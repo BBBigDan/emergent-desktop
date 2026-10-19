@@ -41,19 +41,23 @@ function pickColor() {
  * 原型的 5 种里 sculpture（纯引力井）依赖 3D 引力场，正交投影下看不出结构，
  * 这里先不做；其余四种按原型的参数逐条搬过来。
  */
-/* 球面纬度带（原型：5 带、带高 0.168、间隔 0.030，从 y≈1 铺到赤道） */
-const BANDS = 5;
-const BAND_H = 0.168;
+/* 球面纬度带。
+ * 原型是 5 带、bandH 0.168 / gap 0.030，y 从 1 一路铺到 **0.04** —— 只有北半球，
+ * 所以那个"球"其实是个半球（顶部平、底部空）。这里把带数翻倍到 10、带高按
+ * y ∈ [-1,1] 重新解方程，粒子就铺满南北两极，才是真球体。
+ * 配色仍是 5 组（原型 TYPES 数），南半球镜像回去，保留那层横向色带。 */
+const BANDS = 5;                                             // 配色带数
+const BAND_ROWS = BANDS * 2;                                 // 纬度分带数（南北各 5）
 const BAND_GAP = 0.030;
+const BAND_H = (2 - (BAND_ROWS - 1) * BAND_GAP) / BAND_ROWS; // ≈0.173，铺满 [-1,1]
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
 const SHAPES = ['sphere', 'torus', 'galaxy', 'wave'];
 const SHAPE_MS = 9000;    // 原型 shapeState.interval = 9
 const FLOURISH_S = 0.9;   // 重组后 0.9s 内先向核心收拢再展开
 
-const AMBIENT_N = 4600;
-const PER_BAND = Math.ceil(AMBIENT_N / BANDS);
-const LINK_CAP = 5200;   // 形态连线容量
+const AMBIENT_N = 6400;   // 整球表面积是半球 2 倍，按密度补足
+const PER_BAND = Math.ceil(AMBIENT_N / BAND_ROWS);
 const RIM_PER_WIN = 760;
 const MAX_WIN = 3;
 const N = AMBIENT_N + RIM_PER_WIN * MAX_WIN;
@@ -137,17 +141,31 @@ export class Field {
     this.waveF = 2.6;                    // wave 的频率/振幅（重组时按 seed 变）
     this.waveA = 0.10;
 
+    /* --- 视角（拖动旋转）---
+     * 形态是 3D 的，之前只有自动自转，用户没法自己看背面。这里给一套
+     * 拖拽相机：yaw 绕 Y、pitch 绕 X，松手留角速度做惯性衰减。 */
+    this.spin = 0;        // 自动自转累积角（拖动时暂停）
+    this.yaw = 0;         // 用户水平旋转
+    this.pitch = 0;       // 用户俯仰（+ = 更往下看）
+    this.yawV = 0;
+    this.pitchV = 0;
+    this.dragging = false;
+
     for (let i = 0; i < n; i++) {
-      /* ambient 按纬度带取色（五色分区）；rim 仍用加权随机 */
-      const c = i < AMBIENT_N ? PAL[Math.min(BANDS - 1, Math.floor(i / PER_BAND))] : pickColor();
+      /* ambient 按纬度带取色（五色分区，北半球 0→4、南半球 4→0 镜像）；
+         rim 仍用加权随机 */
+      const bandIdx = Math.min(BAND_ROWS - 1, Math.floor(i / PER_BAND));
+      const colBand = Math.min(BANDS - 1, Math.floor(bandIdx * BANDS / BAND_ROWS));
+      const c = i < AMBIENT_N ? PAL[colBand] : pickColor();
       this.col[i * 3] = c[0]; this.col[i * 3 + 1] = c[1]; this.col[i * 3 + 2] = c[2];
       this.phase[i] = Math.random() * Math.PI * 2;
-      /* 球面：Fibonacci 分布 + 按 5 条纬度带切分（照原型 baseDir）。
-         均匀球面出来只是一团散点；纬度带才有原型那种横条纹和分区配色。 */
-      const b = Math.min(BANDS - 1, Math.floor(i / PER_BAND));
+      /* 球面：Fibonacci（黄金角）方位 + 10 条纬度带切分。
+         y 在带内均匀 → 球面上面积均匀（球面均匀分布等价于 y 均匀），
+         南北极都不会堆点。带与带之间留 gap，就是原型那些横向暗缝。 */
+      const b = Math.min(BAND_ROWS - 1, Math.floor(i / PER_BAND));
       const j = i - b * PER_BAND;
       const cnt = Math.min(PER_BAND, AMBIENT_N - b * PER_BAND);
-      const y0 = 1 - b * (BAND_H + BAND_GAP) - 0.006;
+      const y0 = 1 - b * (BAND_H + BAND_GAP) - 0.004;
       const y1 = y0 - BAND_H;
       const by = y1 + (y0 - y1) * (cnt === 1 ? 0.5 : j / (cnt - 1));
       const brr = Math.sqrt(Math.max(0, 1 - by * by));
@@ -159,7 +177,7 @@ export class Field {
       this.pv[i] = Math.random();
       this.pr1[i] = Math.random();
       this.pr2[i] = Math.random();
-      this.tp[i] = i < AMBIENT_N ? Math.min(BANDS - 1, Math.floor(i / PER_BAND)) : i % 5;
+      this.tp[i] = i % 5;   // 分区号：环面 5 段 / 星系 5 臂 / wave 5 列
       if (i < AMBIENT_N) {
         this.kind[i] = 0;
         this.size[i] = this.baseS[i] = 1.1 + Math.random() * 2.1;
@@ -221,26 +239,7 @@ export class Field {
     this.points = new THREE.Points(this.geo, this.mat);
     this.points.frustumCulled = false;
 
-    /* ---- 形态连线：只点亮不连，出来是一团散沙；连起来才是原型那种"神经网" ---- */
-    this.linkPairs = new Int32Array(LINK_CAP * 2);
-    this.linkPos = new Float32Array(LINK_CAP * 6);
-    this.linkN = 0;
-    this.linkGeo = new THREE.BufferGeometry();
-    this.linkGeo.setAttribute('position', new THREE.BufferAttribute(this.linkPos, 3).setUsage(THREE.DynamicDrawUsage));
-    this.linkGeo.setDrawRange(0, 0);
-    this.linkMat = new THREE.LineBasicMaterial({
-      color: 0x49c8e8,
-      transparent: true,
-      opacity: 0.24,
-      blending: THREE.AdditiveBlending,
-      depthTest: false,
-      depthWrite: false,
-    });
-    this.links = new THREE.LineSegments(this.linkGeo, this.linkMat);
-    this.links.frustumCulled = false;
-
     this.scene = new THREE.Scene();
-    this.scene.add(this.links);
     this.scene.add(this.points);
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
@@ -250,7 +249,61 @@ export class Field {
     this.cam.position.z = 10;
     this.resize();
     this.computeShape();   // 先算一次，否则 ta 全 0，第一帧粒子会全飞向原点
-    this.buildLinks();
+    this.bindDrag();
+  }
+
+  /**
+   * 拖动旋转视角（像 3D 环境里抓住物体转）。
+   *
+   * 画布是 `pointer-events: none`（它盖在窗口上面），所以事件挂在 window 上，
+   * 并且排除 dock / HUD / 窗口这几种目标；iframe 内部的事件本来就不会冒泡到
+   * 父文档，所以在窗口内容上拖动不会误触。
+   * 按下时 setPointerCapture，指针划过 iframe 也仍然由本文档收事件。
+   */
+  bindDrag() {
+    let id = null, lx = 0, ly = 0, lt = 0;
+    const UI = '#dock, #hud, #boot, .win, .win-glow, button, a, input';
+
+    const down = (e) => {
+      if (id !== null || e.button !== 0) return;
+      if (e.target instanceof Element && e.target.closest(UI)) return;
+      id = e.pointerId;
+      this.dragging = true;
+      lx = e.clientX; ly = e.clientY; lt = performance.now();
+      this.yawV = this.pitchV = 0;
+      try { document.body.setPointerCapture(id); } catch { /* 某些环境下不支持 */ }
+      document.body.classList.add('grabbing');
+    };
+
+    const move = (e) => {
+      if (e.pointerId !== id) return;
+      const now = performance.now();
+      const dt = Math.max(8, now - lt) / 1000;
+      const dx = e.clientX - lx, dy = e.clientY - ly;
+      lx = e.clientX; ly = e.clientY; lt = now;
+      if (!dx && !dy) return;
+      /* 直接吃位移，拖起来"抓住球在转"；0.0062 rad/px ≈ 1px→0.36° */
+      this.yaw += dx * 0.0062;
+      this.pitch = clamp(this.pitch + dy * 0.0062, -1.30, 1.30);
+      /* 记角速度，松手后顺着方向继续滑一段 */
+      this.yawV = dx * 0.0062 / dt;
+      this.pitchV = dy * 0.0062 / dt;
+    };
+
+    const up = (e) => {
+      if (e.pointerId !== id) return;
+      id = null;
+      this.dragging = false;
+      /* 松手时把角速度收一点，否则会一直打转 */
+      this.yawV *= 0.55;
+      this.pitchV *= 0.55;
+      document.body.classList.remove('grabbing');
+    };
+
+    window.addEventListener('pointerdown', down);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
   }
 
   resize() {
@@ -316,58 +369,6 @@ export class Field {
    * 坐标一律归一化到半径 1，最后乘一个和屏幕相关的 scale，
    * 这样换分辨率/窗口尺寸时形态大小自动跟着变。
    */
-  /** 在形态目标（归一化 3D）上按近邻建连，每点最多 2 条 */
-  buildLinks() {
-    const n = AMBIENT_N, T = this.ta;
-    const cell = 0.085;
-    const off = 2048;
-    const K = (cx, cy, cz) => ((cx + off) * 4096 + (cy + off)) * 4096 + (cz + off);
-    const buckets = new Map();
-    for (let i = 0; i < n; i++) {
-      const k = K(Math.floor(T[i * 3] / cell), Math.floor(T[i * 3 + 1] / cell), Math.floor(T[i * 3 + 2] / cell));
-      let b = buckets.get(k);
-      if (!b) { b = []; buckets.set(k, b); }
-      b.push(i);
-    }
-    const pr = this.linkPairs, cap = LINK_CAP;
-    let cnt = 0;
-    for (let i = 0; i < n && cnt < cap; i++) {
-      const x = T[i * 3], y = T[i * 3 + 1], z = T[i * 3 + 2];
-      const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell);
-      let made = 0;
-      for (let dx = -1; dx <= 1 && made < 2; dx++)
-        for (let dy = -1; dy <= 1 && made < 2; dy++)
-          for (let dz = -1; dz <= 1 && made < 2; dz++) {
-            const b = buckets.get(K(cx + dx, cy + dy, cz + dz));
-            if (!b) continue;
-            for (let k = 0; k < b.length && made < 2; k++) {
-              const j = b[k];
-              if (j <= i) continue;
-              const ax = T[j * 3] - x, ay = T[j * 3 + 1] - y, az = T[j * 3 + 2] - z;
-              if (ax * ax + ay * ay + az * az > cell * cell * 2.2) continue;
-              pr[cnt * 2] = i; pr[cnt * 2 + 1] = j;
-              cnt++; made++;
-            }
-          }
-    }
-    this.linkN = cnt;
-    this.linkGeo.setDrawRange(0, cnt * 2);
-    this.syncLinks();
-  }
-
-  /** 每帧把粒子当前位置写进线段端点（连的是粒子，不是目标点） */
-  syncLinks() {
-    const n = this.linkN;
-    if (!n) return;
-    const p = this.linkPos, pr = this.linkPairs, P = this.pos;
-    for (let k = 0; k < n; k++) {
-      const a = pr[k * 2], b = pr[k * 2 + 1], o = k * 6;
-      p[o] = P[a * 3]; p[o + 1] = P[a * 3 + 1]; p[o + 2] = 0;
-      p[o + 3] = P[b * 3]; p[o + 4] = P[b * 3 + 1]; p[o + 5] = 0;
-    }
-    this.linkGeo.attributes.position.needsUpdate = true;
-  }
-
   computeShape() {
     const n = AMBIENT_N;
     const T = this.ta, seed = this.shapeSeed;
@@ -394,7 +395,10 @@ export class Field {
     } else if (S === 'galaxy') {
       /* 五条旋臂；旋向/缠绕度随 seed，盘面厚度向外递减 */
       const dir = seed > 0.5 ? 1 : -1;
-      const spin = 1.6 + ((seed * 3.31) % 1) * 1.3;
+      /* 每条臂的缠绕量（单位：半圈）。1.6~2.9 半圈 = 0.8~1.45 圈，
+         臂会和邻臂叠在一起，看起来是一圈圈同心环而不是旋臂 —— 收到
+         0.55~1.05 半圈，五条臂才分得开。 */
+      const spin = 0.55 + ((seed * 3.31) % 1) * 0.5;
       for (let i = 0; i < n; i++) {
         const t01 = this.pu[i];
         const r = 0.10 + t01 * 0.90;
@@ -435,7 +439,6 @@ export class Field {
       this.shapeId = (this.shapeId + 1) % SHAPES.length;
       this.shapeSeed = Math.random();
       this.computeShape();
-      this.buildLinks();
       this.shapeAt = t;
     }
     const flour = Math.max(0, 1 - (t - this.shapeAt) / FLOURISH_S);
@@ -443,10 +446,13 @@ export class Field {
     const R = Math.min(this.W, this.H) * 0.33;
     const scale = R * (1 - 0.62 * flour) * (0.95 + 0.10 * breath);
 
-    /* 缓慢自转 + 固定俯角 —— 把 3D 形态压成 2D 投影 */
-    const ry = t * 0.20 + this.shapeSeed * 6.28;
+    /* 缓慢自转 + 固定俯角 —— 把 3D 形态压成 2D 投影。
+       拖动时自转暂停：否则你抓住球往右拖，它自己还在往左转，手感是"打滑"。 */
+    this.spin += (this.dragging ? 0 : 0.20) * dt;
+    const ry = this.spin + this.shapeSeed * 6.28 + this.yaw;
     const cy = Math.cos(ry), sy = Math.sin(ry);
-    const tilt = S === 'wave' ? 0.92 : S === 'galaxy' ? 0.62 : 0.36;
+    const tiltBase = S === 'wave' ? 0.92 : S === 'galaxy' ? 0.62 : 0.36;
+    const tilt = clamp(tiltBase + this.pitch, -1.35, 1.35);
     const cx = Math.cos(tilt), sx = Math.sin(tilt);
 
     const k = 46 * this.form;
@@ -528,12 +534,19 @@ export class Field {
       this.alpha[i] = this.baseA[i] * (0.78 + 0.22 * Math.sin(t * 0.7 + ph));
     }
 
+    /* ---- 拖动惯性：松手后角速度指数衰减（约 1s 停住） ---- */
+    if (!this.dragging && (this.yawV || this.pitchV)) {
+      this.yaw += this.yawV * dt;
+      this.pitch = clamp(this.pitch + this.pitchV * dt, -1.30, 1.30);
+      const damp = Math.exp(-3.4 * dt);
+      this.yawV *= damp;
+      this.pitchV *= damp;
+      if (Math.abs(this.yawV) < 0.02) this.yawV = 0;
+      if (Math.abs(this.pitchV) < 0.02) this.pitchV = 0;
+    }
+
     /* ---- 形态：弹簧把粒子拉向投影后的目标 ---- */
     if (this.form > 0.01) this.stepShape(dt);
-    /* 连线跟着粒子走；形态退场时一起淡出 */
-    this.links.visible = this.form > 0.04;
-    this.linkMat.opacity = 0.24 * this.form;
-    if (this.links.visible) this.syncLinks();
 
     /* ---- rim：每个窗口一组 ---- */
     for (let g = 0; g < MAX_WIN; g++) {

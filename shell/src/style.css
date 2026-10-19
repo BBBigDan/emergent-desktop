@@ -28,6 +28,11 @@ html, body {
 /* 粒子画布压在窗口之上：窗口生长时粒子要能拖在可见边缘上 */
 #scene { position: fixed; inset: 0; z-index: 3; display: block; pointer-events: none; }
 
+/* 拖动旋转视角：画布本身 pointer-events:none，事件挂在 window 上，
+   所以光标状态也挂在 body（见 field.js bindDrag） */
+body { touch-action: none; }
+body.grabbing, body.grabbing * { cursor: grabbing !important; }
+
 #windows { position: fixed; inset: 0; z-index: 2; }
 
 /* ───────────────────────── 窗口 ───────────────────────── */
