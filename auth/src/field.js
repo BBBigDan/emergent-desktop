@@ -26,7 +26,7 @@ const AVA_N = 1100;      // 头像光晕
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 /* role → 基础亮度 / 点径系数（索引对齐 ui.js 的 ROLE） */
-const ROLE_A = [0, 1.0, 0.70, 0.74, 1.0, 0.88, 0.56, 0.95, 0.62];
+const ROLE_A = [0, 0.95, 0.66, 0.70, 0.88, 0.84, 0.54, 0.90, 0.60];
 const ROLE_S = [0, 1.12, 0.92, 0.96, 1.1, 1.02, 0.9, 1.06, 0.88];
 
 /* role → 所属控件（悬停时该控件的点阵要整体提亮） */
@@ -97,42 +97,48 @@ const VERT = `
     gl_PointSize = aSize * uDpr * (1.0 + aHot * 0.10);
   }`;
 
+/* 加色版：重叠的点会互相叠亮 —— 原型就是 Additive，所以每颗点的"热度"
+   都不一样（簇上的点更白更亮），这是"不规整"的重要一半。 */
 const FRAG_HARD = `
   varying float vA;
+  uniform float uAdd;
   void main(){
     vec2 d = gl_PointCoord - 0.5;
     float r = sqrt(dot(d, d)) * 2.0;
-    /* 硬芯：点阵屏的一颗 LED —— 直径基本等于标称值，边缘只留 1px 抗锯齿。
-       用软光晕的 pow 衰减会让可见芯只剩 55%，点距一拉开字就"断"。 */
+    /* 硬芯：点阵屏的一颗 LED —— 直径基本等于标称值，边缘只留 1px 抗锯齿。 */
     if (r > 1.0) discard;
     float a = vA * (1.0 - smoothstep(0.82, 1.0, r));
-    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * a, a);
+    /* uAdd=1 → 非预乘（加色混合按 SrcAlpha 计权）；
+       uAdd=0 → 预乘（NormalBlending，叠在头像上不会变黑） */
+    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * mix(a, 1.0, uAdd), a);
   }`;
 
 const FRAG_SOFT = `
   varying float vA;
+  uniform float uAdd;
   void main(){
     vec2 d = gl_PointCoord - 0.5;
     float r2 = dot(d, d) * 4.0;
     if (r2 > 1.0) discard;
     float core = pow(1.0 - r2, 1.7);
     float a = core * vA;
-    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * a, a);
+    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * mix(a, 1.0, uAdd), a);
   }`;
 
-function makeMat(hard) {
+function makeMat(hard, additive) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uDpr: { value: 1 },
       uTime: { value: 0 },
       uGain: { value: 1 },
+      uAdd: { value: additive ? 1 : 0 },
     },
     vertexShader: VERT,
     fragmentShader: hard ? FRAG_HARD : FRAG_SOFT,
     transparent: true,
     depthTest: false,
     depthWrite: false,
-    blending: THREE.NormalBlending,
+    blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
   });
 }
 
@@ -176,8 +182,10 @@ export class Field {
     this.geo.setAttribute('aSize', new THREE.BufferAttribute(this.sScale, 1).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aSeed', new THREE.BufferAttribute(this.seed, 1));
     this.hot = new Float32Array(n);
+    this.sJit = new Float32Array(n).fill(1);
+    this.aJit = new Float32Array(n).fill(1);
     this.geo.setAttribute('aHot', new THREE.BufferAttribute(this.hot, 1).setUsage(THREE.DynamicDrawUsage));
-    this.mat = makeMat(true);   // 骨架：硬芯 LED
+    this.mat = makeMat(true, true);    // 骨架：硬芯 LED + 加色（重叠叠亮）
     this.points = new THREE.Points(this.geo, this.mat);
     this.points.frustumCulled = false;
     this.points.position.z = 1;
@@ -222,7 +230,7 @@ export class Field {
     this.cGeo.setAttribute('aSize', new THREE.BufferAttribute(this.cSize, 1).setUsage(THREE.DynamicDrawUsage));
     this.cGeo.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(CLOUD_N).map(() => Math.random()), 1));
     this.cGeo.setAttribute('aHot', new THREE.BufferAttribute(new Float32Array(CLOUD_N), 1));
-    this.cMat = makeMat(false); // 云层：软光尘
+    this.cMat = makeMat(false, true);  // 云层：软光尘 + 加色
     this.cPoints = new THREE.Points(this.cGeo, this.cMat);
     this.cPoints.frustumCulled = false;
     this.cPoints.position.z = 0;
@@ -305,7 +313,22 @@ export class Field {
     this.oPoints = new THREE.Points(this.oGeo, this.oMat);
     this.oPoints.frustumCulled = false;
 
+    /* ───────────────── 连线层 ─────────────────
+     * 原型 UI 模式的 links[0]：按目标近邻连成细神经网。
+     * 这一层是"不规整"的另一半 —— 只点不连，边框就是一串孤立的珠子；
+     * 连起来之后边缘变成连续发光的带，颗粒感仍在，机械感没了。
+     * - 骨架：只连**线条类几何**（边框、箭头），文字绝不连（会糊）
+     * - 增援·槽位：小阈值 → 槽内短网，文字/边框变"实心"
+     * - 增援·公转：大阈值 → 彗光滑尾
+     */
+    this.lnkSkel = this.makeLinks(2600, 0.13);
+    this.lnkSlot = this.makeLinks(4200, 0.20);
+    this.lnkOrb = this.makeLinks(2600, 0.07);
+
     this.scene = new THREE.Scene();
+    this.scene.add(this.lnkSkel.obj);
+    this.scene.add(this.lnkSlot.obj);
+    this.scene.add(this.lnkOrb.obj);
     this.scene.add(this.cPoints);
     this.scene.add(this.points);
     this.scene.add(this.oPoints);
@@ -320,8 +343,8 @@ export class Field {
     this.gw = 36;
     this.gh = 26;
     this.flow = new Float32Array((this.gw + 1) * (this.gh + 1) * 2);
-    this.gainS = 1.12;
-    this.gainC = 1.45;
+    this.gainS = 0.85;
+    this.gainC = 1.05;
 
     this.resize();
   }
@@ -342,6 +365,130 @@ export class Field {
     this.cam.updateProjectionMatrix();
   }
 
+  /* ------------------------------------------------------------ 连线 */
+  makeLinks(cap, opacity) {
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(cap * 6);
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setDrawRange(0, 0);
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x8fd8ff,
+      transparent: true,
+      opacity,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const obj = new THREE.LineSegments(geo, mat);
+    obj.frustumCulled = false;
+    obj.visible = false;
+    obj.position.z = 0.5;
+    return { geo, pos, pairs: new Int32Array(cap * 2), cap, n: 0, obj, mat };
+  }
+
+  /**
+   * 在 ids 里找近邻对。cell = thresh，只看 3×3 桶，j>i 保证每对只连一次。
+   * @param perMax 每颗粒子最多连几条（过大就织成一张网，反而糊）
+   */
+  buildPairs(link, xs, ids, thresh, perMax) {
+    const cell = thresh;
+    const buckets = new Map();
+    const K = (cx, cy) => (cx + 8192) * 16384 + (cy + 8192);
+    for (let a = 0; a < ids.length; a++) {
+      const i = ids[a];
+      const cx = Math.floor(xs[i * 2] / cell), cy = Math.floor(xs[i * 2 + 1] / cell);
+      const k = K(cx, cy);
+      let b = buckets.get(k);
+      if (!b) { b = []; buckets.set(k, b); }
+      b.push(i);
+    }
+    let n = 0;
+    const lim = link.cap;
+    for (let a = 0; a < ids.length && n < lim; a++) {
+      const i = ids[a];
+      const xi = xs[i * 2], yi = xs[i * 2 + 1];
+      const cx = Math.floor(xi / cell), cy = Math.floor(yi / cell);
+      let made = 0;
+      for (let dx = -1; dx <= 1 && made < perMax; dx++) {
+        for (let dy = -1; dy <= 1 && made < perMax; dy++) {
+          const b = buckets.get(K(cx + dx, cy + dy));
+          if (!b) continue;
+          for (let k = 0; k < b.length && made < perMax; k++) {
+            const j = b[k];
+            if (j <= i) continue;
+            const ddx = xs[j * 2] - xi, ddy = xs[j * 2 + 1] - yi;
+            if (ddx * ddx + ddy * ddy > cell * cell) continue;
+            link.pairs[n * 2] = i;
+            link.pairs[n * 2 + 1] = j;
+            n++; made++;
+            if (n >= lim) break;
+          }
+        }
+      }
+    }
+    link.n = n;
+    link.geo.setDrawRange(0, n * 2);
+    link.obj.visible = n > 0;
+  }
+
+  /** 把粒子位置写进连线的顶点缓冲（每帧调，很便宜） */
+  syncLinks(link, xs) {
+    if (!link.n) return;
+    const p = link.pos, pr = link.pairs;
+    for (let k = 0; k < link.n; k++) {
+      const a = pr[k * 2], b = pr[k * 2 + 1], o = k * 6;
+      p[o] = xs[a * 2]; p[o + 1] = xs[a * 2 + 1]; p[o + 2] = 0;
+      p[o + 3] = xs[b * 2]; p[o + 4] = xs[b * 2 + 1]; p[o + 5] = 0;
+    }
+    link.geo.attributes.position.needsUpdate = true;
+  }
+
+  /** 骨架连线：只连线条类几何（边框 3 / 箭头 5），文字一律不连 */
+  rebuildSkelLinks() {
+    const L = this.lnkSkel;
+    const ids = [];
+    for (let i = 0; i < this.top; i++) {
+      const r = this.role[i];
+      if (r === 3 || r === 5) ids.push(i);
+    }
+    if (!ids.length) { L.n = 0; L.obj.visible = false; return; }
+    this.buildPairs(L, this.tgt, new Int32Array(ids), CELL * this.scale * 1.75, 3);
+    this.syncLinks(L, this.tgt);
+  }
+
+  /** 槽位连线：槽内短网，让被灌满的控件看起来是"实心"的 */
+  rebuildSlotLinks() {
+    const L = this.lnkSlot;
+    const ids = [];
+    for (let i = 0; i < CLOUD_N; i++) if (this.cMode[i] === 1) ids.push(i);
+    if (ids.length < 2) { L.n = 0; L.obj.visible = false; return; }
+    /* 槽位目标暂时借用 cPos（此刻粒子可能还在飞的路上），用 slotX/slotY 更稳 */
+    const sp = this.slotPos();
+    this.buildPairs(L, sp, new Int32Array(ids), CELL_R * this.scale * 2.1, 2);
+    this.syncLinks(L, sp);
+  }
+
+  slotPos() {
+    if (!this._slot) this._slot = new Float32Array(CLOUD_N * 2);
+    for (let i = 0; i < CLOUD_N; i++) {
+      this._slot[i * 2] = this.cMode[i] === 1 ? this.slotX[i] : this.cPos[i * 2];
+      this._slot[i * 2 + 1] = this.cMode[i] === 1 ? this.slotY[i] : this.cPos[i * 2 + 1];
+    }
+    return this._slot;
+  }
+
+  /** 公转连线：大阈值 → 彗光滑尾（隔几帧重建，拓扑不用每帧换） */
+  rebuildOrbLinks() {
+    const L = this.lnkOrb;
+    if (!this.ptr.on || this.slot.fill > 0.98) { L.n = 0; L.obj.visible = false; return; }
+    const ids = [];
+    for (let i = 0; i < CLOUD_N; i++) if (this.cMode[i] === 0) ids.push(i);
+    if (ids.length < 2) { L.n = 0; L.obj.visible = false; return; }
+    /* 阈值不能大：公转云是一圈薄饼，阈值一大就连出横穿整团的乱线（像划痕）。
+       18px 只连相邻粒子 → 短线随流动一起走，才是"彗光滑尾" */
+    this.buildPairs(L, this.cPos, new Int32Array(ids), 10, 1);
+  }
+
   /* --------------------------------------------------------- 头像光晕 */
   setAvatar(lx, ly, lr, scale, LW, LH) {
     this.ava = { x: (lx - LW / 2) * scale, y: (LH / 2 - ly) * scale, r: lr * scale, scale };
@@ -351,40 +498,68 @@ export class Field {
   }
 
   /* --------------------------------------------------------- 骨架点阵 */
+  /**
+   * 点阵落位。
+   *
+   * **过采样 1.3x**：原型是 4400 颗粒子铺 ~3377 个槽位，所以每个槽平均 1.3 颗 ——
+   * 多出来的那颗带着自己的弹簧/流场/相位，永远压不实，于是同一个格子上是一小簇
+   * 微偏的复本（点径、亮度都不同）。这正是"不规整"的来源：1:1 铺满等于一张
+   * 印刷网点图，每颗都一样大、一样亮、钉在同一点。这里按 key 的哈希决定
+   * 34% 的格子多一颗，并给它一个 ±0.45 格的随机偏移（不是格心）。
+   */
   setPoints(pts, scale, LW, LH) {
     this.scale = scale;
-    /* 硬芯点直径 ≈ 点距 ×1.24：相邻点相切、笔画连成线，仍留一圈暗缝；
-       再大（1.5+）就成了实心块，"点阵"的质感没了。 */
-    const pointSize = CELL * scale * 1.45;
+    /* 硬芯点直径 ≈ 点距 ×1.45：相邻点相切、笔画连成线，仍留一圈暗缝 */
+    const pointSize = CELL * scale * 1.38;
 
     const M = pts.length / 4;
     const keep = new Set();
     const ox = LW / 2, oy = LH / 2;
 
     for (let k = 0; k < M; k++) {
-      const lx = pts[k * 4], ly = pts[k * 4 + 1], role = pts[k * 4 + 2], key = pts[k * 4 + 3];
-      keep.add(key);
-      const wx = (lx - ox) * scale;
-      const wy = (oy - ly) * scale;
+      const lx = pts[k * 4], ly = pts[k * 4 + 1], role = pts[k * 4 + 2], slot = pts[k * 4 + 3];
+      const wx0 = (lx - ox) * scale;
+      const wy0 = (oy - ly) * scale;
 
-      let idx = this.byKey.get(key);
-      if (idx === undefined) {
-        if (this.free.length) idx = this.free.pop();
-        else if (this.top < SKEL_MAX) idx = this.top++;
-        else continue;
-        this.byKey.set(key, idx);
-        this.key[idx] = key;
-        this.pos[idx * 2] = wx;
-        this.pos[idx * 2 + 1] = wy;
-        this.vel[idx * 2] = 0;
-        this.vel[idx * 2 + 1] = 0;
-        this.fade[idx] = 0;
+      /* 该格子几颗：1 或 2（确定性哈希，重绘时不跳变） */
+      const h = Math.imul(slot ^ 0x9e3779b9, 2654435761) >>> 0;
+      const subs = (h % 100) < 46 ? 2 : 1;
+
+      for (let sub = 0; sub < subs; sub++) {
+        const key = slot * 4 + sub;
+        keep.add(key);
+
+        let wx = wx0, wy = wy0;
+        if (sub > 0) {
+          /* 复本不落格心：随机方向 ±0.45 格 —— 看起来是"两粒沙"，不是重影 */
+          const a = (h % 6283) / 1000 + sub * 2.4;
+          const r = (0.12 + ((h >>> 7) % 100) / 100 * 0.44) * CELL * scale;
+          wx += Math.cos(a) * r;
+          wy += Math.sin(a) * r;
+        }
+
+        let idx = this.byKey.get(key);
+        if (idx === undefined) {
+          if (this.free.length) idx = this.free.pop();
+          else if (this.top < SKEL_MAX) idx = this.top++;
+          else continue;
+          this.byKey.set(key, idx);
+          this.key[idx] = key;
+          this.pos[idx * 2] = wx;
+          this.pos[idx * 2 + 1] = wy;
+          this.vel[idx * 2] = 0;
+          this.vel[idx * 2 + 1] = 0;
+          this.fade[idx] = 0;
+          /* 逐粒子点径/亮度差异：印刷网点每颗都不同，模子刻出来的一眼就是假的 */
+          this.sJit[idx] = 0.82 + ((h >>> 11) % 100) / 100 * 0.38;
+          this.aJit[idx] = 0.78 + ((h >>> 17) % 100) / 100 * 0.28;
+        }
+        this.tgt[idx * 2] = wx;
+        this.tgt[idx * 2 + 1] = wy;
+        this.role[idx] = role;
+        this.aScale[idx] = (ROLE_A[role] ?? 0.6) * this.aJit[idx];
+        this.sScale[idx] = pointSize * (ROLE_S[role] ?? 1) * this.sJit[idx];
       }
-      this.tgt[idx * 2] = wx;
-      this.tgt[idx * 2 + 1] = wy;
-      this.role[idx] = role;
-      this.aScale[idx] = ROLE_A[role] ?? 0.6;
-      this.sScale[idx] = pointSize * (ROLE_S[role] ?? 1);
     }
 
     for (const [key, idx] of this.byKey) {
@@ -394,6 +569,7 @@ export class Field {
       }
     }
     this.geo.setDrawRange(0, this.top);
+    this.rebuildSkelLinks();
   }
 
   /**
@@ -444,6 +620,7 @@ export class Field {
 
     this.slot.fill = useCount / CLOUD_N;
     this.applyHot(id, scale);   // 骨架里属于该控件的点整体提亮
+    this.rebuildSlotLinks();
   }
 
   /** 标记「哪些骨架点属于当前悬停的控件」 */
@@ -451,7 +628,7 @@ export class Field {
     this.hotPart = id || null;
     for (let i = 0; i < this.top; i++) {
       this.hot[i] = id && ROLE_PART[this.role[i]] === id ? 1 : 0;
-      if (scale) this.sScale[i] = CELL * scale * 1.45 * (ROLE_S[this.role[i]] ?? 1);
+      if (scale) this.sScale[i] = CELL * scale * 1.38 * (ROLE_S[this.role[i]] ?? 1);
     }
     this.geo.attributes.aHot.needsUpdate = true;
     if (scale) this.geo.attributes.aSize.needsUpdate = true;
@@ -462,6 +639,8 @@ export class Field {
     this.slot.fill = 0;
     this.cMode.fill(0);
     this.cRole.fill(0);
+    this.lnkSlot.n = 0;
+    this.lnkSlot.obj.visible = false;
     this.applyHot(null);
   }
 
@@ -604,7 +783,7 @@ export class Field {
         sv[i2 + 1] = sv[i2 + 1] * (1 - 1.1 * dt);
         sp[i2] += sv[i2] * dt;
         sp[i2 + 1] += sv[i2 + 1] * dt;
-        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * burst * 1.4;
+        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.aJit[i] * burst * 1.4;
         this.sScale[i] *= 1 + 0.9 * dt;
       } else {
         /* 半隐式弹簧：先积分速度再位移，任何 dt 都稳定。
@@ -614,7 +793,7 @@ export class Field {
         sv[i2 + 1] = (sv[i2 + 1] + dy * SKEL_K * dt) / (1 + SKEL_C * dt);
         sp[i2] += sv[i2] * dt;
         sp[i2 + 1] += sv[i2 + 1] * dt;
-        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.fade[i] * this.gainS;
+        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.aJit[i] * this.fade[i] * this.gainS;
       }
 
       posArr[i * 3] = sp[i2];
@@ -641,7 +820,7 @@ export class Field {
           this.key[i] = -1;
           this.free.push(i);
         } else {
-          this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.fade[i];
+          this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.aJit[i] * this.fade[i];
           rest.push(i);
         }
       }
@@ -713,13 +892,26 @@ export class Field {
       /* 槽位粒子更亮（正好压在笔画上，是"充能"）；公转粒子是光尘 */
       /* 槽位：压在笔画上 → 亮；公转：光尘。指针在时公转粒子收得很紧，
          太亮会糊成一团脏斑，压到 0.55；待机星尘散得开，0.72 才看得见 */
-      const base = this.cMode[i] === 1 ? 1.25 : (this.ptr.on ? 0.66 : 0.72);
+      const base = this.cMode[i] === 1 ? 1.0 : (this.ptr.on ? 0.8 : 0.62);
       this.cAlpha[i] = this.cAmp[i] * base * this.cFade[i] * burst * this.gainC;
     }
 
     this.cGeo.attributes.position.needsUpdate = true;
     this.cGeo.attributes.aAlpha.needsUpdate = true;
     this.cGeo.attributes.aSize.needsUpdate = true;
+
+    /* ───────── 连线 ─────────
+       骨架/槽位：拓扑不用变（目标是静止的），只跟一遍位置；
+       公转：云团在转，每 6 帧重建一次拓扑，中间靠 syncLinks 跟着走 */
+    this.syncLinks(this.lnkSkel, this.pos);
+    if (this.lnkSlot.n) this.syncLinks(this.lnkSlot, this.cPos);
+    if (this.ptr.on) {
+      if ((this._lnkTick = (this._lnkTick | 0) + 1) % 6 === 0) this.rebuildOrbLinks();
+      this.syncLinks(this.lnkOrb, this.cPos);
+    } else if (this.lnkOrb.n) {
+      this.lnkOrb.n = 0;
+      this.lnkOrb.obj.visible = false;
+    }
   }
 
   render() {
