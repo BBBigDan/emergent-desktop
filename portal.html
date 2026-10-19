@@ -31,13 +31,12 @@
      越过边缘向内漂的粒子靠透明度衰减表现"被吸进页面"。 */
   #scene{position:fixed;inset:0;z-index:3;display:block;pointer-events:none}
 
-  /* iframe 外壳：始终是最终尺寸，靠 transform:scale 从 0 放大到 1。
-     之所以不用 clip-path 从中心"开洞"：那样只是露出页面中间一块，像窥视孔；
-     scale 才是"这扇窗本身从粒子点里长出来"，且粒子前沿与窗口边缘严格等比对齐。 */
+  /* iframe 外壳：尺寸/位置恒定，只做 opacity 淡入淡出。
+     不用 transform:scale（内容跟着缩放，中途一直糊），也不用 clip-path（像从中心开窥视孔）。
+     opacity 完全不碰内容的栅格化，所以字从第一帧到最后一帧都是 1:1 锐利。 */
   #portal{position:fixed;left:0;top:0;z-index:2;border-radius:18px;overflow:hidden;
-    background:#070b14;transform-origin:50% 50%;will-change:transform;
-    box-shadow:0 0 0 1px rgba(126,196,255,.30), 0 0 22px rgba(88,178,255,.34), 0 0 78px rgba(44,130,255,.26),
-               inset 0 0 60px rgba(30,110,210,.14)}
+    background:transparent;opacity:0;visibility:hidden;will-change:opacity;
+    box-shadow:0 0 0 1px rgba(126,196,255,.20), 0 0 26px rgba(88,178,255,.26), 0 0 90px rgba(44,130,255,.18)}
   #portal iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#070b14}
 
   /* HUD */
@@ -80,14 +79,14 @@
 
 <div id="portal"><iframe id="frame" title="portal content" allow="clipboard-read; clipboard-write"></iframe></div>
 
-<div id="title" class="panel">粒子门 · iframe 包裹试验 <span style="opacity:.45">v0.15</span>
-  <small>粒子先收成一个点 → 从点长出窗口边框 → iframe 在粒子流里被撑开 → 稳定后粒子沿四边循环流动</small>
+<div id="title" class="panel">粒子门 · iframe 包裹试验 <span style="opacity:.45">v0.16</span>
+  <small>小点阶段粒子就在流动 → 缓缓扩成窗口大小的环 → 内部够大时 iframe 淡入 → Esc 让粒子四散、页面淡出</small>
 </div>
 <div id="selftest" class="panel" hidden></div>
 
 <div id="hud" class="panel">
-  <button id="replay" title="从点重新长一次（R）">重播</button>
-  <button id="collapse" title="收回成一点（Esc）">收回</button>
+  <button id="replay" title="从小点重新来一次（R）">重播</button>
+  <button id="collapse" title="粒子四散、页面淡出（Esc）">散开</button>
   <div class="sep"></div>
   <span class="lbl">流速</span><input id="flow" type="range" min="0" max="260" value="100">
   <div class="sep"></div>
@@ -95,7 +94,7 @@
   <button id="load">载入</button>
   <div class="stat" id="stat">--</div>
 </div>
-<div id="hint" class="panel">R 重播　Esc 收回　鼠标靠近边框 · 粒子被推开　可填网址载入别的页面（部分站点禁止被 iframe 嵌入）</div>
+<div id="hint" class="panel">R 重播　Esc 散开　鼠标靠近粒子流 · 会被推开　可填网址载入别的页面（部分站点禁止被 iframe 嵌入）</div>
 
 <div id="loading">正在凝聚…</div>
 <div id="fallback" hidden>当前环境不支持 WebGL，无法渲染粒子流。</div>
