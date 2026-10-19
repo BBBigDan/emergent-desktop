@@ -1,0 +1,14 @@
+# ---- 构建产物（由 build-standalone.mjs 生成，可随时重建）----
+/particle-sphere-standalone.html
+
+# ---- 验证产物：截图 / 临时探针页面 / CDP 驱动 ----
+/dist/
+/.tmp/
+
+# ---- 依赖 ----
+node_modules/
+
+# ---- 杂项 ----
+*.log
+.DS_Store
+Thumbs.db

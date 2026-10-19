@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>涌现式粒子原型 · Olares 社区版</title>
+<style>
+  :root{
+    --bg:#04060c;
+    --panel:rgba(10,16,28,.62);
+    --line:rgba(148,178,255,.14);
+    --text:rgba(228,238,255,.88);
+    --dim:rgba(228,238,255,.55);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:var(--bg)}
+  body{font-family:"PingFang SC","Microsoft YaHei",-apple-system,"Segoe UI",sans-serif;color:var(--text);user-select:none}
+  #scene{position:fixed;inset:0;display:block;touch-action:none}
+  #vignette{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,5,.6) 100%)}
+  .panel{position:fixed;background:var(--panel);border:1px solid var(--line);border-radius:12px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);transition:opacity .8s ease}
+  body.dimmed .panel:not(:hover){opacity:.05}
+  #title{top:16px;left:16px;padding:10px 14px;font-size:12px;letter-spacing:.05em}
+  #title small{display:block;color:var(--dim);font-size:10px;margin-top:2px;letter-spacing:.02em}
+  #selftest{top:64px;left:16px;max-width:430px;padding:10px 14px;font-size:11px;line-height:1.8;white-space:pre;font-variant-numeric:tabular-nums;color:var(--dim)}
+  #selftest b{color:var(--text);font-weight:500}
+  #hud{top:16px;right:16px;width:244px;padding:14px;font-size:12px}
+  #hud .row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  #hud .row>label{width:54px;color:var(--dim);flex:none}
+  #hud input[type=range]{flex:1;accent-color:#6fb4ff;height:14px}
+  #hud .val{width:38px;text-align:right;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+  #hud .breathbar{margin-top:7px;height:3px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}
+  #hud .breathbar i{display:block;height:100%;width:50%;border-radius:2px;background:linear-gradient(90deg,#3d6fd0,#9adcff);transition:width .12s linear}
+  #hud .checks{flex-wrap:wrap;gap:4px 12px}
+  #hud .chk{display:flex;align-items:center;gap:5px;color:var(--dim);cursor:pointer;width:auto}
+  #hud .chk input{accent-color:#6fb4ff}
+  #bars{margin-top:10px}
+  .bar{display:flex;align-items:center;gap:7px;margin-top:6px}
+  .bar i{width:8px;height:8px;border-radius:2px;flex:none}
+  .bar .name{width:26px;color:var(--dim);flex:none}
+  .bar .track{flex:1;height:3px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden}
+  .bar .fill{height:100%;width:0%;border-radius:2px}
+  .bar .pv{width:32px;text-align:right;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+  #hud .btns{gap:8px;margin-top:12px}
+  #hud button{flex:1;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:5px 0;font-size:12px;cursor:pointer}
+  #hud button:hover{border-color:rgba(148,178,255,.35);background:rgba(255,255,255,.07)}
+  #hud .shapes{display:flex;gap:4px;margin-top:10px}
+  #hud .shapes button{flex:1;padding:4px 0;font-size:11px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--dim);border-radius:7px;cursor:pointer}
+  #hud .shapes button:hover{color:var(--text)}
+  #hud .shapes button.active{color:var(--text);border-color:rgba(111,180,255,.5);background:rgba(111,180,255,.12)}
+  #shapeName{margin-top:8px;color:var(--dim);font-size:11px}
+  #shapeName b{color:var(--text);font-weight:500}
+  #hud .stats{display:flex;justify-content:space-between;margin-top:10px;color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+  #hud .legend{display:flex;align-items:center;gap:7px;margin-top:10px;color:var(--dim);font-size:10px}
+  #hud .legend i{flex:1;height:4px;border-radius:2px;background:linear-gradient(90deg,#44aaff,#2ee4d8,#18e0b9,#b277ff,#ffb040)}
+  #hud .legend-note{margin-top:4px;color:var(--dim);font-size:10px;opacity:.75}
+  #hint{left:50%;bottom:18px;transform:translateX(-50%);padding:8px 14px;font-size:11px;color:var(--dim);white-space:nowrap}
+  #toast{left:50%;bottom:64px;transform:translateX(-50%);padding:8px 14px;font-size:12px;opacity:0;pointer-events:none;transition:opacity .3s ease}
+  #toast.show{opacity:1}
+  body.ui-mode #title,body.ui-mode #hud,body.ui-mode #hint{opacity:0;pointer-events:none}
+  #loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--dim);font-size:13px;letter-spacing:.2em;z-index:10;transition:opacity .8s ease}
+  #loading.hide{opacity:0;pointer-events:none}
+  #fallback{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--dim);font-size:14px;z-index:20;padding:0 24px;text-align:center}
+  #fallback[hidden]{display:none}
+  @media (max-width:680px){#title{display:none}#hint{display:none}#hud{width:210px;font-size:11px}}
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="vignette"></div>
+
+<div id="title" class="panel">涌现式粒子原型<small>v0.14 · Three.js · 引力形变 · 呼吸 · 温度配色 · 粒子 UI · 点阵字体工程（等线Light·1格笔画·1格字距·1:1格心）骨架3500+增援3800</small></div>
+<div id="selftest" class="panel" hidden></div>
+
+<div id="hud" class="panel">
+  <div class="row"><label>全局负载</label><input id="load" type="range" min="0" max="100" value="45"><span class="val" id="loadV">45%</span></div>
+  <div class="row"><label>全局温度</label><input id="temp" type="range" min="0" max="100" value="35"><span class="val" id="tempV">35%</span></div>
+  <div class="row"><label>呼吸幅度</label><input id="breath" type="range" min="0" max="100" value="65"><span class="val" id="breathV">65%</span></div>
+  <div class="breathbar" title="呼吸相位（中=静息，满=吸气顶点，空=呼气谷底）"><i id="breathFill"></i></div>
+  <div class="row checks">
+    <label class="chk" title="自动演示遥测数据"><input type="checkbox" id="auto" checked>遥测</label>
+    <label class="chk" title="自动循环切换形态"><input type="checkbox" id="morphAuto" checked>形态</label>
+    <label class="chk" title="神经网络连线"><input type="checkbox" id="links" checked>连线</label>
+    <label class="chk" title="深空星野"><input type="checkbox" id="stars" checked>星野</label>
+  </div>
+  <div class="legend"><span>低温</span><i></i><span>高温</span></div>
+  <div class="legend-note">颜色 = 温度：色相冷→暖 · 亮度暗→亮 · 超温→暗红；负载 → 运动速度；硬件类型由位置分区表达</div>
+  <div class="legend-note">粒子 UI 双层：骨架 1000 钉住面板；增援 2000 随鼠标移动、倾泻到光标处的控件</div>
+  <div id="bars"></div>
+  <div class="shapes">
+    <button data-s="sphere" title="神经球体">球体</button>
+    <button data-s="torus" title="引力环面">环面</button>
+    <button data-s="galaxy" title="螺旋星系">星系</button>
+    <button data-s="wave" title="涟漪曲面">涟漪</button>
+    <button data-s="sculpture" title="引力雕塑">雕塑</button>
+  </div>
+  <div id="shapeName">当前形态 · <b>神经球体</b></div>
+  <div class="row btns"><button id="uiBtn" title="粒子凝聚成可交互 UI 面板（Enter）">控制面板</button><button id="pause">暂停</button></div>
+  <div class="stats"><span id="fps">-- fps</span><span id="pcount"></span></div>
+</div>
+
+<div id="hint" class="panel">移动鼠标 · 引力井　　点击 · 脉冲　　拖拽 · 旋转　　滚轮 · 缩放　　1-5/N · 形态　　B · 呼吸　　Enter · 控制面板（骨架+增援）　　空格 · 暂停</div>
+<div id="toast" class="panel"></div>
+<div id="loading">正在凝聚粒子…</div>
+<div id="fallback" hidden>当前环境不支持 WebGL，无法渲染粒子特效。</div>
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

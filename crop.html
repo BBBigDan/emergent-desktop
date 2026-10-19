@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>body{margin:0;background:#000}canvas{display:block}</style></head>
+<body>
+<script>
+// 调试裁剪工具：?src=<png路径>&x&y&w&h&s=<缩放> 把截图区域放大渲染（无头检查细节用）
+const q = new URLSearchParams(location.search);
+const src = q.get('src') || 'dist/v9-shot-reinforce.png';
+const x = +q.get('x') || 0, y = +q.get('y') || 0;
+const w = +q.get('w') || 1440, h = +q.get('h') || 900;
+const s = +q.get('s') || 2;
+const img = new Image();
+img.onload = () => {
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * s); c.height = Math.ceil(h * s);
+  document.body.appendChild(c);
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, x, y, w, h, 0, 0, c.width, c.height);
+};
+img.src = src;
+</script>
+</body>
+</html>
