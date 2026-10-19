@@ -1,0 +1,190 @@
+:root {
+  --bg: #04060c;
+  --text: rgba(228, 238, 255, 0.9);
+  --dim: rgba(228, 238, 255, 0.52);
+  --dim2: rgba(228, 238, 255, 0.3);
+  --line: rgba(148, 178, 255, 0.14);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+  font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+  user-select: none;
+}
+
+/* 背景辉光：粒子场下面垫一层冷色，纯黑底会让点阵显得发灰 */
+#bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(58% 46% at 50% 52%, rgba(24, 80, 150, 0.30), transparent 72%),
+    radial-gradient(34% 30% at 50% 50%, rgba(46, 228, 216, 0.09), transparent 70%),
+    linear-gradient(180deg, #04060c, #04060c);
+}
+#bg::after {
+  content: ""; position: absolute; inset: 0;
+  background: radial-gradient(ellipse at center, transparent 50%, rgba(0, 0, 6, 0.78) 100%);
+}
+
+/* 粒子画布压在窗口之上：窗口生长时粒子要能拖在可见边缘上 */
+#scene { position: fixed; inset: 0; z-index: 3; display: block; pointer-events: none; }
+
+#windows { position: fixed; inset: 0; z-index: 2; }
+
+/* ───────────────────────── 窗口 ───────────────────────── */
+.win {
+  position: absolute; border-radius: 18px; overflow: hidden;
+  --edge: 64px; --edge-y: 46px; --corner: 150px; --rev: 0;
+  isolation: isolate;                       /* backdrop 只吃自己内部的像素 */
+  /* 整窗一起淡入：这样 veil / frost 不会在粒子还没成型时先露出一个空板子 */
+  opacity: var(--rev);
+}
+/* 外发光单独一层：必须跟着 --rev 出现，否则第一帧就能看见一个满尺寸的"空框" */
+.win-glow {
+  position: absolute; inset: -1px; border-radius: inherit; pointer-events: none; z-index: 5;
+  box-shadow: 0 0 26px rgba(88, 178, 255, 0.20), 0 0 90px rgba(44, 130, 255, 0.14);
+  opacity: var(--rev);
+}
+.win.minimized { display: none; }
+.win.revealed { will-change: auto; }
+.win.revealed .win-frame { pointer-events: auto; }
+
+/* iframe 只做 opacity 淡入 —— 不缩放、不裁剪，内容像素不被重新栅格化 */
+.win-frame {
+  position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block;
+  background: #070b14;
+  pointer-events: none;                     /* 还没显形前不要抢点击 */
+  --fm:
+    linear-gradient(to right, rgba(0,0,0,.40) 0, rgba(0,0,0,.70) calc(var(--edge) * .42), #000 calc(var(--edge) * 1.20), #000 calc(100% - var(--edge) * 1.20), rgba(0,0,0,.70) calc(100% - var(--edge) * .42), rgba(0,0,0,.40) 100%),
+    linear-gradient(to bottom, rgba(0,0,0,.40) 0, rgba(0,0,0,.70) calc(var(--edge-y) * .42), #000 calc(var(--edge-y) * 1.20), #000 calc(100% - var(--edge-y) * 1.20), rgba(0,0,0,.70) calc(100% - var(--edge-y) * .42), rgba(0,0,0,.40) 100%);
+  -webkit-mask-image: var(--fm); mask-image: var(--fm);
+  -webkit-mask-composite: source-in; mask-composite: intersect;
+}
+
+/* 边缘毛玻璃：一层 filter + 八层 mask（四边线性 + 四角径向），越靠边越糊 */
+.win-frost {
+  position: absolute; inset: 0; pointer-events: none;
+  --m:
+    linear-gradient(to right, #000 0, rgba(0,0,0,.82) calc(var(--edge) * .22), rgba(0,0,0,.46) calc(var(--edge) * .55), rgba(0,0,0,.15) calc(var(--edge) * .82), transparent var(--edge)),
+    linear-gradient(to left,  #000 0, rgba(0,0,0,.82) calc(var(--edge) * .22), rgba(0,0,0,.46) calc(var(--edge) * .55), rgba(0,0,0,.15) calc(var(--edge) * .82), transparent var(--edge)),
+    linear-gradient(to bottom,#000 0, rgba(0,0,0,.82) calc(var(--edge-y) * .22), rgba(0,0,0,.46) calc(var(--edge-y) * .55), rgba(0,0,0,.15) calc(var(--edge-y) * .82), transparent var(--edge-y)),
+    linear-gradient(to top,   #000 0, rgba(0,0,0,.82) calc(var(--edge-y) * .22), rgba(0,0,0,.46) calc(var(--edge-y) * .55), rgba(0,0,0,.15) calc(var(--edge-y) * .82), transparent var(--edge-y)),
+    radial-gradient(circle at 0 0,    rgba(0,0,0,.92), transparent var(--corner)),
+    radial-gradient(circle at 100% 0, rgba(0,0,0,.92), transparent var(--corner)),
+    radial-gradient(circle at 0 100%, rgba(0,0,0,.92), transparent var(--corner)),
+    radial-gradient(circle at 100% 100%, rgba(0,0,0,.92), transparent var(--corner));
+  -webkit-mask-image: var(--m); mask-image: var(--m);
+  -webkit-mask-composite: source-over; mask-composite: add;
+  -webkit-backdrop-filter: blur(15px) saturate(1.24) brightness(1.14);
+  backdrop-filter: blur(15px) saturate(1.24) brightness(1.14);
+}
+
+/* 给边缘补一层冷色玻璃底：只有模糊会发白，不像玻璃 */
+.win-tint {
+  position: absolute; inset: 0; pointer-events: none; mix-blend-mode: screen;
+  --m:
+    linear-gradient(to right, rgba(150,205,255,.27) 0, rgba(120,185,255,.07) calc(var(--edge) * .5), transparent var(--edge)),
+    linear-gradient(to left,  rgba(150,205,255,.27) 0, rgba(120,185,255,.07) calc(var(--edge) * .5), transparent var(--edge)),
+    linear-gradient(to bottom,rgba(150,205,255,.18) 0, rgba(120,185,255,.06) calc(var(--edge-y) * .5), transparent var(--edge-y)),
+    linear-gradient(to top,   rgba(150,205,255,.18) 0, rgba(120,185,255,.06) calc(var(--edge-y) * .5), transparent var(--edge-y)),
+    radial-gradient(circle at 0 0,    rgba(140,200,255,.20), transparent var(--corner)),
+    radial-gradient(circle at 100% 0, rgba(140,200,255,.15), transparent var(--corner)),
+    radial-gradient(circle at 0 100%, rgba(140,200,255,.15), transparent var(--corner)),
+    radial-gradient(circle at 100% 100%, rgba(140,200,255,.20), transparent var(--corner));
+  -webkit-mask-image: var(--m); mask-image: var(--m);
+  -webkit-mask-composite: source-over; mask-composite: add;
+  opacity: .62;
+  animation: dreamBreath 6.4s ease-in-out infinite alternate;
+}
+@keyframes dreamBreath { from { opacity: .5; } to { opacity: .74; } }
+
+/* 出现期的整页雾：rev 从 0 升到 1 时这里从 1 降到 0，内容先是一团影子再析出 */
+.win-veil {
+  position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(180deg, rgba(14,32,62,.40), rgba(6,14,30,.30));
+  -webkit-backdrop-filter: blur(12px) saturate(1.10);
+  backdrop-filter: blur(12px) saturate(1.10);
+  /* 雾在 rev≈0.69 时散尽：内容"从雾里析出"靠这一层 */
+  opacity: max(0, calc(1 - var(--rev) * 1.45));
+}
+.win.revealed .win-veil { display: none; }
+
+/* 玻璃的"厚度"：内侧压暗 + 极淡内边线 + 四角冷光（纯渐变，几乎不花性能） */
+.win-rim {
+  position: absolute; inset: 0; pointer-events: none; border-radius: inherit;
+  box-shadow:
+    inset 0 0 calc(var(--edge) * 1.05) rgba(5,12,26,.34),
+    inset 0 0 calc(var(--edge) * .58) rgba(96,190,255,.075),
+    inset 0 0 0 1px rgba(160,208,255,.05);
+  background:
+    radial-gradient(56% 56% at 0% 0%,    rgba(96,190,255,.10), transparent 66%),
+    radial-gradient(56% 56% at 100% 0%,  rgba(96,190,255,.06), transparent 66%),
+    radial-gradient(56% 56% at 0% 100%,  rgba(96,190,255,.06), transparent 66%),
+    radial-gradient(56% 56% at 100% 100%,rgba(96,190,255,.10), transparent 66%);
+}
+
+@supports not ((backdrop-filter: blur(4px)) or (-webkit-backdrop-filter: blur(4px))) {
+  .win-frost { background: rgba(14, 28, 52, 0.62); }
+  .win-veil { background: rgba(10, 22, 44, 0.86); }
+}
+
+/* 标题栏：只在窗口显形后出现，避免"框先于页面" */
+.win-bar {
+  position: absolute; left: 0; right: 0; top: 0; height: 40px; z-index: 4;
+  display: flex; align-items: center; gap: 8px; padding: 0 10px 0 14px;
+  cursor: default;
+  opacity: clamp(0, calc((var(--rev) - .55) / .45), 1);
+  transform: translateY(calc((1 - var(--rev)) * -6px));
+  background: linear-gradient(180deg, rgba(8, 16, 30, 0.55), rgba(8, 16, 30, 0.12));
+  pointer-events: none;
+}
+.win.revealed .win-bar { pointer-events: auto; }
+.win-icon { width: 18px; height: 18px; object-fit: contain; }
+.win-title { font-size: 12.5px; letter-spacing: .02em; color: rgba(228,238,255,.86); }
+.win-spacer { flex: 1; }
+.win-btn {
+  width: 26px; height: 24px; border: 0; border-radius: 7px; cursor: pointer;
+  background: rgba(255, 255, 255, .05); color: var(--dim);
+  font-size: 13px; line-height: 1; font-family: inherit;
+  transition: background .15s, color .15s;
+}
+.win-btn:hover { background: rgba(255, 255, 255, .12); color: var(--text); }
+.win-close:hover { background: rgba(255, 86, 86, .28); color: #ffd9d9; }
+
+/* ───────────────────────── dock ───────────────────────── */
+#dock {
+  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 6; display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-radius: 16px;
+  background: rgba(10, 16, 28, 0.52);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(14px) saturate(1.1);
+  -webkit-backdrop-filter: blur(14px) saturate(1.1);
+}
+.dock-item {
+  width: 46px; height: 46px; border: 0; border-radius: 13px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text); font-size: 17px; font-family: inherit;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform .18s cubic-bezier(.2,.9,.3,1.2), background .18s;
+}
+.dock-item:hover { transform: translateY(-6px) scale(1.06); background: rgba(255, 255, 255, 0.10); }
+.dock-item.active { background: rgba(95, 216, 255, 0.16); box-shadow: 0 0 0 1px rgba(95,216,255,.35), 0 0 18px rgba(95,216,255,.22); }
+.dock-icon { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; }
+.dock-icon img { width: 100%; height: 100%; object-fit: contain; }
+.dock-logout { margin-left: 6px; color: var(--dim); font-size: 15px; }
+.dock-logout:hover { color: #ffb3b3; }
+
+/* ───────────────────────── HUD / 启动 ───────────────────────── */
+#hud {
+  position: fixed; left: 16px; top: 14px; z-index: 6;
+  font-size: 11px; letter-spacing: .04em; color: var(--dim2);
+  pointer-events: none;
+}
+#boot {
+  position: fixed; inset: 0; z-index: 9; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); color: var(--dim); font-size: 12px; letter-spacing: .3em;
+  transition: opacity .55s ease;
+}
+#boot.hide { opacity: 0; pointer-events: none; }
+.boot-err { text-align: center; letter-spacing: 0; line-height: 1.9; font-size: 13px; }
+.boot-err small { color: var(--dim2); font-size: 11px; }

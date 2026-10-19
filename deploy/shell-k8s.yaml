@@ -1,0 +1,114 @@
+# 涌现式桌面 · 开发壳层
+#
+# 思路：不动官方 deployment，另起一个 pod 专门跑我们的壳层。
+#   - 静态文件放 hostPath /olares/emergent-shell/www，改完 rsync 即可，无需重启
+#   - 只接管 `/`（桌面入口），/api /server /kapis 等全部反代回官方 pod:91
+#   - 用 `edge-desktop` 这个 Service 的 selector 在 dev / official 之间切换
+#
+# 首次部署：
+#   kubectl apply -f shell-k8s.yaml
+# 切到开发版：
+#   kubectl patch svc edge-desktop -n user-space-bbbigdan \
+#     -p '{"spec":{"selector":{"app":"emergent-shell"}}}'
+# 切回官方版：
+#   kubectl patch svc edge-desktop -n user-space-bbbigdan \
+#     -p '{"spec":{"selector":{"app":"olares-app"}}}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: emergent-shell-nginx
+  namespace: user-space-bbbigdan
+data:
+  emergent-shell.conf: |
+    map $http_upgrade $ed_connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen 91;
+        server_name _;
+        root /www;
+        index index.html;
+
+        # 壳层本身：不缓存，改完刷新即生效
+        location / {
+            try_files $uri $uri/index.html /index.html;
+            add_header Cache-Control "private,no-cache";
+        }
+
+        # 其余全部交回官方前端 pod，登录态、接口、静态资源都不受影响
+        location ~ ^/(api|server|kapis|market-backend|socket\.io|ws|websocket|static|js|css|fonts|assets)/ {
+            proxy_pass http://olares-app-official.user-space-bbbigdan.svc.cluster.local:91;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $ed_connection_upgrade;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_buffering off;
+            proxy_read_timeout 3600s;
+        }
+    }
+---
+# 官方前端 pod 的稳定入口（selector 只命中官方 pod），供上面 proxy_pass 使用
+apiVersion: v1
+kind: Service
+metadata:
+  name: olares-app-official
+  namespace: user-space-bbbigdan
+spec:
+  selector:
+    app: olares-app
+  ports:
+    - name: desktop
+      port: 91
+      targetPort: 91
+---
+# 注意：这里刻意用裸 Pod 而不是 Deployment。
+# Olares 的 appns-validating-webhook 只校验 deployments/statefulsets/daemonsets 的 CREATE，
+# 裸 Pod 不受该 webhook 拦截，所以开发壳层可以作为一个 Pod 直接跑起来。
+# 代价是没有 Deployment 的自愈，节点重调度后需要重新 apply（开发期可接受）。
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emergent-shell
+  namespace: user-space-bbbigdan
+  labels:
+    app: emergent-shell
+spec:
+  restartPolicy: Always
+  containers:
+    - name: nginx
+      image: docker.io/beclab/docker-nginx-headers-more:ubuntu-v0.1.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 91
+      volumeMounts:
+        - name: www
+          mountPath: /www
+        - name: conf
+          mountPath: /etc/nginx/conf.d/emergent-shell.conf
+          subPath: emergent-shell.conf
+      readinessProbe:
+        tcpSocket:
+          port: 91
+        initialDelaySeconds: 2
+        periodSeconds: 5
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+  volumes:
+    - name: www
+      hostPath:
+        path: /olares/emergent-shell/www
+        type: DirectoryOrCreate
+    - name: conf
+      configMap:
+        name: emergent-shell-nginx

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Olares</title>
+<link rel="stylesheet" href="./src/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+  <div id="bg"></div>
+  <div id="windows"></div>
+  <canvas id="scene"></canvas>
+  <div id="dock"></div>
+  <div id="hud"></div>
+  <div id="boot">正在凝聚</div>
+
+  <script>
+    // 官方桌面会注册 scope=/ 的 Service Worker，它会把旧壳层的缓存喂给同源页面，
+    // 导致我们的页面根本不被加载。这里主动摘掉——开发期必须做，否则刷新永远看到旧版。
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then((rs) => {
+        rs.forEach((r) => r.unregister());
+        if (rs.length) console.info('[emergent] 已注销', rs.length, '个 Service Worker');
+      }).catch(() => {});
+      if (window.caches) caches.keys().then((ks) => ks.forEach((k) => caches.delete(k))).catch(() => {});
+    }
+  </script>
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
