@@ -130,6 +130,30 @@ particle-sphere/
 
 ---
 
+## 版本管理约定
+
+每完成一版（自检通过 + 截图复查）：
+
+```bash
+git add -A
+git commit -m "v0.15: <一句话主题>"
+git tag -a v0.15 -m "<这一版解决了什么>"
+```
+
+回到某一版：
+
+```bash
+git log --oneline              # 看历史
+git tag                        # 列所有版本
+git checkout v0.14             # 切到该版（分离 HEAD，只读查看）
+git switch -                   # 切回最新
+git checkout v0.14 -- src      # 只把某一版源码拉回来（推荐，用于回退效果）
+npm run build                  # 单文件版不入库，回退后需重建
+```
+
+`particle-sphere-standalone.html`、`dist/`（截图）、`.tmp/`（字体探针 / CDP 驱动）都不入库：
+它们是可重建产物，避免每个版本把几百 KB 的生成文件和几十张 PNG 塞进历史。
+
 ## 已知限制
 
 - 无头软渲染下 fps 只有 14~17（SwiftShader），不代表真机；真机 Chrome 稳定 60fps。
