@@ -231,6 +231,7 @@ export class Field {
     this.cOrbS = new Float32Array(CLOUD_N);
     this.cSize = new Float32Array(CLOUD_N);
     this.cAmp = new Float32Array(CLOUD_N);
+    this.slotKey = new Int32Array(CLOUD_N).fill(-1);  // 粘性分配：粒子占的是哪一格
     this.slotX = new Float32Array(CLOUD_N);
     this.slotY = new Float32Array(CLOUD_N);
     this.cFade = new Float32Array(CLOUD_N);
@@ -621,52 +622,103 @@ export class Field {
    * @param id   控件 id（只用于记录，容量系数由调用方算好后传入）
    * @param capK 容量系数：线条类接近 1（越灌越亮），大段文字要低（会糊）
    */
+  /**
+   * 给悬停的控件分配增援槽位。
+   *
+   * **必须做粘性分配**：密码框里每多打一个字符，scanPart 的结果就会变
+   * （多一个密码点、光标位置动了）。如果每次都 cMode.fill(0) 再按距离重排，
+   * 所有粒子的角色会整批重洗 —— 这一帧是槽位的，下一帧被踢回环绕飞向指针，
+   * 再下一帧又被抓回输入框。观感就是"刚灌进去的被消耗掉，鼠标周围的又灌进来"，
+   * 一片混乱。
+   *
+   * 所以每颗粒子记住自己占的是哪一格（slotKey）：格子还在就原地不动、
+   * 只更新目标坐标；格子没了就回环绕；新增的格子才从环绕粒子按距离补。
+   */
   setSlots(pts, id, capK, scale, LW, LH) {
     if (!pts || !pts.length) { this.clearSlots(); return; }
+    const same = this.slot.id === id;
     this.slot.id = id;
 
-    const M = pts.length / 3;
+    const M = pts.length / 4;              // [x, y, role, key]
     const useCount = Math.min(CLOUD_N, Math.ceil(M * capK));
     const ox = LW / 2, oy = LH / 2;
-
-    /* 槽位中心（世界坐标） */
-    let cx = 0, cy = 0;
-    for (let k = 0; k < M; k++) {
-      cx += (pts[k * 3] - ox) * scale;
-      cy += (oy - pts[k * 3 + 1]) * scale;
-    }
-    cx /= M; cy /= M;
-
-    /* 按到控件中心的距离排序：近的先拿到槽位 → 看起来是"从指针这边灌进去" */
-    const order = new Int32Array(CLOUD_N);
-    for (let i = 0; i < CLOUD_N; i++) order[i] = i;
-    const px = this.cPos;
-    const arr = Array.from(order);
-    arr.sort((a, b) => {
-      const da = (px[a * 2] - cx) ** 2 + (px[a * 2 + 1] - cy) ** 2;
-      const db = (px[b * 2] - cx) ** 2 + (px[b * 2 + 1] - cy) ** 2;
-      return da - db;
-    });
-
-    this.cMode.fill(0);
-    /* 半格交错只对**面状**控件（文字）有意义：让增援点落在骨架点之间，均匀加密。
+    /* 半格交错只对**面状**控件（文字）有意义：让增援点落在骨架点之间均匀加密。
        线条类（边框/箭头）绝不能交错 —— 骨架点是 5.96px 的圆点，再在旁边 3px 处
-       压一个同样的点，视觉宽度直接撑到 9px，看起来就是"灌注后凭空描了一圈粗边"。
-       所以 contour 类 off = 0，与骨架点重合，只叠亮度、不改粗细。 */
+       压一个同样的点，视觉宽度直接撑到 9px，看起来就是"灌注后凭空描了一圈粗边"。 */
     const contour = id === 'input' || id === 'button';
     const off = contour ? 0 : CELL_R * scale * 0.5;
-    for (let k = 0; k < useCount; k++) {
-      const pi = arr[k];
-      /* 槽位是等距抽样分配的：M 可能大于或小于 useCount，都均匀铺开 */
-      const s = Math.min(M - 1, ((k + 0.5) * M / useCount) | 0);
-      this.cMode[pi] = 1;
-      this.cRole[pi] = pts[s * 3 + 2];
-      this.slotX[pi] = (pts[s * 3] - ox) * scale + off;
-      this.slotY[pi] = (oy - pts[s * 3 + 1]) * scale + off;
-    }
-    for (let k = useCount; k < CLOUD_N; k++) this.cRole[arr[k]] = 0;
 
-    this.slot.fill = useCount / CLOUD_N;
+    /* 新槽位的世界坐标 + key → 下标 */
+    const sx = new Float32Array(M), sy = new Float32Array(M), sr = new Uint8Array(M);
+    const keyAt = new Map();
+    for (let k = 0; k < M; k++) {
+      sx[k] = (pts[k * 4] - ox) * scale + off;
+      sy[k] = (oy - pts[k * 4 + 1]) * scale + off;
+      sr[k] = pts[k * 4 + 2];
+      const key = pts[k * 4 + 3];
+      if (!keyAt.has(key)) keyAt.set(key, k);
+    }
+
+    const claimed = new Uint8Array(M);
+    let used = 0;
+
+    if (same) {
+      /* ① 粘性：已是槽位的粒子跟着自己那一格走 */
+      for (let i = 0; i < CLOUD_N; i++) {
+        if (this.cMode[i] !== 1) continue;
+        if (used >= useCount) { this.cMode[i] = 0; this.cRole[i] = 0; continue; }
+        const k = keyAt.get(this.slotKey[i]);
+        if (k !== undefined && !claimed[k]) {
+          claimed[k] = 1;
+          this.cRole[i] = sr[k];
+          this.slotX[i] = sx[k];
+          this.slotY[i] = sy[k];
+          used++;
+        } else {
+          this.cMode[i] = 0;      // 这一格没了（比如删掉一个字符）→ 回环绕
+          this.cRole[i] = 0;
+        }
+      }
+    } else {
+      /* 换控件：全部释放，重新从指针周围灌（这一跳是想要的过渡） */
+      this.cMode.fill(0);
+      this.cRole.fill(0);
+    }
+
+    /* ② 补空位：从环绕粒子按"离控件中心由近及远"取，看起来是从指针那边灌进去 */
+    if (used < useCount) {
+      const free = [];
+      for (let k = 0; k < M; k++) if (!claimed[k]) free.push(k);
+
+      let ccx = 0, ccy = 0;
+      for (let k = 0; k < M; k++) { ccx += sx[k]; ccy += sy[k]; }
+      ccx /= M; ccy /= M;
+
+      const cand = [];
+      for (let i = 0; i < CLOUD_N; i++) if (this.cMode[i] !== 1) cand.push(i);
+      const px = this.cPos;
+      cand.sort((a, b) => {
+        const da = (px[a * 2] - ccx) ** 2 + (px[a * 2 + 1] - ccy) ** 2;
+        const db = (px[b * 2] - ccx) ** 2 + (px[b * 2 + 1] - ccy) ** 2;
+        return da - db;
+      });
+
+      const need = Math.min(useCount - used, cand.length, free.length);
+      for (let j = 0; j < need; j++) {
+        const pi = cand[j];
+        /* 空槽位等距抽样 → 粒子均匀铺开，不会全挤在文字开头 */
+        const k = free[Math.min(free.length - 1, ((j + 0.5) * free.length / need) | 0)];
+        claimed[k] = 1;
+        this.cMode[pi] = 1;
+        this.cRole[pi] = sr[k];
+        this.slotKey[pi] = pts[k * 4 + 3];
+        this.slotX[pi] = sx[k];
+        this.slotY[pi] = sy[k];
+        used++;
+      }
+    }
+
+    this.slot.fill = used / CLOUD_N;
     this.applyHot(id, scale);   // 骨架里属于该控件的点整体提亮
     this.rebuildSlotLinks();
   }
@@ -676,7 +728,7 @@ export class Field {
     this.hotPart = id || null;
     for (let i = 0; i < this.top; i++) {
       this.hot[i] = id && ROLE_PART[this.role[i]] === id ? 1 : 0;
-      if (scale) this.sScale[i] = CELL * scale * 1.38 * (ROLE_S[this.role[i]] ?? 1);
+      if (scale) this.sScale[i] = CELL * scale * 1.06 * (ROLE_S[this.role[i]] ?? 1);
     }
     this.geo.attributes.aHot.needsUpdate = true;
     if (scale) this.geo.attributes.aSize.needsUpdate = true;
@@ -966,7 +1018,7 @@ export class Field {
          （ROLE_A 0.70 vs 0.88），灌注时不能一视同仁提到 1.15 —— 那会让边框
          比文字还亮，看起来像"把控件外框描了出来"。 */
       const slotA = this.cRole[i] === 3 ? 0.72 : 1.15;
-      const base = this.cMode[i] === 1 ? slotA : (this.ptr.on ? 1.0 : 0.30);
+      const base = this.cMode[i] === 1 ? slotA : (this.ptr.on ? 0.75 : 0.30);
       this.cAlpha[i] = this.cAmp[i] * base * this.cFade[i] * burst * this.gainC;
     }
 

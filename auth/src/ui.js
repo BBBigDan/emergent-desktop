@@ -217,27 +217,37 @@ function drawInput(c, s) {
   if (n === 0 && !s.focused) {
     uiText(c, ROLE.PLACE, 46, '密码', padX, cy, 'left');
   } else {
-    /* 密码点：6.4 格见方的实心块，一眼看出有几个字符 */
-    const box = 16;
-    const gap = 26;
+    /* 密码点：4 格见方（屏幕 22px）。16px（6.4 格）时它比字还重，
+       一排方块压在输入框里，视觉重心直接从"界面"掉到"密码框"。
+       间距也从 26 收到 16，让 8 个字符仍然排在框体前 2/3 以内。 */
+    const box = 10;
+    const gap = 16;
     let dx = padX;
     const maxVisible = Math.floor((I.w - 100) / (box + gap));
+    /* 圆点：方块的直角在点阵里缺角，4×4 格出来是"小乱码"；圆形栅格化后
+       是干净的 3×3~4×4 圆斑，才像官方那种 bullet */
+    const dot = (px, py, r, role) => {
+      c.fillStyle = tone(role);
+      c.beginPath();
+      c.arc(px, py, r, 0, 6.2832);
+      c.fill();
+    };
     for (let i = 0; i < Math.min(n, maxVisible); i++) {
-      c.fillStyle = tone(ROLE.DOT);
-      c.fillRect(dx, cy - box / 2, box, box);
+      dot(dx + box / 2, cy, box / 2, ROLE.DOT);
       dx += box + gap;
     }
     /* 光标位 */
     if (s.focused && n < maxVisible) {
-      c.fillStyle = tone(ROLE.CURSOR);
-      c.fillRect(dx, cy - box / 2, box, box);
+      dot(dx + box / 2, cy, box / 2, ROLE.CURSOR);
     }
     if (n > maxVisible) {
       /* 溢出的用三个点表示 */
       c.fillStyle = tone(ROLE.HINT);
-      const d3 = 7, g3 = 8;
+      const d3 = 5, g3 = 7;
       for (let i = 0; i < 3; i++) {
-        c.fillRect(dx + i * (d3 + g3), cy - d3 / 2, d3, d3);
+        c.beginPath();
+        c.arc(dx + i * (d3 + g3) + d3 / 2, cy, d3 / 2, 0, 6.2832);
+        c.fill();
       }
     }
   }
@@ -377,7 +387,10 @@ export function scan(ctx) {
 /**
  * 只扫某个控件，用细网格 —— 给增援层当槽位。
  * 注意：会清空并重画画布，调用方事后要 paint() 还原。
- * @returns {number[]} [x, y, role] 三元组，行优先（已按 y,x 有序）
+ * @returns {number[]} [x, y, role, key] 四元组，行优先（已按 y,x 有序）。
+ *   key 是格子索引，setSlots 靠它做**粘性分配**：密码框里多打一个字符时，
+ *   边框那些格子的 key 一个都没变，占着它们的粒子就该继续待在那儿，
+ *   而不是每敲一个键就整批重洗一遍角色（那就是"乱"的来源）。
  */
 export function scanPart(ctx, s, id, scale) {
   const r = RECT[id];
@@ -401,6 +414,6 @@ export function scanPart(ctx, s, id, scale) {
     d, W, H, sat, cell, TH_R,
     Math.max(0, r.x - pad), Math.max(0, r.y - pad),
     Math.min(W, r.x + r.w + pad), Math.min(H, r.y + r.h + pad),
-    false,
+    true,   // 带 key：供增援层做粘性分配
   );
 }
