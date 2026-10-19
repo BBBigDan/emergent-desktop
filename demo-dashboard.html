@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Olares · 系统概览</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --bg:#070b14; --card:rgba(14,22,38,.66); --line:rgba(140,180,255,.10);
+    --text:#e6eeff; --dim:#8b9bb8; --dim2:#5e6d89;
+    --cyan:#5fd8ff; --teal:#2ee4d8; --purple:#b277ff; --amber:#ffb040; --red:#ff6b6b;
+  }
+  html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+    font-family:"PingFang SC","Microsoft YaHei",-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
+  .app{display:grid;grid-template-columns:204px 1fr;height:100%}
+
+  /* ---------- 侧栏 ---------- */
+  aside{border-right:1px solid var(--line);padding:18px 12px 14px;display:flex;flex-direction:column;
+    background:linear-gradient(180deg,rgba(22,36,64,.45),rgba(7,11,20,0) 55%)}
+  .brand{display:flex;align-items:center;gap:9px;padding:0 8px 20px}
+  .logo{width:20px;height:20px;border-radius:6px;flex:none;background:conic-gradient(from 210deg,#5fd8ff,#2ee4d8,#b277ff,#5fd8ff);
+    box-shadow:0 0 18px rgba(95,216,255,.55)}
+  .brand b{font-size:12px;letter-spacing:.26em;font-weight:600}
+  .navgroup{font-size:9.5px;letter-spacing:.18em;color:var(--dim2);padding:12px 10px 6px}
+  .nav{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--dim);font-size:12.5px;margin-bottom:1px}
+  .nav i{width:5px;height:5px;border-radius:1.5px;background:currentColor;opacity:.55;flex:none}
+  .nav.on{background:rgba(95,216,255,.10);color:#dff4ff;box-shadow:inset 0 0 0 1px rgba(95,216,255,.16)}
+  .nav.on i{background:var(--cyan);opacity:1;box-shadow:0 0 8px var(--cyan)}
+  .aside-foot{margin-top:auto;padding:10px 8px 0;border-top:1px solid var(--line);font-size:10px;color:var(--dim2);line-height:1.7}
+  .aside-foot b{color:var(--dim);font-weight:500}
+
+  /* ---------- 主区 ---------- */
+  main{display:grid;grid-template-rows:56px 1fr 24px;min-width:0;min-height:0}
+  header{display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--line)}
+  .h-l{display:flex;align-items:baseline;gap:10px}
+  h1{font-size:15px;font-weight:500;letter-spacing:.06em}
+  .h-sub{font-size:10.5px;color:var(--dim2)}
+  .h-r{display:flex;align-items:center;gap:12px}
+  .search{display:flex;align-items:center;gap:7px;height:26px;padding:0 10px;border-radius:7px;
+    background:rgba(255,255,255,.035);border:1px solid var(--line);color:var(--dim2);font-size:11px;width:168px}
+  .search i{width:9px;height:9px;border:1.4px solid currentColor;border-radius:50%;position:relative}
+  .search i::after{content:"";position:absolute;right:-3px;bottom:-2px;width:4px;height:1.4px;background:currentColor;transform:rotate(45deg)}
+  .pill{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim);padding:4px 9px;border-radius:20px;
+    border:1px solid var(--line);background:rgba(46,228,216,.05)}
+  .dot{width:5px;height:5px;border-radius:50%;background:var(--teal);box-shadow:0 0 8px var(--teal)}
+
+  .content{display:grid;grid-template-columns:1fr 252px;gap:11px;padding:13px 18px;min-height:0;overflow:hidden}
+  .col{display:grid;gap:11px;min-height:0;min-width:0}
+  .col.l{grid-template-rows:auto 1fr}
+  .col.r{grid-template-rows:auto 1fr}
+
+  /* 指标卡 */
+  .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:11px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:11px 12px 9px;overflow:hidden;position:relative}
+  .card::after{content:"";position:absolute;inset:0 0 auto;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(150,210,255,.35),transparent)}
+  .card .k{font-size:10.5px;color:var(--dim);display:flex;justify-content:space-between;align-items:center;letter-spacing:.04em}
+  .tag{font-size:9.5px;padding:1px 5px;border-radius:4px;border:1px solid currentColor;opacity:.9}
+  .t-cool{color:#63c9ff} .t-warm{color:var(--amber)} .t-hot{color:var(--red)}
+  .card .v{font-size:23px;font-weight:300;margin-top:5px;letter-spacing:-.01em;line-height:1.1}
+  .card .v small{font-size:10.5px;color:var(--dim);margin-left:2px;font-weight:400}
+  .card canvas{display:block;width:100%;height:24px;margin-top:7px}
+
+  /* 主图表 */
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:11px;padding:11px 13px;min-height:0;overflow:hidden;
+    display:flex;flex-direction:column}
+  .p-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+  .p-title{font-size:11.5px;color:var(--dim);letter-spacing:.05em}
+  .legend{display:flex;gap:11px;font-size:10px;color:var(--dim)}
+  .legend span{display:flex;align-items:center;gap:5px}
+  .legend i{width:7px;height:2px;border-radius:1px}
+  .chartbox{flex:1;min-height:0;position:relative}
+  .chartbox canvas{position:absolute;inset:0;width:100%;height:100%}
+
+  /* 应用列表 */
+  .apps{display:flex;flex-direction:column;gap:3px;margin-top:4px;overflow:hidden}
+  .app-row{display:grid;grid-template-columns:1fr 46px 46px;align-items:center;gap:8px;padding:6px 2px;
+    border-bottom:1px solid rgba(140,180,255,.06);font-size:11.5px}
+  .app-row:last-child{border-bottom:0}
+  .app-name{display:flex;align-items:center;gap:7px;min-width:0}
+  .app-name span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sdot{width:5px;height:5px;border-radius:50%;flex:none}
+  .s-on{background:#2ee4d8;box-shadow:0 0 7px #2ee4d8}
+  .s-idle{background:#5e6d89}
+  .s-warn{background:#ffb040;box-shadow:0 0 7px #ffb040}
+  .mini{height:3px;background:rgba(255,255,255,.07);border-radius:2px;overflow:hidden}
+  .mini i{display:block;height:100%;border-radius:2px}
+  footer{display:flex;align-items:center;justify-content:space-between;padding:0 18px;font-size:10px;color:var(--dim2);border-top:1px solid var(--line)}
+  .stat{display:flex;gap:14px}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="brand"><div class="logo"></div><b>OLARES</b></div>
+    <div class="navgroup">工作空间</div>
+    <div class="nav on"><i></i>系统概览</div>
+    <div class="nav"><i></i>我的应用</div>
+    <div class="nav"><i></i>文件</div>
+    <div class="nav"><i></i>知识库</div>
+    <div class="navgroup">平台</div>
+    <div class="nav"><i></i>节点与网络</div>
+    <div class="nav"><i></i>存储卷</div>
+    <div class="nav"><i></i>设置</div>
+    <div class="aside-foot">
+      节点 <b>olares-home</b><br>运行 <b id="uptime">127d 04:12</b><br>K3s <b>v1.30.4</b>
+    </div>
+  </aside>
+
+  <main>
+    <header>
+      <div class="h-l"><h1>系统概览</h1><span class="h-sub" id="clock">10:46:03</span></div>
+      <div class="h-r">
+        <div class="search"><i></i>搜索应用、文件…</div>
+        <div class="pill"><span class="dot"></span>全部服务正常</div>
+      </div>
+    </header>
+
+    <div class="content">
+      <div class="col l">
+        <div class="cards" id="cards"></div>
+        <div class="panel">
+          <div class="p-head">
+            <div class="p-title">综合负载 · 近 12 小时</div>
+            <div class="legend">
+              <span><i style="background:#5fd8ff"></i>CPU</span>
+              <span><i style="background:#b277ff"></i>GPU</span>
+              <span><i style="background:#2ee4d8"></i>内存</span>
+            </div>
+          </div>
+          <div class="chartbox"><canvas id="chart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="col r">
+        <div class="panel">
+          <div class="p-head"><div class="p-title">运行中的应用</div><div class="p-title" style="opacity:.6">7 / 9</div></div>
+          <div class="apps" id="apps"></div>
+        </div>
+        <div class="panel">
+          <div class="p-head"><div class="p-title">存储卷</div></div>
+          <div class="apps" id="vols"></div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <div class="stat"><span>CPU 8 核</span><span>内存 32 GB</span><span>GPU RTX 4060</span><span>磁盘 8 TB</span></div>
+      <div class="stat"><span id="fpsTxt">遥测 1s</span><span>Prometheus</span><span>v1.12.6</span></div>
+    </footer>
+  </main>
+</div>
+
+<script>
+/* ---------- 指标卡 ---------- */
+const CARDS = [
+  { k: 'CPU', v: 42, unit: '%', sub: '58°C', temp: 'cool', c1: '#5fd8ff', c2: 'rgba(95,216,255,0)' },
+  { k: 'GPU', v: 71, unit: '%', sub: '64°C', temp: 'warm', c1: '#b277ff', c2: 'rgba(178,119,255,0)' },
+  { k: '内存', v: 18.2, unit: 'GB', sub: '/ 32', temp: 'cool', c1: '#2ee4d8', c2: 'rgba(46,228,216,0)' },
+  { k: '显存', v: 12.4, unit: 'GB', sub: '/ 24', temp: 'cool', c1: '#18e0b9', c2: 'rgba(24,224,185,0)' },
+  { k: '硬盘', v: 3.1, unit: 'TB', sub: '/ 8', temp: 'cool', c1: '#ffb040', c2: 'rgba(255,176,64,0)' },
+];
+const TEMP_TXT = { cool: '正常', warm: '偏热', hot: '超温' };
+const cardsEl = document.getElementById('cards');
+const charts = [];
+CARDS.forEach((c) => {
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = `<div class="k"><span>${c.k}</span><span class="tag t-${c.temp}">${TEMP_TXT[c.temp]}</span></div>
+    <div class="v"><span data-v>${c.v}</span><small>${c.unit} ${c.sub}</small></div>
+    <canvas></canvas>`;
+  cardsEl.appendChild(d);
+  const cv = d.querySelector('canvas');
+  const series = Array.from({ length: 34 }, () => 0.25 + Math.random() * 0.6);
+  charts.push({ cv, c, series });
+});
+
+/* ---------- 应用 / 存储列表 ---------- */
+const APPS = [
+  ['Nginx 反代', 'on', 8, 2], ['Jellyfin', 'on', 26, 4], ['Syncthing', 'on', 11, 1],
+  ['Ollama', 'warn', 63, 88], ['PostgreSQL', 'on', 17, 2], ['qBittorrent', 'idle', 2, 0],
+  ['Home Assistant', 'on', 6, 1], ['Vaultwarden', 'on', 3, 0],
+];
+document.getElementById('apps').innerHTML = APPS.map(([n, s, cpu, gpu]) => `
+  <div class="app-row">
+    <div class="app-name"><i class="sdot s-${s}"></i><span>${n}</span></div>
+    <div class="mini"><i style="width:${cpu}%;background:${cpu > 50 ? '#ffb040' : '#5fd8ff'}"></i></div>
+    <div class="mini"><i style="width:${gpu}%;background:${gpu > 50 ? '#b277ff' : '#2ee4d8'}"></i></div>
+  </div>`).join('');
+
+const VOLS = [['system', 38, '#5fd8ff'], ['media', 71, '#ffb040'], ['backup', 24, '#2ee4d8']];
+document.getElementById('vols').innerHTML = VOLS.map(([n, p, c]) => `
+  <div class="app-row" style="grid-template-columns:56px 1fr 34px">
+    <div class="app-name"><span>${n}</span></div>
+    <div class="mini"><i style="width:${p}%;background:${c}"></i></div>
+    <div style="color:#8b9bb8;font-size:10.5px;text-align:right">${p}%</div>
+  </div>`).join('');
+
+/* ---------- 迷你折线 ---------- */
+function drawSpark({ cv, c, series }) {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== w * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const n = series.length, step = w / (n - 1);
+  const y = (v) => h - 2 - v * (h - 5);
+  g.beginPath();
+  series.forEach((v, i) => (i ? g.lineTo(i * step, y(v)) : g.moveTo(0, y(v))));
+  g.lineTo(w, h); g.lineTo(0, h); g.closePath();
+  const grad = g.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, c.c1 + '55'); grad.addColorStop(1, c.c2);
+  g.fillStyle = grad; g.fill();
+  g.beginPath();
+  series.forEach((v, i) => (i ? g.lineTo(i * step, y(v)) : g.moveTo(0, y(v))));
+  g.strokeStyle = c.c1; g.lineWidth = 1.2; g.lineJoin = 'round'; g.stroke();
+  g.beginPath();
+  g.arc(w - 1.5, y(series[n - 1]), 1.6, 0, 7); g.fillStyle = c.c1; g.fill();
+}
+
+/* ---------- 主图 ---------- */
+const chartCv = document.getElementById('chart');
+const SERIES = [
+  { color: '#5fd8ff', data: [], base: 0.40 },
+  { color: '#b277ff', data: [], base: 0.62 },
+  { color: '#2ee4d8', data: [], base: 0.52 },
+];
+const NPT = 72;
+SERIES.forEach((s) => { for (let i = 0; i < NPT; i++) s.data.push(s.base + (Math.random() - 0.5) * 0.16); });
+
+function drawChart() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = chartCv.clientWidth, h = chartCv.clientHeight;
+  if (!w || !h) return;
+  if (chartCv.width !== Math.round(w * dpr)) { chartCv.width = Math.round(w * dpr); chartCv.height = Math.round(h * dpr); }
+  const g = chartCv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const padB = 14, padT = 8;
+  const y = (v) => padT + (1 - v) * (h - padT - padB);
+  // 网格
+  g.strokeStyle = 'rgba(140,180,255,.07)'; g.lineWidth = 1;
+  [0, 0.25, 0.5, 0.75, 1].forEach((v) => {
+    g.beginPath(); g.moveTo(0, y(v) + 0.5); g.lineTo(w, y(v) + 0.5); g.stroke();
+  });
+  // 横轴标签
+  g.fillStyle = 'rgba(140,160,190,.55)'; g.font = '9px "PingFang SC",sans-serif';
+  ['-12h', '-9h', '-6h', '-3h', '现在'].forEach((t, i, a) => {
+    g.textAlign = i === 0 ? 'left' : i === a.length - 1 ? 'right' : 'center';
+    g.fillText(t, (i / (a.length - 1)) * w, h - 3);
+  });
+  const step = w / (NPT - 1);
+  SERIES.forEach((s) => {
+    // 面积
+    g.beginPath();
+    s.data.forEach((v, i) => (i ? g.lineTo(i * step, y(v)) : g.moveTo(0, y(v))));
+    g.lineTo(w, h - padB); g.lineTo(0, h - padB); g.closePath();
+    const grad = g.createLinearGradient(0, 0, 0, h - padB);
+    grad.addColorStop(0, s.color + '22'); grad.addColorStop(1, s.color + '00');
+    g.fillStyle = grad; g.fill();
+    // 线
+    g.beginPath();
+    s.data.forEach((v, i) => (i ? g.lineTo(i * step, y(v)) : g.moveTo(0, y(v))));
+    g.strokeStyle = s.color; g.lineWidth = 1.4; g.lineJoin = 'round'; g.shadowColor = s.color + '88'; g.shadowBlur = 6; g.stroke();
+    g.shadowBlur = 0;
+    // 尾点
+    const lv = s.data[NPT - 1];
+    g.beginPath(); g.arc(w - 1, y(lv), 2, 0, 7); g.fillStyle = s.color; g.fill();
+  });
+}
+
+/* ---------- 数据推进 ---------- */
+function tick() {
+  charts.forEach((c) => {
+    const last = c.series[c.series.length - 1];
+    let v = last + (Math.random() - 0.5) * 0.14;
+    v += (c.c.v / (c.c.unit === '%' ? 100 : 32) - last) * 0.06;
+    c.series.push(Math.max(0.06, Math.min(0.96, v)));
+    if (c.series.length > 34) c.series.shift();
+    // 数值同步
+    const el = c.cv.parentElement.querySelector('[data-v]');
+    const base = c.c.unit === '%' ? c.c.v : c.c.v;
+    const nv = base + (c.series[c.series.length - 1] - 0.5) * (c.c.unit === '%' ? 14 : 2.2);
+    el.textContent = c.c.unit === '%' ? Math.max(1, Math.round(nv)) : nv.toFixed(1);
+    drawSpark(c);
+  });
+  SERIES.forEach((s) => {
+    let v = s.data[NPT - 1] + (Math.random() - 0.5) * 0.07;
+    v += (s.base - v) * 0.05;
+    s.data.push(Math.max(0.04, Math.min(0.97, v)));
+    s.data.shift();
+  });
+  drawChart();
+}
+
+function clock() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  document.getElementById('clock').textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function boot() {
+  tick(); clock();
+  setInterval(tick, 900);
+  setInterval(clock, 1000);
+}
+if (document.readyState === 'complete') boot(); else addEventListener('load', boot);
+addEventListener('resize', () => { drawChart(); charts.forEach(drawSpark); });
+</script>
+</body>
+</html>

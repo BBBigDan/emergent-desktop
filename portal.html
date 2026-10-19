@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>粒子门 · iframe 包裹试验</title>
+<style>
+  :root{
+    --bg:#04060c;
+    --panel:rgba(10,16,28,.62);
+    --line:rgba(148,178,255,.14);
+    --text:rgba(228,238,255,.9);
+    --dim:rgba(228,238,255,.52);
+    --dim2:rgba(228,238,255,.32);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+    font-family:"PingFang SC","Microsoft YaHei",-apple-system,"Segoe UI",sans-serif;user-select:none}
+
+  /* 背景辉光 */
+  #bg{position:fixed;inset:0;z-index:0;pointer-events:none;
+    background:
+      radial-gradient(58% 46% at 50% 49%, rgba(24,80,150,.34), transparent 72%),
+      radial-gradient(34% 30% at 50% 50%, rgba(46,228,216,.10), transparent 70%),
+      linear-gradient(180deg,#04060c,#04060c)}
+  #bg::after{content:"";position:absolute;inset:0;
+    background:radial-gradient(ellipse at center,transparent 52%,rgba(0,0,6,.72) 100%)}
+
+  /* 粒子画布：压在 iframe 之上（pointer-events:none 不影响页面交互）。
+     窗口生长时粒子要能"拖"在可见边缘上，若压在下面就会被窗口吞掉；
+     越过边缘向内漂的粒子靠透明度衰减表现"被吸进页面"。 */
+  #scene{position:fixed;inset:0;z-index:3;display:block;pointer-events:none}
+
+  /* iframe 外壳：始终是最终尺寸，靠 transform:scale 从 0 放大到 1。
+     之所以不用 clip-path 从中心"开洞"：那样只是露出页面中间一块，像窥视孔；
+     scale 才是"这扇窗本身从粒子点里长出来"，且粒子前沿与窗口边缘严格等比对齐。 */
+  #portal{position:fixed;left:0;top:0;z-index:2;border-radius:18px;overflow:hidden;
+    background:#070b14;transform-origin:50% 50%;will-change:transform;
+    box-shadow:0 0 0 1px rgba(126,196,255,.30), 0 0 22px rgba(88,178,255,.34), 0 0 78px rgba(44,130,255,.26),
+               inset 0 0 60px rgba(30,110,210,.14)}
+  #portal iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#070b14}
+
+  /* HUD */
+  .panel{position:fixed;z-index:4;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+  #title{top:16px;left:16px;padding:9px 13px;font-size:12px;letter-spacing:.05em;pointer-events:none}
+  #title small{display:block;color:var(--dim);font-size:10px;margin-top:3px;letter-spacing:.02em;line-height:1.6}
+  #selftest{top:16px;left:16px;margin-top:74px;max-width:420px;padding:10px 13px;font-size:11px;line-height:1.75;
+    white-space:pre;font-variant-numeric:tabular-nums;color:var(--dim)}
+  #selftest[hidden]{display:none}
+  #selftest b{color:var(--text);font-weight:500}
+
+  #hud{bottom:16px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;
+    padding:8px 10px;font-size:11.5px;white-space:nowrap}
+  #hud button{background:rgba(255,255,255,.045);border:1px solid var(--line);color:var(--text);
+    border-radius:8px;padding:5px 11px;font-size:11.5px;cursor:pointer;font-family:inherit}
+  #hud button:hover{border-color:rgba(148,178,255,.38);background:rgba(255,255,255,.08)}
+  #hud .sep{width:1px;height:18px;background:var(--line);margin:0 2px}
+  #hud input[type=range]{width:82px;accent-color:#5fd8ff;height:14px}
+  #hud .lbl{color:var(--dim);font-size:10.5px}
+  #hud input[type=text]{width:186px;background:rgba(255,255,255,.04);border:1px solid var(--line);
+    color:var(--text);border-radius:7px;padding:5px 8px;font-size:11px;font-family:inherit;outline:none}
+  #hud input[type=text]:focus{border-color:rgba(95,216,255,.5)}
+  #hud .stat{color:var(--dim2);font-variant-numeric:tabular-nums;min-width:74px;text-align:right;font-size:10.5px}
+
+  #hint{position:fixed;right:16px;bottom:16px;z-index:4;padding:7px 11px;font-size:10.5px;color:var(--dim2);
+    letter-spacing:.03em}
+  #loading{position:fixed;inset:0;z-index:9;display:flex;align-items:center;justify-content:center;
+    background:var(--bg);color:var(--dim);font-size:12px;letter-spacing:.28em;transition:opacity .5s ease}
+  #loading.hide{opacity:0;pointer-events:none}
+  #fallback{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;
+    background:var(--bg);color:var(--dim);font-size:13px;text-align:center;padding:0 24px}
+  #fallback[hidden]{display:none}
+  @media (max-width:760px){#title,#hint{display:none}#hud input[type=text]{width:120px}}
+</style>
+</head>
+<body>
+<div id="bg"></div>
+<canvas id="scene"></canvas>
+
+<div id="portal"><iframe id="frame" title="portal content" allow="clipboard-read; clipboard-write"></iframe></div>
+
+<div id="title" class="panel">粒子门 · iframe 包裹试验 <span style="opacity:.45">v0.15</span>
+  <small>粒子先收成一个点 → 从点长出窗口边框 → iframe 在粒子流里被撑开 → 稳定后粒子沿四边循环流动</small>
+</div>
+<div id="selftest" class="panel" hidden></div>
+
+<div id="hud" class="panel">
+  <button id="replay" title="从点重新长一次（R）">重播</button>
+  <button id="collapse" title="收回成一点（Esc）">收回</button>
+  <div class="sep"></div>
+  <span class="lbl">流速</span><input id="flow" type="range" min="0" max="260" value="100">
+  <div class="sep"></div>
+  <input id="url" type="text" spellcheck="false" placeholder="iframe 地址（默认本地 dashboard）">
+  <button id="load">载入</button>
+  <div class="stat" id="stat">--</div>
+</div>
+<div id="hint" class="panel">R 重播　Esc 收回　鼠标靠近边框 · 粒子被推开　可填网址载入别的页面（部分站点禁止被 iframe 嵌入）</div>
+
+<div id="loading">正在凝聚…</div>
+<div id="fallback" hidden>当前环境不支持 WebGL，无法渲染粒子流。</div>
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module" src="./src/portal.js"></script>
+</body>
+</html>
