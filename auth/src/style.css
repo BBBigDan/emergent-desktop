@@ -1,0 +1,98 @@
+/* 登录页：没有任何容器、卡片、按钮 —— 屏幕上只有粒子。
+   这里只负责底色、画布尺寸，以及那个看不见的输入框。 */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  background: #04060c; color: #e4eeff;
+  font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+  user-select: none; -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 粒子下面的冷色辉光。点阵必须有点底气，纯黑会让点看起来发灰 */
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(54% 44% at 50% 48%, rgba(24, 78, 148, 0.30), transparent 72%),
+    radial-gradient(28% 24% at 50% 50%, rgba(46, 228, 216, 0.08), transparent 70%);
+  opacity: 0; transition: opacity 1.2s ease;
+}
+body.ready::before { opacity: 1; }
+/* 四周压暗，注意力收到点阵上 */
+body::after {
+  content: ""; position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 44%, rgba(0, 0, 6, 0.86) 100%);
+}
+
+/* canvas 是替换元素：只写 inset:0 不会拉伸它（会保持 300×150），必须显式给宽高 */
+#scene {
+  position: fixed; inset: 0; width: 100%; height: 100%;
+  z-index: 2; display: block;
+  opacity: 0; transition: opacity 0.9s ease;
+}
+body.ready #scene { opacity: 1; }
+
+/* 头像：真实照片，垫在粒子层下面 —— 外圈那些流动的粒子会压在它的边缘上，
+   看起来就是「头像被粒子流包裹」。位置与直径由 JS 按逻辑坐标算。 */
+.ava-wrap {
+  position: fixed; z-index: 1;
+  border-radius: 50%; overflow: hidden;
+  opacity: 0; transform: scale(0.92);
+  transition: opacity 0.7s ease, transform 0.7s cubic-bezier(0.2, 0.8, 0.2, 1);
+  box-shadow:
+    0 0 0 1px rgba(150, 210, 255, 0.14),
+    0 0 34px rgba(60, 150, 255, 0.26),
+    0 0 90px rgba(30, 110, 220, 0.18);
+  background: radial-gradient(circle at 50% 30%, rgba(40, 110, 190, 0.55), rgba(8, 20, 40, 0.9));
+}
+body.ready .ava-wrap { opacity: 1; transform: none; }
+body.leaving .ava-wrap { opacity: 0; transform: scale(1.06); transition: opacity 0.45s ease, transform 0.6s ease; }
+
+.ava {
+  width: 100%; height: 100%; display: block;
+  object-fit: cover; border-radius: 50%;
+}
+.ava-letter {
+  position: absolute; inset: 0;
+  display: none; align-items: center; justify-content: center;
+  font-size: 42px; font-weight: 600; letter-spacing: 0.02em;
+  color: rgba(226, 242, 255, 0.94);
+}
+.ava-wrap.no-img .ava { display: none; }
+.ava-wrap.no-img .ava-letter { display: flex; }
+
+/* 透明输入框：位置由 JS 按密码框的逻辑坐标算出来，用户看不见它 */
+#pw {
+  position: fixed; z-index: 3;
+  opacity: 0;
+  border: 0; outline: 0; background: transparent;
+  color: transparent; caret-color: transparent;
+  font-size: 16px;              /* 低于 16px 时 iOS 会自动放大页面 */
+  cursor: text;
+}
+
+/* 指在「进入」上时给个手型（它只是一片粒子，但该有的反馈要有） */
+body.on-btn { cursor: pointer; }
+body.on-btn #pw { cursor: pointer; }
+
+/* 输错时整块点阵抖一下。抖的是 canvas，代价是短暂重新栅格化，可接受 */
+body.shake #scene { animation: dotShake 0.42s cubic-bezier(0.36, 0.07, 0.19, 0.97); }
+@keyframes dotShake {
+  10%, 90% { transform: translateX(-2px); }
+  30%, 70% { transform: translateX(4px); }
+  50% { transform: translateX(-3px); }
+}
+
+/* 成功后点阵炸开，整页淡出，交给桌面 */
+body.leaving #scene { opacity: 0; transition: opacity 0.62s ease 0.16s; }
+body.leaving::before { opacity: 0; transition: opacity 0.5s ease; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body.shake #scene { animation: none; }
+  #scene { transition: none; }
+}

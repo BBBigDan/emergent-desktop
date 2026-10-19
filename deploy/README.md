@@ -84,3 +84,60 @@ ssh root@HOST 'bash /root/switch.sh official'
 # 彻底移除开发壳层：
 ssh root@HOST 'kubectl delete pod emergent-shell -n user-space-bbbigdan; kubectl delete -f /root/shell-k8s.yaml'
 ```
+
+---
+
+# 登录页（emergent-auth）
+
+和壳层同一套路：另起一个 nginx Pod 只接管 `/`，`/api` `/bfl` `/jwks.json` 全部反代回官方的
+`auth-front`（`authelia-deployment` 容器），登录协议一行不改。
+
+```bash
+# 首次
+ssh root@HOST 'kubectl apply -f /root/auth-k8s.yaml'
+# 切到我们的登录页
+ssh root@HOST 'kubectl patch svc authelia-svc -n user-space-bbbigdan -p "{\"spec\":{\"selector\":{\"app\":\"emergent-auth\"}}}"'
+# 回滚
+ssh root@HOST 'kubectl patch svc authelia-svc -n user-space-bbbigdan -p "{\"spec\":{\"selector\":{\"app\":\"authelia\"}}}"'
+```
+
+静态文件在宿主机 `/olares/emergent-auth/www`，改完 `scp` 上去刷新即生效，不用重启。
+
+## 它长什么样
+
+界面**没有一块 DOM 容器**：`src/ui.js` 用 2D canvas 画一份「墨稿」（用户名、提示、输入框、箭头），
+`scan()` 按 cell 网格把覆盖率够的格子采样成点阵，`src/field.js` 用粒子把这些点排出来。
+DOM 里只有两样东西：
+
+| 元素 | 作用 |
+|---|---|
+| `<img id="ava">` | 头像真实照片（官方 CDN 默认图；加载失败退回首字母） |
+| `<input id="pw">` | 透明输入框，只为收键盘 / 唤起移动端输入法 |
+
+头像外圈那层流动的粒子是 `field.js` 的 `orbit` 组：不同半径不同角速度形成剪切层，
+亮度带沿圆周扫过。它画在头像**上层**，所以看起来是把头像「包」起来的。
+
+## 三个必须照抄的协议细节
+
+1. **密码要先 md5**：`osVersion >= 1.12.0` 时传 `md5(password + "@Olares2025")`，
+   常量写在官方包里（`y6(pwd, {osVersion})`）。传明文会被判密码错。
+2. **用户名从 `X-Bfl-User` 头取**：Authelia 定制版从 header 拿 ctxuser，
+   没有它会回 400 `cannot get user name from header`。正常链路里由网关注入，
+   从 pod 内部直连测试时需要手动带。
+3. **targetURL**：`?redirect=` / `?rd=` 优先，否则 `https://desktop.<olaresId 的 @ 换成 .>`。
+
+## 点阵的两个硬约束（踩过的坑）
+
+- **笔画宽度必须 ≥ CELL × TH**（现在是 2.2 × 0.40 ≈ 0.88）。低于这个值，同一横截面上
+  有的格过阈值有的不过，线就断成虚线。
+- **CJK 字要 ~30px 才认得出来**。官方那行提示是 14px，放进点阵里必然糊成一团 ——
+  所以这里放大了字号（内容不变，尺寸随媒介）。拉丁字母 16px 就够清晰。
+
+## 粒子 alpha 必须预乘
+
+`gl_FragColor = vec4(rgb, 1.0)` 配 `AdditiveBlending` 在**黑底**上没问题（桌面壳层就是），
+但登录页的头像上方会变成一圈**黑色不透明点**——因为 canvas 用预乘 alpha，
+`a=1` 意味着「完全不透明，颜色 = rgb」，而 rgb 里已经只剩一点亮度。
+
+正解是 `float a = core * vA; gl_FragColor = vec4(color * a, a);` 配 `NormalBlending`。
+换成 `AdditiveBlending` 会把 a 再乘一次（变全黑）；换成 `CustomBlending(One, One)` 也试过，同样不显示。

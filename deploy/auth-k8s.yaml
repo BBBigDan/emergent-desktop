@@ -1,0 +1,141 @@
+# 涌现式登录页
+#
+# 和壳层同一套路：不动官方 deployment，另起一个 nginx pod 只接管 `/`，
+# /api /bfl /jwks.json 全部反代回 authelia 官方前端，登录协议完全不碰。
+#
+# 切换（改 authelia-svc 的 selector）：
+#   kubectl patch svc authelia-svc -n user-space-bbbigdan \
+#     -p '{"spec":{"selector":{"app":"emergent-auth"}}}'
+# 回滚：
+#   kubectl patch svc authelia-svc -n user-space-bbbigdan \
+#     -p '{"spec":{"selector":{"app":"authelia"}}}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: emergent-auth-nginx
+  namespace: user-space-bbbigdan
+data:
+  emergent-auth.conf: |
+    server {
+        listen 91;
+        server_name _;
+        root /www;
+        index index.html;
+
+        gzip on;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css application/javascript application/json
+                   image/svg+xml application/manifest+json;
+
+        # 我们的登录页：不缓存
+        location ^~ /src/ {
+            add_header Cache-Control "private,no-cache";
+        }
+        location ^~ /vendor/ {
+            expires 7d;
+        }
+
+        # 认证相关，一律交回官方 auth-front
+        location ^~ /api/ {
+            proxy_pass http://authelia-official.user-space-bbbigdan.svc.cluster.local:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_buffering off;
+            proxy_read_timeout 120s;
+        }
+        location ^~ /bfl/ {
+            proxy_pass http://authelia-official.user-space-bbbigdan.svc.cluster.local:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_buffering off;
+            proxy_read_timeout 120s;
+        }
+        location = /jwks.json {
+            proxy_pass http://authelia-official.user-space-bbbigdan.svc.cluster.local:80;
+            proxy_set_header Host $host;
+        }
+        location ^~ /.well-known/ {
+            proxy_pass http://authelia-official.user-space-bbbigdan.svc.cluster.local:80;
+            proxy_set_header Host $host;
+        }
+
+        # 官方登录页的静态资源（2FA / 重置密码等页面还会用到）
+        location ~ ^/(js|css|fonts|img|auth|bg|walletIcon|dashboard)/ {
+            proxy_pass http://authelia-official.user-space-bbbigdan.svc.cluster.local:80;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Host $host;
+        }
+
+        location / {
+            try_files $uri $uri/index.html /index.html;
+            add_header Cache-Control "private,no-cache";
+        }
+    }
+---
+# 官方 auth-front 的稳定入口（selector 只命中官方 pod），供上面 proxy_pass 使用
+apiVersion: v1
+kind: Service
+metadata:
+  name: authelia-official
+  namespace: user-space-bbbigdan
+spec:
+  selector:
+    app: authelia
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emergent-auth
+  namespace: user-space-bbbigdan
+  labels:
+    app: emergent-auth
+spec:
+  restartPolicy: Always
+  containers:
+    - name: nginx
+      image: docker.io/beclab/docker-nginx-headers-more:ubuntu-v0.1.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 91
+      volumeMounts:
+        - name: www
+          mountPath: /www
+        - name: conf
+          mountPath: /etc/nginx/conf.d/emergent-auth.conf
+          subPath: emergent-auth.conf
+      readinessProbe:
+        tcpSocket:
+          port: 91
+        initialDelaySeconds: 2
+        periodSeconds: 5
+      resources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+  volumes:
+    - name: www
+      hostPath:
+        path: /olares/emergent-auth/www
+        type: DirectoryOrCreate
+    - name: conf
+      configMap:
+        name: emergent-auth-nginx

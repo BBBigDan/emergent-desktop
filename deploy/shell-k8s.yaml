@@ -32,14 +32,25 @@ data:
         root /www;
         index index.html;
 
+        # 官方前端打的是 gzip off，25MB js 裸传。这里由我们这层补压缩：
+        # 反代时 upstream 拿到的请求不带 Accept-Encoding，回的是原始体，
+        # 所以 gzip_proxied any 让 nginx 自己压一遍再发给浏览器（约 4x 收益）。
+        gzip on;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css text/xml application/javascript application/json
+                   application/xml application/wasm image/svg+xml application/manifest+json;
+
         # 壳层本身：不缓存，改完刷新即生效
         location / {
             try_files $uri $uri/index.html /index.html;
             add_header Cache-Control "private,no-cache";
         }
 
-        # 其余全部交回官方前端 pod，登录态、接口、静态资源都不受影响
-        location ~ ^/(api|server|kapis|market-backend|socket\.io|ws|websocket|static|js|css|fonts|assets)/ {
+        # 长连接：必须不缓冲
+        location ~ ^/(socket\.io|ws|websocket)/ {
             proxy_pass http://olares-app-official.user-space-bbbigdan.svc.cluster.local:91;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -49,6 +60,23 @@ data:
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Host $host;
             proxy_buffering off;
+            proxy_read_timeout 3600s;
+        }
+
+        # 其余全部交回官方前端 pod，登录态、接口、静态资源都不受影响
+        location ~ ^/(api|server|kapis|market-backend|static|js|css|fonts|assets)/ {
+            proxy_pass http://olares-app-official.user-space-bbbigdan.svc.cluster.local:91;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $ed_connection_upgrade;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Host $host;
+            # 静态资源先缓冲再压，压缩率更高、上游连接释放更快
+            proxy_buffering on;
+            proxy_buffers 8 64k;
+            proxy_busy_buffers_size 128k;
             proxy_read_timeout 3600s;
         }
     }
