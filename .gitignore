@@ -1,14 +1,19 @@
-# ---- 构建产物（由 build-standalone.mjs 生成，可随时重建）----
-/particle-sphere-standalone.html
-
-# ---- 验证产物：截图 / 临时探针页面 / CDP 驱动 ----
-/dist/
-/.tmp/
-
 # ---- 依赖 ----
 node_modules/
+package-lock.json
+pnpm-lock.yaml.bak
 
-# ---- 杂项 ----
+# ---- 构建产物（由 prototype/build-standalone.mjs 生成，可随时重建）----
+particle-sphere-standalone.html
+
+# ---- 验证产物：截图 / 临时探针页面 / CDP 驱动 ----
+dist/
+.tmp/
 *.log
+
+# ---- 编辑器 / 系统 ----
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.swp
