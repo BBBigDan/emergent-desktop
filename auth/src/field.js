@@ -649,7 +649,12 @@ export class Field {
     });
 
     this.cMode.fill(0);
-    const off = CELL_R * scale * 0.5;   // 半格交错：不叠在骨架点上，而是均匀加密
+    /* 半格交错只对**面状**控件（文字）有意义：让增援点落在骨架点之间，均匀加密。
+       线条类（边框/箭头）绝不能交错 —— 骨架点是 5.96px 的圆点，再在旁边 3px 处
+       压一个同样的点，视觉宽度直接撑到 9px，看起来就是"灌注后凭空描了一圈粗边"。
+       所以 contour 类 off = 0，与骨架点重合，只叠亮度、不改粗细。 */
+    const contour = id === 'input' || id === 'button';
+    const off = contour ? 0 : CELL_R * scale * 0.5;
     for (let k = 0; k < useCount; k++) {
       const pi = arr[k];
       /* 槽位是等距抽样分配的：M 可能大于或小于 useCount，都均匀铺开 */
@@ -957,7 +962,11 @@ export class Field {
       /* 槽位粒子更亮（正好压在笔画上，是"充能"）；公转粒子是光尘 */
       /* 槽位：压在笔画上 → 亮；公转：光尘。指针在时公转粒子收得很紧，
          太亮会糊成一团脏斑，压到 0.55；待机星尘散得开，0.72 才看得见 */
-      const base = this.cMode[i] === 1 ? 1.15 : (this.ptr.on ? 1.0 : 0.30);
+      /* 槽位粒子的亮度按角色分档：边框（role 3）本身在骨架里就比文字暗一级
+         （ROLE_A 0.70 vs 0.88），灌注时不能一视同仁提到 1.15 —— 那会让边框
+         比文字还亮，看起来像"把控件外框描了出来"。 */
+      const slotA = this.cRole[i] === 3 ? 0.72 : 1.15;
+      const base = this.cMode[i] === 1 ? slotA : (this.ptr.on ? 1.0 : 0.30);
       this.cAlpha[i] = this.cAmp[i] * base * this.cFade[i] * burst * this.gainC;
     }
 

@@ -34,7 +34,8 @@ export const CELL = 2.5;
 /* 增援层用更密的网格：(2.5/1.35)² ≈ 3.4 倍槽位，悬停的控件才会明显变实 */
 export const CELL_R = 1.35;
 const TH = 0.45;     // 原型 SCAN_TH
-const TH_R = 0.36;
+/* 增援细网格的覆盖率阈值（比骨架略低，细笔画才不至于整条丢失） */
+const TH_R = 0.45;
 
 const CX = LW / 2;
 
@@ -178,7 +179,7 @@ export function partAt(lx, ly) {
 
 /* 容量系数：线条类灌满更亮（一维结构越密越像实线），大段文字低一点
    （字怀本来就靠暗缝成立，灌太满会糊回去）。和原型的分档一致。 */
-export const CAPK = { button: 0.5, input: 0.48, name: 0.34, hint: 0.34 };
+export const CAPK = { button: 0.75, input: 0.75, name: 0.34, hint: 0.34 };
 /* 为什么不是 1：灌到 1 时 2400 颗全进控件，指针周围一颗旋转的都不剩 ——
    而"大量旋转的粒子"本身就是原型的一半观感。留一半在指针周围转，
    灌进去的那一半把控件填实，这才是"随鼠标移动、同时增加到附近组件上"。 */
@@ -326,11 +327,18 @@ function scanIn(d, W, H, sat, cell, th, x0, y0, x1, y1, withKey) {
   const cy0 = Math.floor(y0 / cell), cy1 = Math.ceil(y1 / cell);
 
   for (let cy = cy0; cy < cy1; cy++) {
-    const yy0 = Math.max(y0, Math.round(cy * cell));
+    /* 覆盖率必须按**整格面积**算。
+       scanPart 的扫描区是「控件矩形 ±pad」，起止点通常落在格子中间；
+       如果按 y0/x0 裁掉格子的半边（max(y0, ·)），分母就只剩不到 1px，
+       那么边缘的 1 个抗锯齿像素会被算成 100% 覆盖 → 整列/整行点亮，
+       屏幕上就是控件外框那条「凭空多出来的边」。
+       画布上此刻只画了当前这一个控件（scanPart 先 clearRect），
+       所以放宽到整格不会吸到相邻控件的墨。 */
+    const yy0 = Math.max(0, Math.round(cy * cell));
     const yy1 = Math.min(H, Math.round((cy + 1) * cell));
     if (yy1 <= yy0) continue;
     for (let cx = cx0; cx < cx1; cx++) {
-      const xx0 = Math.max(x0, Math.round(cx * cell));
+      const xx0 = Math.max(0, Math.round(cx * cell));
       const xx1 = Math.min(W, Math.round((cx + 1) * cell));
       if (xx1 <= xx0) continue;
 
@@ -382,9 +390,12 @@ export function scanPart(ctx, s, id, scale) {
 
   const d = ctx.getImageData(0, 0, W, H).data;
   const sat = buildSat(d, W, H);
-  /* 槽位坐标要跟骨架落在同一个世界坐标里，所以这里用同一个 scale；
-     但 cell 仍按逻辑 px 取 → 屏幕上大约 1.35×scale CSS px 的密度。 */
-  const cell = CELL_R / Math.max(0.72, Math.min(1.15, scale));
+  /* 线条类（边框 / 箭头）**用骨架格**取槽位：槽位正好落在骨架点上，
+     灌注只是把那一颗点叠亮。细格在这里是有害的 —— 线宽 2.4 跨 2.05 个细格，
+     无论怎么写都会点亮 2 行，边框看起来就"凭空粗了一圈"。
+     面状控件（文字）才用细格加密，因为文字的笔画内部有空隙可以填。 */
+  const contour = id === 'input' || id === 'button';
+  const cell = contour ? CELL : CELL_R / Math.max(0.72, Math.min(1.15, scale));
   const pad = 2;
   return scanIn(
     d, W, H, sat, cell, TH_R,
