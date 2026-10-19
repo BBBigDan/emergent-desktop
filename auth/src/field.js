@@ -1,24 +1,140 @@
 /**
- * 点阵粒子场 —— 登录界面本身就是这些粒子，没有任何背景板。
+ * 粒子场 —— 界面本身就是这些粒子，没有半透明卡片垫底。
  *
- * 两组粒子：
- *   dots  —— 由「墨稿」采样得到的点阵（用户名、提示、输入框、箭头）
- *   orbit —— 头像外圈的粒子流：不同半径不同角速度，形成剪切流动，
- *            把头像「包」起来；亮度带沿圆周扫过，看起来是活的
+ * 这一版的物理是从原型（prototype/src/main.js）搬过来的，不是自己编的：
  *
- * 呼吸、鼠标高亮、环流全在 vertex shader 里算，CPU 每帧只更新点阵位置。
+ *   骨架层 skeleton —— 点阵。**不是**钉死在格点上：每帧被一个相干流场
+ *      （fbm value noise，按屏幕坐标采样 → 邻域受力一致）推着走，
+ *      弹簧阻尼跟随，因此整片字会像水面一样缓慢起伏 ±1px，永远在活着。
+ *   云层 cloud —— 增援。指针在时围着指针公转（半径/相位/角速度逐粒子随机，
+ *      内慢外快形成剪切），指针压到控件上时按「离控件中心由近及远」倾泻
+ *      进该控件的细网格槽位，控件被粒子灌满 → 变亮变实（这就是"更清楚"），
+ *      挤不进去的其余粒子把半径外扩成光晕。
+ *   头像光晕 ava —— 贴着头像边缘的三层环流，顶点着色器里算（便宜）。
+ *
+ * 骨架的流场必须**相干**：如果每个点各抖各的（per-particle sin），看起来
+ * 就是噪点闪烁；只有整片一起流动，才像"形"在呼吸。
  */
 import * as THREE from 'three';
-import { CELL } from './ui.js';
+import { CELL, CELL_R } from './ui.js';
 
-const MAX = 7000;
-const ORBIT_N = 900;
+const TAU = Math.PI * 2;
+const SKEL_MAX = 6000;   // 骨架点阵容量
+const CLOUD_N = 2400;    // 增援云（围着指针转 / 倾泻进控件）
+const AVA_N = 1100;      // 头像光晕
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 /* role → 基础亮度 / 点径系数（索引对齐 ui.js 的 ROLE） */
-const ROLE_A = [0, 1.00, 0.56, 0.62, 0.98, 0.78, 0.44, 0.95, 0.52];
-const ROLE_S = [0, 1.12, 0.88, 0.92, 1.10, 1.00, 0.86, 1.06, 0.84];
+const ROLE_A = [0, 1.0, 0.70, 0.74, 1.0, 0.88, 0.56, 0.95, 0.62];
+const ROLE_S = [0, 1.12, 0.92, 0.96, 1.1, 1.02, 0.9, 1.06, 0.88];
+
+/* role → 所属控件（悬停时该控件的点阵要整体提亮） */
+const ROLE_PART = [null, 'name', 'hint', 'input', 'input', 'button', 'input', 'input', 'error'];
+
+/* 骨架：弹簧刚度 / 阻尼（px 单位）。k 越大越"钉"，ω=sqrt(k)≈13rad/s，
+ * 阻尼比 0.9 —— 略欠阻尼，跟随时有一点点回弹，不是生硬的直给。 */
+const SKEL_K = 170;
+const SKEL_C = 2 * Math.sqrt(SKEL_K) * 0.9;
+
+/* 云层：进入槽位时紧（k 大），公转时松（k 小 → 会拖在指针后面甩） */
+const SLOT_K = 240, SLOT_C = 2 * Math.sqrt(SLOT_K) * 0.85;
+const ORB_K = 88, ORB_C = 2 * Math.sqrt(ORB_K) * 0.8;
+
+/* 流场强度（px 振幅）：骨架只要轻微起伏，云层可以飘得大些 */
+const FLOW_SKEL = 2.6;
+const FLOW_SLOT = 1.1;
+const FLOW_ORB = 9.0;
+
+/* ---------------------------------------------------------------- 噪声 */
+function hash3(ix, iy, iz, seed) {
+  let h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(iz, 1274126177) ^ Math.imul(seed | 0, 2246822519);
+  h = Math.imul(h ^ (h >>> 15), 2246822519);
+  h ^= h >>> 13;
+  h = Math.imul(h, 3266489917);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+
+function vnoise(x, y, z, seed) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+  const uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const uz = fz * fz * fz * (fz * (fz * 6 - 15) + 10);
+  const c000 = hash3(ix, iy, iz, seed), c100 = hash3(ix + 1, iy, iz, seed);
+  const c010 = hash3(ix, iy + 1, iz, seed), c110 = hash3(ix + 1, iy + 1, iz, seed);
+  const c001 = hash3(ix, iy, iz + 1, seed), c101 = hash3(ix + 1, iy, iz + 1, seed);
+  const c011 = hash3(ix, iy + 1, iz + 1, seed), c111 = hash3(ix + 1, iy + 1, iz + 1, seed);
+  const x00 = c000 + (c100 - c000) * ux, x10 = c010 + (c110 - c010) * ux;
+  const x01 = c001 + (c101 - c001) * ux, x11 = c011 + (c111 - c011) * ux;
+  const y0 = x00 + (x10 - x00) * uy, y1 = x01 + (x11 - x01) * uy;
+  return (y0 + (y1 - y0) * uz) * 2 - 1;
+}
+
+function fbm(x, y, z, seed) {
+  return vnoise(x, y, z, seed) * 0.6
+    + vnoise(x * 2.1, y * 2.1, z * 2.1, seed + 71) * 0.3
+    + vnoise(x * 4.3, y * 4.3, z * 4.3, seed + 131) * 0.1;
+}
+
+/* ------------------------------------------------------- 点精灵 shader ---
+ * 预乘 alpha + NormalBlending：这样画在头像上是"发光点"而不是黑点
+ * （Additive 会要求 a=1 直接盖住头像；预乘再叠加会乘两次变全黑）。 */
+const VERT = `
+  attribute float aAlpha; attribute float aSize; attribute float aSeed; attribute float aHot;
+  varying float vA;
+  uniform float uDpr; uniform float uTime; uniform float uGain;
+  void main(){
+    /* 亮度呼吸：每个点自己的相位 → 星点闪烁（**位置**的呼吸在 CPU 流场里，
+       那是整群相干的；这里的 alpha 抖动只是个高光，幅度很小） */
+    float breathe = 0.82 + 0.18 * sin(uTime * (0.5 + aSeed * 0.8) + aSeed * 6.2831);
+    /* aHot：这个点属于正在被悬停的控件 → 提亮 + 微微加粗，
+       再叠上增援粒子灌进槽位的那份密度，控件就"活过来"了 */
+    vA = clamp(aAlpha * breathe * uGain * (1.0 + aHot * 0.55), 0.0, 1.0);
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+    gl_PointSize = aSize * uDpr * (1.0 + aHot * 0.10);
+  }`;
+
+const FRAG_HARD = `
+  varying float vA;
+  void main(){
+    vec2 d = gl_PointCoord - 0.5;
+    float r = sqrt(dot(d, d)) * 2.0;
+    /* 硬芯：点阵屏的一颗 LED —— 直径基本等于标称值，边缘只留 1px 抗锯齿。
+       用软光晕的 pow 衰减会让可见芯只剩 55%，点距一拉开字就"断"。 */
+    if (r > 1.0) discard;
+    float a = vA * (1.0 - smoothstep(0.82, 1.0, r));
+    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * a, a);
+  }`;
+
+const FRAG_SOFT = `
+  varying float vA;
+  void main(){
+    vec2 d = gl_PointCoord - 0.5;
+    float r2 = dot(d, d) * 4.0;
+    if (r2 > 1.0) discard;
+    float core = pow(1.0 - r2, 1.7);
+    float a = core * vA;
+    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * a, a);
+  }`;
+
+function makeMat(hard) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uDpr: { value: 1 },
+      uTime: { value: 0 },
+      uGain: { value: 1 },
+    },
+    vertexShader: VERT,
+    fragmentShader: hard ? FRAG_HARD : FRAG_SOFT,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+  });
+}
 
 export class Field {
   constructor(canvas) {
@@ -29,11 +145,17 @@ export class Field {
     this.scale = 1;
     this.burstAt = -1;
 
-    /* ─────────── 点阵 ─────────── */
-    const n = MAX;
-    this.pos = new Float32Array(n * 3);
+    /* 指针（世界坐标） */
+    this.ptr = { x: 0, y: 0, on: false };
+
+    /* 悬停槽位状态 */
+    this.slot = { id: null, fill: 0 };
+
+    /* ───────────────── 骨架：点阵 ───────────────── */
+    const n = SKEL_MAX;
+    this.pos = new Float32Array(n * 2);
     this.vel = new Float32Array(n * 2);
-    this.tgt = new Float32Array(n * 3);
+    this.tgt = new Float32Array(n * 2);
     this.role = new Float32Array(n);
     this.seed = new Float32Array(n);
     this.aScale = new Float32Array(n);
@@ -49,82 +171,86 @@ export class Field {
 
     this.geo = new THREE.BufferGeometry();
     this.geo.setDrawRange(0, 0);
-    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
+    this.geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aAlpha', new THREE.BufferAttribute(this.aScale, 1).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aSize', new THREE.BufferAttribute(this.sScale, 1).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aSeed', new THREE.BufferAttribute(this.seed, 1));
-
-    this.mat = new THREE.ShaderMaterial({
-      uniforms: {
-        uDpr: { value: 1 },
-        uTime: { value: 0 },
-        uMouse: { value: new THREE.Vector2(0, 0) },
-        uMouseOn: { value: 0 },
-        uMouseR: { value: 100 },
-      },
-      vertexShader: `
-        attribute float aAlpha; attribute float aSize; attribute float aSeed;
-        varying float vA;
-        uniform float uDpr; uniform float uTime;
-        uniform vec2 uMouse; uniform float uMouseOn; uniform float uMouseR;
-        void main(){
-          float breath = 0.88 + 0.12 * sin(uTime * (0.55 + aSeed * 0.75) + aSeed * 6.2831);
-          float d = distance(position.xy, uMouse);
-          float hover = uMouseOn * smoothstep(uMouseR, 0.0, d);
-          vA = clamp(aAlpha * breath + hover * 0.85, 0.0, 1.0);
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_Position = projectionMatrix * mv;
-          gl_PointSize = aSize * uDpr * (1.0 + hover * 0.42);
-        }`,
-      fragmentShader: `
-        varying float vA;
-        void main(){
-          vec2 d = gl_PointCoord - 0.5;
-          float r2 = dot(d, d) * 4.0;
-          if (r2 > 1.0) discard;
-          float core = pow(1.0 - r2, 1.55);
-          /* 预乘 alpha：a 必须等于亮度。写成 vec4(rgb, 1.0) 会变成「黑色不透明点」，
-             在头像上方就是一圈黑污渍 —— 桌面页背景是黑的所以看不出来。 */
-          float a = core * vA;
-          gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * a, a);
-        }`,
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-      /* 标准 alpha 合成（预乘）：这样画在头像上方是「发光点」而不是「黑点」。
-         Additive 要求 a=1，那会整块盖住头像；加色又会让预乘乘两次变全黑。 */
-      blending: THREE.NormalBlending,
-    });
-
+    this.hot = new Float32Array(n);
+    this.geo.setAttribute('aHot', new THREE.BufferAttribute(this.hot, 1).setUsage(THREE.DynamicDrawUsage));
+    this.mat = makeMat(true);   // 骨架：硬芯 LED
     this.points = new THREE.Points(this.geo, this.mat);
     this.points.frustumCulled = false;
+    this.points.position.z = 1;
 
-    /* ─────────── 头像粒子流 ─────────── */
-    const or = new Float32Array(ORBIT_N * 3);
-    this.oA = new Float32Array(ORBIT_N);      // 初始角
-    this.oW = new Float32Array(ORBIT_N);      // 角速度
-    this.oOff = new Float32Array(ORBIT_N);    // 相对头像半径的偏移（逻辑 px，负值 = 压在头像上）
-    this.oS = new Float32Array(ORBIT_N);      // 点径
-    this.oAmp = new Float32Array(ORBIT_N);    // 亮度
-    this.oPh = new Float32Array(ORBIT_N);     // 相位
+    /* ───────────────── 云层：增援 ───────────────── */
+    this.cPos = new Float32Array(CLOUD_N * 2);
+    this.cVel = new Float32Array(CLOUD_N * 2);
+    this.cMode = new Uint8Array(CLOUD_N);      // 0 公转 / 1 槽位
+    this.cOrbR = new Float32Array(CLOUD_N);
+    this.cOrbPh = new Float32Array(CLOUD_N);
+    this.cOrbS = new Float32Array(CLOUD_N);
+    this.cSize = new Float32Array(CLOUD_N);
+    this.cAmp = new Float32Array(CLOUD_N);
+    this.slotX = new Float32Array(CLOUD_N);
+    this.slotY = new Float32Array(CLOUD_N);
+    this.cFade = new Float32Array(CLOUD_N);
+    this.cAlpha = new Float32Array(CLOUD_N);
+    this.cParkR = new Float32Array(CLOUD_N);
+    this.cRole = new Float32Array(CLOUD_N);
 
-    for (let i = 0; i < ORBIT_N; i++) {
-      this.oA[i] = Math.random() * Math.PI * 2;
-      /* 大部分贴着边缘，少数外散成雾；内圈相对慢一点，避免像齿轮 */
+    for (let i = 0; i < CLOUD_N; i++) {
+      /* 公转半径 16~62px：填充率低时整体外扩成光晕（见 step）。
+         别收得太紧 —— 578 颗挤在 20px 环里就是一坨糊斑，看不出"在转"。 */
+      this.cOrbR[i] = 16 + Math.pow(Math.random(), 0.8) * 46;
+      /* 待机时沉成星尘用的独立半径，跟悬停参数解耦 */
+      this.cParkR[i] = 190 + Math.pow(Math.random(), 0.7) * 280;
+      this.cOrbPh[i] = Math.random() * TAU;
+      this.cOrbS[i] = 0.75 + Math.random() * 0.65;
+      this.cSize[i] = 2.0 + Math.random() * 2.2;
+      this.cAmp[i] = 0.34 + Math.random() * 0.5;
+      this.cFade[i] = 0;
+      this.cAlpha[i] = 0;
+      /* 初始就散在待机环上，避免第一帧从圆心炸开 */
+      const a = Math.random() * TAU, rr = 120 + Math.random() * 260;
+      this.cPos[i * 2] = Math.cos(a) * rr;
+      this.cPos[i * 2 + 1] = Math.sin(a) * rr * 0.8;
+    }
+
+    this.cGeo = new THREE.BufferGeometry();
+    this.cGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(CLOUD_N * 3), 3).setUsage(THREE.DynamicDrawUsage));
+    this.cGeo.setAttribute('aAlpha', new THREE.BufferAttribute(this.cAlpha, 1).setUsage(THREE.DynamicDrawUsage));
+    this.cGeo.setAttribute('aSize', new THREE.BufferAttribute(this.cSize, 1).setUsage(THREE.DynamicDrawUsage));
+    this.cGeo.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(CLOUD_N).map(() => Math.random()), 1));
+    this.cGeo.setAttribute('aHot', new THREE.BufferAttribute(new Float32Array(CLOUD_N), 1));
+    this.cMat = makeMat(false); // 云层：软光尘
+    this.cPoints = new THREE.Points(this.cGeo, this.cMat);
+    this.cPoints.frustumCulled = false;
+    this.cPoints.position.z = 0;
+
+    /* ───────────────── 头像光晕（顶点着色器算轨道） ───────────────── */
+    this.oA = new Float32Array(AVA_N);
+    this.oW = new Float32Array(AVA_N);
+    this.oOff = new Float32Array(AVA_N);
+    this.oS = new Float32Array(AVA_N);
+    this.oAmp = new Float32Array(AVA_N);
+    this.oPh = new Float32Array(AVA_N);
+
+    for (let i = 0; i < AVA_N; i++) {
+      this.oA[i] = Math.random() * TAU;
+      /* 三层：贴身 / 中层 / 外雾 */
       const u = Math.random();
-      if (u < 0.62) this.oOff[i] = -4.5 + Math.random() * 10;   // 贴身层：贴着头像边缘走
-      else if (u < 0.90) this.oOff[i] = 6 + Math.pow(Math.random(), 1.4) * 24;
-      else this.oOff[i] = 28 + Math.pow(Math.random(), 1.6) * 30; // 外雾
-      /* 内快外慢 → 剪切层，看起来像被头像「拖着走」 */
+      if (u < 0.6) this.oOff[i] = -4.5 + Math.random() * 10;
+      else if (u < 0.9) this.oOff[i] = 6 + Math.pow(Math.random(), 1.4) * 24;
+      else this.oOff[i] = 28 + Math.pow(Math.random(), 1.6) * 32;
       const base = 0.62 / (1 + Math.max(0, this.oOff[i]) * 0.055);
       this.oW[i] = base * (0.75 + Math.random() * 0.5) * (Math.random() < 0.86 ? 1 : -1);
       this.oS[i] = 1.7 + Math.random() * 2.2;
       this.oAmp[i] = 0.44 + Math.random() * 0.55;
-      this.oPh[i] = Math.random() * Math.PI * 2;
+      this.oPh[i] = Math.random() * TAU;
     }
 
     this.oGeo = new THREE.BufferGeometry();
-    this.oGeo.setAttribute('position', new THREE.BufferAttribute(or, 3).setUsage(THREE.DynamicDrawUsage));
+    this.oGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(AVA_N * 3), 3));
     this.oGeo.setAttribute('aA', new THREE.BufferAttribute(this.oA, 1));
     this.oGeo.setAttribute('aW', new THREE.BufferAttribute(this.oW, 1));
     this.oGeo.setAttribute('aOff', new THREE.BufferAttribute(this.oOff, 1));
@@ -149,11 +275,11 @@ export class Field {
         uniform float uR; uniform float uPx; uniform float uOpacity;
         void main(){
           float ang = aA + uTime * aW;
-          float rr = uR + aOff * uPx + sin(uTime * 1.7 + aPh) * 2.4 * uPx;
+          /* 半径本身也在呼吸：环流不是规整的圆，而是一圈一圈涨落的云 */
+          float rr = uR + aOff * uPx + sin(uTime * 1.7 + aPh) * 2.4 * uPx
+                   + sin(uTime * 0.43 + aPh * 2.1) * 3.2 * uPx;
           vec3 p = vec3(uCenter.x + cos(ang) * rr, uCenter.y + sin(ang) * rr, 0.0);
-          /* 亮带沿圆周扫过，粒子像被光流过 */
           float band = 0.58 + 0.42 * sin(ang * 2.0 - uTime * 1.35 + aPh);
-          /* 外圈更淡，避免喧宾夺主 */
           float falloff = 1.0 - clamp((aOff - 2.0) / 40.0, 0.0, 0.84);
           vA = aAmp * band * falloff * uOpacity;
           vec4 mv = modelViewMatrix * vec4(p, 1.0);
@@ -173,8 +299,6 @@ export class Field {
       transparent: true,
       depthTest: false,
       depthWrite: false,
-      /* 标准 alpha 合成（预乘）：这样画在头像上方是「发光点」而不是「黑点」。
-         Additive 要求 a=1，那会整块盖住头像；加色又会让预乘乘两次变全黑。 */
       blending: THREE.NormalBlending,
     });
 
@@ -182,6 +306,7 @@ export class Field {
     this.oPoints.frustumCulled = false;
 
     this.scene = new THREE.Scene();
+    this.scene.add(this.cPoints);
     this.scene.add(this.points);
     this.scene.add(this.oPoints);
 
@@ -189,6 +314,15 @@ export class Field {
     this.renderer.setClearColor(0x000000, 0);
     this.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);
     this.cam.position.z = 10;
+
+    /* 流场网格：每帧在粗网格上算一次 fbm，粒子做双线性采样
+       —— 效果等价于逐粒子求 fbm（场本来就是连续的），但便宜两个数量级 */
+    this.gw = 36;
+    this.gh = 26;
+    this.flow = new Float32Array((this.gw + 1) * (this.gh + 1) * 2);
+    this.gainS = 1.12;
+    this.gainC = 1.45;
+
     this.resize();
   }
 
@@ -199,6 +333,7 @@ export class Field {
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(this.W, this.H, false);
     this.mat.uniforms.uDpr.value = dpr;
+    this.cMat.uniforms.uDpr.value = dpr;
     this.oMat.uniforms.uDpr.value = dpr;
     this.cam.left = -this.W / 2;
     this.cam.right = this.W / 2;
@@ -207,16 +342,20 @@ export class Field {
     this.cam.updateProjectionMatrix();
   }
 
-  /** 头像的位置与半径（逻辑坐标），用来摆粒子流 */
+  /* --------------------------------------------------------- 头像光晕 */
   setAvatar(lx, ly, lr, scale, LW, LH) {
-    this.oMat.uniforms.uCenter.value.set((lx - LW / 2) * scale, (LH / 2 - ly) * scale);
-    this.oMat.uniforms.uR.value = lr * scale;
+    this.ava = { x: (lx - LW / 2) * scale, y: (LH / 2 - ly) * scale, r: lr * scale, scale };
+    this.oMat.uniforms.uCenter.value.set(this.ava.x, this.ava.y);
+    this.oMat.uniforms.uR.value = this.ava.r;
     this.oMat.uniforms.uPx.value = scale;
   }
 
+  /* --------------------------------------------------------- 骨架点阵 */
   setPoints(pts, scale, LW, LH) {
     this.scale = scale;
-    const pointSize = CELL * scale * 1.18;
+    /* 硬芯点直径 ≈ 点距 ×1.24：相邻点相切、笔画连成线，仍留一圈暗缝；
+       再大（1.5+）就成了实心块，"点阵"的质感没了。 */
+    const pointSize = CELL * scale * 1.45;
 
     const M = pts.length / 4;
     const keep = new Set();
@@ -231,19 +370,18 @@ export class Field {
       let idx = this.byKey.get(key);
       if (idx === undefined) {
         if (this.free.length) idx = this.free.pop();
-        else if (this.top < MAX) idx = this.top++;
+        else if (this.top < SKEL_MAX) idx = this.top++;
         else continue;
         this.byKey.set(key, idx);
         this.key[idx] = key;
-        /* 新点直接在目标位置淡入，不从别处飞 —— 打一个字不该整屏重排 */
-        this.pos[idx * 3] = wx;
-        this.pos[idx * 3 + 1] = wy;
+        this.pos[idx * 2] = wx;
+        this.pos[idx * 2 + 1] = wy;
         this.vel[idx * 2] = 0;
         this.vel[idx * 2 + 1] = 0;
         this.fade[idx] = 0;
       }
-      this.tgt[idx * 3] = wx;
-      this.tgt[idx * 3 + 1] = wy;
+      this.tgt[idx * 2] = wx;
+      this.tgt[idx * 2 + 1] = wy;
       this.role[idx] = role;
       this.aScale[idx] = ROLE_A[role] ?? 0.6;
       this.sScale[idx] = pointSize * (ROLE_S[role] ?? 1);
@@ -255,15 +393,83 @@ export class Field {
         this.dying.push(idx);
       }
     }
-
     this.geo.setDrawRange(0, this.top);
+  }
+
+  /**
+   * 把增援云倾泻进某个控件的槽位。
+   * @param pts  [lx, ly, role] 三元组（逻辑坐标，行优先 → 已按 y,x 有序）
+   * @param id   控件 id（只用于记录，容量系数由调用方算好后传入）
+   * @param capK 容量系数：线条类接近 1（越灌越亮），大段文字要低（会糊）
+   */
+  setSlots(pts, id, capK, scale, LW, LH) {
+    if (!pts || !pts.length) { this.clearSlots(); return; }
+    this.slot.id = id;
+
+    const M = pts.length / 3;
+    const useCount = Math.min(CLOUD_N, Math.ceil(M * capK));
+    const ox = LW / 2, oy = LH / 2;
+
+    /* 槽位中心（世界坐标） */
+    let cx = 0, cy = 0;
+    for (let k = 0; k < M; k++) {
+      cx += (pts[k * 3] - ox) * scale;
+      cy += (oy - pts[k * 3 + 1]) * scale;
+    }
+    cx /= M; cy /= M;
+
+    /* 按到控件中心的距离排序：近的先拿到槽位 → 看起来是"从指针这边灌进去" */
+    const order = new Int32Array(CLOUD_N);
+    for (let i = 0; i < CLOUD_N; i++) order[i] = i;
+    const px = this.cPos;
+    const arr = Array.from(order);
+    arr.sort((a, b) => {
+      const da = (px[a * 2] - cx) ** 2 + (px[a * 2 + 1] - cy) ** 2;
+      const db = (px[b * 2] - cx) ** 2 + (px[b * 2 + 1] - cy) ** 2;
+      return da - db;
+    });
+
+    this.cMode.fill(0);
+    const off = CELL_R * scale * 0.5;   // 半格交错：不叠在骨架点上，而是均匀加密
+    for (let k = 0; k < useCount; k++) {
+      const pi = arr[k];
+      /* 槽位是等距抽样分配的：M 可能大于或小于 useCount，都均匀铺开 */
+      const s = Math.min(M - 1, ((k + 0.5) * M / useCount) | 0);
+      this.cMode[pi] = 1;
+      this.cRole[pi] = pts[s * 3 + 2];
+      this.slotX[pi] = (pts[s * 3] - ox) * scale + off;
+      this.slotY[pi] = (oy - pts[s * 3 + 1]) * scale + off;
+    }
+    for (let k = useCount; k < CLOUD_N; k++) this.cRole[arr[k]] = 0;
+
+    this.slot.fill = useCount / CLOUD_N;
+    this.applyHot(id, scale);   // 骨架里属于该控件的点整体提亮
+  }
+
+  /** 标记「哪些骨架点属于当前悬停的控件」 */
+  applyHot(id, scale) {
+    this.hotPart = id || null;
+    for (let i = 0; i < this.top; i++) {
+      this.hot[i] = id && ROLE_PART[this.role[i]] === id ? 1 : 0;
+      if (scale) this.sScale[i] = CELL * scale * 1.45 * (ROLE_S[this.role[i]] ?? 1);
+    }
+    this.geo.attributes.aHot.needsUpdate = true;
+    if (scale) this.geo.attributes.aSize.needsUpdate = true;
+  }
+
+  clearSlots() {
+    this.slot.id = null;
+    this.slot.fill = 0;
+    this.cMode.fill(0);
+    this.cRole.fill(0);
+    this.applyHot(null);
   }
 
   burst() {
     if (this.burstAt >= 0) return;
     this.burstAt = this.time;
     for (let i = 0; i < this.top; i++) {
-      const px = this.pos[i * 3], py = this.pos[i * 3 + 1];
+      const px = this.pos[i * 2], py = this.pos[i * 2 + 1];
       const d = Math.hypot(px, py) || 1;
       const nx = px / d, ny = py / d;
       const ang = (Math.random() - 0.5) * 1.1;
@@ -272,68 +478,155 @@ export class Field {
       this.vel[i * 2] = (nx * ca - ny * sa) * sp;
       this.vel[i * 2 + 1] = (nx * sa + ny * ca) * sp;
     }
+    for (let i = 0; i < CLOUD_N; i++) {
+      const px = this.cPos[i * 2], py = this.cPos[i * 2 + 1];
+      const d = Math.hypot(px, py) || 1;
+      const sp = 200 + Math.random() * 700;
+      this.cVel[i * 2] = px / d * sp;
+      this.cVel[i * 2 + 1] = py / d * sp;
+      this.cMode[i] = 0;
+    }
   }
 
-  /** 头像的粒子流也跟着散开 */
   burstAvatar() {
     if (this.avatarBurst === undefined) this.avatarBurst = this.time;
   }
 
-  setMouse(x, y, on) {
-    this.mat.uniforms.uMouse.value.set(x - this.W / 2, this.H / 2 - y);
-    this.mat.uniforms.uMouseOn.value = on ? 1 : 0;
+  /** 指针（CSS 坐标） */
+  setPointer(x, y, on) {
+    this.ptr.on = on;
+    this.ptr.x = x - this.W / 2;
+    this.ptr.y = this.H / 2 - y;
   }
 
+  /** 点击脉冲：从触点向外推一圈冲击波（骨架只吃 22%，文字不晃） */
+  pulse(x, y) {
+    const px = x - this.W / 2, py = this.H / 2 - y;
+    for (let i = 0; i < this.top; i++) {
+      const dx = this.pos[i * 2] - px, dy = this.pos[i * 2 + 1] - py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 1600 && d2 > 1) {
+        const d = Math.sqrt(d2);
+        const f = (1 - d / 40) * 260 * 0.22 / d;
+        this.vel[i * 2] += dx * f;
+        this.vel[i * 2 + 1] += dy * f;
+      }
+    }
+    for (let i = 0; i < CLOUD_N; i++) {
+      const dx = this.cPos[i * 2] - px, dy = this.cPos[i * 2 + 1] - py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 3600 && d2 > 1) {
+        const d = Math.sqrt(d2);
+        const f = (1 - d / 60) * 320 / d;
+        this.cVel[i * 2] += dx * f;
+        this.cVel[i * 2 + 1] += dy * f;
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------- 流场 */
+  updateFlow(t) {
+    const { gw, gh, W, H, flow } = this;
+    const S = 0.0065;                 // 采样频率：约 154px 一个噪声胞
+    const ft = t * 0.21;              // 场本身缓慢推进 → 起伏不是原地跳
+    let o = 0;
+    for (let j = 0; j <= gh; j++) {
+      const wy = (j / gh - 0.5) * H;
+      for (let i = 0; i <= gw; i++) {
+        const wx = (i / gw - 0.5) * W;
+        flow[o++] = fbm(wx * S, wy * S, ft, 911);
+        flow[o++] = fbm(wy * S + 31.7, wx * S, ft + 5.3, 433) * 0.85;
+      }
+    }
+  }
+
+  /** 双线性采样流场（世界坐标，返回写入 _fx/_fy） */
+  flowAt(wx, wy) {
+    const { gw, gh, W, H, flow } = this;
+    const gx = clamp((wx / W + 0.5) * gw, 0, gw - 0.001);
+    const gy = clamp((wy / H + 0.5) * gh, 0, gh - 0.001);
+    const i = gx | 0, j = gy | 0;
+    const fx = gx - i, fy = gy - j;
+    const o0 = (j * (gw + 1) + i) * 2;
+    const o1 = o0 + (gw + 1) * 2;
+    const a = flow[o0] + (flow[o0 + 2] - flow[o0]) * fx;
+    const b = flow[o1] + (flow[o1 + 2] - flow[o1]) * fx;
+    this._fx = a + (b - a) * fy;
+    const a2 = flow[o0 + 1] + (flow[o0 + 3] - flow[o0 + 1]) * fx;
+    const b2 = flow[o1 + 1] + (flow[o1 + 3] - flow[o1 + 1]) * fx;
+    this._fy = a2 + (b2 - a2) * fy;
+  }
+
+  /* ------------------------------------------------------------- 主步 */
   step(dt) {
     this.time += dt;
     const t = this.time;
     this.mat.uniforms.uTime.value = t;
+    this.cMat.uniforms.uTime.value = t;
     this.oMat.uniforms.uTime.value = t;
 
-    /* 头像粒子流：成功时整体散开淡出 */
     if (this.avatarBurst !== undefined) {
       const k = clamp(1 - (t - this.avatarBurst) / 0.9, 0, 1);
       this.oMat.uniforms.uOpacity.value = k;
       this.oMat.uniforms.uR.value += dt * 260;
     }
 
-    if (this.burstAt >= 0) {
-      const fade = clamp(1 - (t - this.burstAt) / 0.95, 0, 1);
-      for (let i = 0; i < this.top; i++) {
-        this.pos[i * 3] += this.vel[i * 2] * dt;
-        this.pos[i * 3 + 1] += this.vel[i * 2 + 1] * dt;
-        this.vel[i * 2] *= 1 - 1.1 * dt;
-        this.vel[i * 2 + 1] *= 1 - 1.1 * dt;
-        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * fade * 1.4;
-        this.sScale[i] *= 1 + 0.9 * dt;
-      }
-      this.geo.attributes.position.needsUpdate = true;
-      this.geo.attributes.aAlpha.needsUpdate = true;
-      this.geo.attributes.aSize.needsUpdate = true;
-      return;
-    }
+    this.updateFlow(t);
 
-    /* 弹簧跟随（半隐式阻尼，无条件稳定） */
-    const K = 620, C = 40;
+    /* 呼吸包络：整群统一（不是逐粒子）→ 起伏有节奏，像呼吸而不是抖动 */
+    const env = 0.5 + 0.5 * Math.sin(t * 0.42);
+    const breath = (0.35 + 0.65 * env) * 1.05;
+
+    const burst = this.burstAt >= 0 ? clamp(1 - (t - this.burstAt) / 0.95, 0, 1) : 1;
+
+    /* ───────── 骨架 ───────── */
+    const posArr = this.geo.attributes.position.array;
+    const sp = this.pos, sv = this.vel, st = this.tgt;
     let moved = false;
 
     for (let i = 0; i < this.top; i++) {
+      const i2 = i * 2;
+      const px = sp[i2], py = sp[i2 + 1];
+
       if (this.fade[i] < 1) this.fade[i] = Math.min(1, this.fade[i] + dt * 6.5);
 
-      const dx = this.tgt[i * 3] - this.pos[i * 3];
-      const dy = this.tgt[i * 3 + 1] - this.pos[i * 3 + 1];
-      if (dx * dx + dy * dy > 0.02) {
-        this.vel[i * 2] = (this.vel[i * 2] + dx * K * dt) / (1 + C * dt);
-        this.vel[i * 2 + 1] = (this.vel[i * 2 + 1] + dy * K * dt) / (1 + C * dt);
-        this.pos[i * 3] += this.vel[i * 2] * dt;
-        this.pos[i * 3 + 1] += this.vel[i * 2 + 1] * dt;
-        moved = true;
+      this.flowAt(px, py);
+      /* 径向呼吸：从画布中心外推一点点，整片一起胀缩 */
+      const rl = Math.hypot(px, py) || 1;
+      const br = 2.3 * (breath - 0.7);
+      const tx = st[i2] + this._fx * FLOW_SKEL + (px / rl) * br;
+      const ty = st[i2 + 1] + this._fy * FLOW_SKEL + (py / rl) * br;
+
+      const dx = tx - px, dy = ty - py;
+
+      if (this.burstAt >= 0) {
+        sv[i2] = sv[i2] * (1 - 1.1 * dt);
+        sv[i2 + 1] = sv[i2 + 1] * (1 - 1.1 * dt);
+        sp[i2] += sv[i2] * dt;
+        sp[i2 + 1] += sv[i2 + 1] * dt;
+        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * burst * 1.4;
+        this.sScale[i] *= 1 + 0.9 * dt;
       } else {
-        this.pos[i * 3] = this.tgt[i * 3];
-        this.pos[i * 3 + 1] = this.tgt[i * 3 + 1];
-        this.vel[i * 2] = this.vel[i * 2 + 1] = 0;
+        /* 半隐式弹簧：先积分速度再位移，任何 dt 都稳定。
+           注意**没有**「近了就吸附归零」的死区 —— 那正是上一版看起来
+           像贴图的原因：目标一擦到就把速度清零，粒子永远钉死在格心。 */
+        sv[i2] = (sv[i2] + dx * SKEL_K * dt) / (1 + SKEL_C * dt);
+        sv[i2 + 1] = (sv[i2 + 1] + dy * SKEL_K * dt) / (1 + SKEL_C * dt);
+        sp[i2] += sv[i2] * dt;
+        sp[i2 + 1] += sv[i2 + 1] * dt;
+        this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.fade[i] * this.gainS;
       }
-      this.aScale[i] = (ROLE_A[this.role[i]] ?? 0.6) * this.fade[i];
+
+      posArr[i * 3] = sp[i2];
+      posArr[i * 3 + 1] = sp[i2 + 1];
+      posArr[i * 3 + 2] = 0;
+      moved = true;
+    }
+
+    if (moved) {
+      this.geo.attributes.position.needsUpdate = true;
+      this.geo.attributes.aAlpha.needsUpdate = true;
+      this.geo.attributes.aSize.needsUpdate = true;
     }
 
     /* 回收淡完的点 */
@@ -353,10 +646,80 @@ export class Field {
         }
       }
       this.dying = rest;
+      this.geo.attributes.aAlpha.needsUpdate = true;
     }
 
-    if (moved || this.dying.length) this.geo.attributes.position.needsUpdate = true;
-    this.geo.attributes.aAlpha.needsUpdate = true;
+    /* ───────── 云层 ───────── */
+    const cPos = this.cPos, cVel = this.cVel;
+    const cArr = this.cGeo.attributes.position.array;
+    /* 指针在 → 围着指针（填充率越低越外扩）；指针不在 → 整片沉成一层
+       缓慢漂移的星尘，半径放大 10 倍、角速度降到 1/5（不然外圈线速度太快） */
+    const idle = !this.ptr.on;
+    const orbitK = 1 + 0.9 * (1 - this.slot.fill);
+    const cx0 = this.ptr.x;
+    const cy0 = this.ptr.y;
+    const spd = idle ? 0.16 : 0.78;
+
+    for (let i = 0; i < CLOUD_N; i++) {
+      const i2 = i * 2;
+      const px = cPos[i2], py = cPos[i2 + 1];
+      if (this.cFade[i] < 1) this.cFade[i] = Math.min(1, this.cFade[i] + dt * 2.2);
+
+      this.flowAt(px, py);
+
+      let tx, ty, k, c, flowAmp;
+      if (this.cMode[i] === 1) {
+        /* 槽位：微旋半径 0.9px —— 保持活性但不会把笔画糊掉 */
+        const a = t * 0.8 + this.cOrbPh[i];
+        tx = this.slotX[i] + Math.cos(a) * 0.9;
+        ty = this.slotY[i] + Math.sin(a) * 0.9;
+        k = SLOT_K; c = SLOT_C; flowAmp = FLOW_SLOT;
+      } else {
+        const a = t * spd * this.cOrbS[i] + this.cOrbPh[i];
+        /* 半径再叠一层慢涨落：环带被揉开成云，不是几何圆 */
+        const base = idle ? this.cParkR[i] : this.cOrbR[i] * orbitK;
+        const rr = base * (0.84 + 0.3 * Math.sin(t * 0.37 + this.cOrbPh[i] * 1.7));
+        tx = cx0 + Math.cos(a) * rr;
+        ty = cy0 + Math.sin(a) * rr * 0.84;
+        k = ORB_K; c = ORB_C; flowAmp = FLOW_ORB;
+      }
+
+      tx += this._fx * flowAmp;
+      ty += this._fy * flowAmp;
+
+      const dx = tx - px, dy = ty - py;
+      if (this.burstAt >= 0) {
+        cVel[i2] *= 1 - 1.1 * dt;
+        cVel[i2 + 1] *= 1 - 1.1 * dt;
+      } else {
+        cVel[i2] = (cVel[i2] + dx * k * dt) / (1 + c * dt);
+        cVel[i2 + 1] = (cVel[i2 + 1] + dy * k * dt) / (1 + c * dt);
+      }
+
+      /* 速度封顶，防炸 */
+      const v2 = cVel[i2] * cVel[i2] + cVel[i2 + 1] * cVel[i2 + 1];
+      if (v2 > 360000) {
+        const s = 600 / Math.sqrt(v2);
+        cVel[i2] *= s; cVel[i2 + 1] *= s;
+      }
+
+      cPos[i2] += cVel[i2] * dt;
+      cPos[i2 + 1] += cVel[i2 + 1] * dt;
+
+      cArr[i * 3] = cPos[i2];
+      cArr[i * 3 + 1] = cPos[i2 + 1];
+      cArr[i * 3 + 2] = 0;
+
+      /* 槽位粒子更亮（正好压在笔画上，是"充能"）；公转粒子是光尘 */
+      /* 槽位：压在笔画上 → 亮；公转：光尘。指针在时公转粒子收得很紧，
+         太亮会糊成一团脏斑，压到 0.55；待机星尘散得开，0.72 才看得见 */
+      const base = this.cMode[i] === 1 ? 1.25 : (this.ptr.on ? 0.66 : 0.72);
+      this.cAlpha[i] = this.cAmp[i] * base * this.cFade[i] * burst * this.gainC;
+    }
+
+    this.cGeo.attributes.position.needsUpdate = true;
+    this.cGeo.attributes.aAlpha.needsUpdate = true;
+    this.cGeo.attributes.aSize.needsUpdate = true;
   }
 
   render() {

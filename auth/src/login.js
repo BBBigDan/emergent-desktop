@@ -15,7 +15,7 @@
  *   2. targetURL 默认是 https://desktop.<olaresId 的 @ 换成 .>，有 ?rd= 时以它为准
  */
 import { Field } from './field.js';
-import { paint, scan, LW, LH, HIT, AVA } from './ui.js';
+import { paint, scan, scanPart, partAt, CAPK, LW, LH, HIT, AVA } from './ui.js';
 
 /* 官方登录页的头像来自 CDN；实例信息里 avatar 为空时就用这张默认图 */
 const DEFAULT_AVA = 'https://app.cdn.olares.com/avatar3/30.png';
@@ -155,6 +155,14 @@ function toCSS(lx, ly) {
   };
 }
 
+/** CSS 坐标 → 逻辑坐标（悬停命中用） */
+function toLogical(px, py) {
+  return {
+    x: (px - window.innerWidth / 2) / S.scale + LW / 2,
+    y: (py - window.innerHeight / 2) / S.scale + LH / 2,
+  };
+}
+
 /** 把透明 input 摆到密码框的位置上，让点击/输入法都落在正确的地方 */
 function placeInput() {
   const inp = $('#pw');
@@ -182,7 +190,19 @@ function placeAvatar() {
 
 /* ------------------------------- 重绘 -------------------------------- */
 let lastSig = '';
+let hover = null;
+
+/** 把增援粒子灌进当前悬停控件的槽位（细网格 → 控件变密变亮） */
+function refreshSlots() {
+  if (!field) return;
+  if (!hover) { field.clearSlots(); return; }
+  const pts = scanPart(uiCtx, S, hover, S.scale);
+  paint(uiCtx, S);            // scanPart 是破坏性的，把墨稿画回来
+  field.setSlots(pts, hover, CAPK[hover] ?? 0.5, S.scale, LW, LH);
+}
+
 function repaint(force = false) {
+  if (!field || !uiCtx) return;   // resize 事件可能早于启动完成
   const sig = `${S.olaresId}|${S.password.length}|${S.focused}|${S.busy}|${S.error}`;
   if (!force && sig === lastSig) return;
   lastSig = sig;
@@ -190,6 +210,8 @@ function repaint(force = false) {
   paint(uiCtx, S);
   const pts = scan(uiCtx);
   field.setPoints(pts, S.scale, LW, LH);
+  /* 打字时槽位也跟着变（密码点、光标都是新位置） */
+  if (hover) refreshSlots();
 }
 
 /* ------------------------------- 提交 -------------------------------- */
@@ -327,10 +349,10 @@ async function boot() {
 }
 
 /* ------------------------------- 交互 -------------------------------- */
-function overButton(x, y) {
-  const a = toCSS(HIT.button.x, HIT.button.y);
-  const b = toCSS(HIT.button.x + HIT.button.w, HIT.button.y + HIT.button.h);
-  return x >= a.x && x <= b.x && y >= a.y && y <= b.y;
+/** 指针下是哪个控件（用墨稿实测出来的矩形，不是另外编一套坐标） */
+function hitPart(x, y) {
+  const l = toLogical(x, y);
+  return partAt(l.x, l.y);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -351,8 +373,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
   /* 点哪儿都算聚焦 —— 这页只有一个输入 */
   window.addEventListener('pointerdown', (e) => {
+    field?.pulse(e.clientX, e.clientY);
     /* 先判箭头：它在输入框右端，不能先被 input 吃掉 */
-    if (overButton(e.clientX, e.clientY)) {
+    if (hitPart(e.clientX, e.clientY) === 'button') {
       submit();
       return;
     }
@@ -361,10 +384,21 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   window.addEventListener('pointermove', (e) => {
-    field?.setMouse(e.clientX, e.clientY, true);
-    document.body.classList.toggle('on-btn', overButton(e.clientX, e.clientY));
+    field?.setPointer(e.clientX, e.clientY, true);
+    const p = hitPart(e.clientX, e.clientY);
+    if (p !== hover) {
+      hover = p;
+      refreshSlots();
+      document.body.classList.toggle('on-btn', p === 'button');
+    }
   });
-  window.addEventListener('pointerleave', () => field?.setMouse(0, 0, false));
+
+  window.addEventListener('pointerleave', () => {
+    field?.setPointer(0, 0, false);
+    hover = null;
+    refreshSlots();
+    document.body.classList.remove('on-btn');
+  });
 
   /* 移动端键盘弹起时视口变了，重新算一次 */
   if (window.visualViewport) {

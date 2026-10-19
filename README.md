@@ -51,6 +51,8 @@
 | 粒子门（iframe 从粒子里长出来） | ✅ | 小点先流动 → 缓慢扩环 → 内部够大才渐现内容 → 散开炸裂 |
 | 梦境边缘（半透明 + 毛玻璃 + 渐变） | ✅ | 四边/四角 mask 衰减 + 单层 `backdrop-filter` + 全屏雾随浮现退去 |
 | 外挂注入调试链路 | ✅ | Tampermonkey 从本地服务拉包，改代码 1 秒热替换，不用重打镜像 |
+| 粒子登录页（真实 Authelia 链路） | ✅ | 界面全由点阵粒子构成，悬停控件时增援粒子倾泻进去；已跑通 firstfactor 登录 |
+| 壳层部署（不改进官方镜像） | ✅ | 裸 Pod + Service selector 切换，`deploy/switch.sh dev\|official` |
 | 接入 Olares 官方栈 | ⬜ | 目标：Vue 3 + Quasar 的窗口层，详见 [`docs/原型移交说明.md`](docs/原型移交说明.md) |
 
 验收数值（骨架收敛偏差 1.1px、槽位 3462 vs 骨架 3500、点距/光斑 1.42、零 console 报错）
@@ -71,6 +73,9 @@ emergent-desktop/
 │   ├── vendor/                 Three.js 本地副本（离线可用，未走 CDN）
 │   ├── build-standalone.mjs    内联打包成单文件 HTML
 │   └── README.md               ※ 原型完整技术说明在这里
+├── shell/                      桌面壳层：整屏粒子场 + 粒子门窗口（裸 Pod 部署）
+├── auth/                       粒子登录页：界面全部由点阵粒子构成
+├── deploy/                     k8s 清单 + 一键切换脚本（官方版 ⇄ 开发版）
 ├── tools/portal-inject/        外挂注入调试工程（Tampermonkey + 本地热更服务）
 ├── docs/                       需求评估、原型移交说明
 └── LICENSE                     MIT
@@ -96,6 +101,14 @@ python -m http.server 8765
 ```bash
 cd prototype
 node build-standalone.mjs     # → particle-sphere-standalone.html（已 gitignore）
+```
+
+粒子登录页单独跑：
+
+```bash
+cd auth
+python -m http.server 8811
+# → http://127.0.0.1:8811/   粒子/字体的设计说明见 auth/README.md
 ```
 
 ### 在真实的 Olares 桌面上试
