@@ -41,15 +41,17 @@ function pickColor() {
  * 原型的 5 种里 sculpture（纯引力井）依赖 3D 引力场，正交投影下看不出结构，
  * 这里先不做；其余四种按原型的参数逐条搬过来。
  */
-/* 球面纬度带。
- * 原型是 5 带、bandH 0.168 / gap 0.030，y 从 1 一路铺到 **0.04** —— 只有北半球，
- * 所以那个"球"其实是个半球（顶部平、底部空）。这里把带数翻倍到 10、带高按
- * y ∈ [-1,1] 重新解方程，粒子就铺满南北两极，才是真球体。
- * 配色仍是 5 组（原型 TYPES 数），南半球镜像回去，保留那层横向色带。 */
-const BANDS = 5;                                             // 配色带数
-const BAND_ROWS = BANDS * 2;                                 // 纬度分带数（南北各 5）
-const BAND_GAP = 0.030;
-const BAND_H = (2 - (BAND_ROWS - 1) * BAND_GAP) / BAND_ROWS; // ≈0.173，铺满 [-1,1]
+/* 球面：**均匀** Fibonacci 分布，铺满整个球（y 从 +1 到 -1）。
+ *
+ * 原型是 5 条纬度带（bandH 0.168 / gap 0.030，另有类型分区），两个问题：
+ *   1. y 从 1 只铺到 0.04 —— 只有北半球，是个"穹顶"，不是球；
+ *   2. 带与带之间留空 → 那不是一个连续球面，而是十来个**纬度环**。
+ *      静止时看不出，一旦拖动视角，每个环都投影成一个椭圆，
+ *      整个球就被压成一张扁盘（实测平均投影半径 0.79R → 0.60R）。
+ *
+ * 所以位置改成均匀球面（球面面积均匀 ⇔ y 均匀），任何角度看轮廓都是正圆；
+ * 配色仍然按 5 条纬度带分（南北各 2.5 带），保留那层横向色带的信息。 */
+const BANDS = 5;                                    // 配色带数（原型 TYPES 数）
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
 const SHAPES = ['sphere', 'torus', 'galaxy', 'wave'];
@@ -57,7 +59,6 @@ const SHAPE_MS = 9000;    // 原型 shapeState.interval = 9
 const FLOURISH_S = 0.9;   // 重组后 0.9s 内先向核心收拢再展开
 
 const AMBIENT_N = 6400;   // 整球表面积是半球 2 倍，按密度补足
-const PER_BAND = Math.ceil(AMBIENT_N / BAND_ROWS);
 const RIM_PER_WIN = 760;
 const MAX_WIN = 3;
 const N = AMBIENT_N + RIM_PER_WIN * MAX_WIN;
@@ -152,27 +153,18 @@ export class Field {
     this.dragging = false;
 
     for (let i = 0; i < n; i++) {
-      /* ambient 按纬度带取色（五色分区，北半球 0→4、南半球 4→0 镜像）；
-         rim 仍用加权随机 */
-      const bandIdx = Math.min(BAND_ROWS - 1, Math.floor(i / PER_BAND));
-      const colBand = Math.min(BANDS - 1, Math.floor(bandIdx * BANDS / BAND_ROWS));
+      /* 球面坐标：y 在 [-1,1] 均匀（球面上面积均匀）+ 黄金角方位 */
+      const sy0 = 1 - 2 * (i + 0.5) / AMBIENT_N;
+      const srr = Math.sqrt(Math.max(0, 1 - sy0 * sy0));
+      const sth = GOLDEN * i;
+      /* ambient 按纬度分 5 个配色带（与原型一致的横向色带）；rim 走加权随机 */
+      const colBand = Math.min(BANDS - 1, Math.floor((1 - sy0) * 0.5 * BANDS));
       const c = i < AMBIENT_N ? PAL[colBand] : pickColor();
       this.col[i * 3] = c[0]; this.col[i * 3 + 1] = c[1]; this.col[i * 3 + 2] = c[2];
       this.phase[i] = Math.random() * Math.PI * 2;
-      /* 球面：Fibonacci（黄金角）方位 + 10 条纬度带切分。
-         y 在带内均匀 → 球面上面积均匀（球面均匀分布等价于 y 均匀），
-         南北极都不会堆点。带与带之间留 gap，就是原型那些横向暗缝。 */
-      const b = Math.min(BAND_ROWS - 1, Math.floor(i / PER_BAND));
-      const j = i - b * PER_BAND;
-      const cnt = Math.min(PER_BAND, AMBIENT_N - b * PER_BAND);
-      const y0 = 1 - b * (BAND_H + BAND_GAP) - 0.004;
-      const y1 = y0 - BAND_H;
-      const by = y1 + (y0 - y1) * (cnt === 1 ? 0.5 : j / (cnt - 1));
-      const brr = Math.sqrt(Math.max(0, 1 - by * by));
-      const bth = GOLDEN * j + b * 2.399;
-      this.sd[i * 3] = Math.cos(bth) * brr;
-      this.sd[i * 3 + 1] = by;
-      this.sd[i * 3 + 2] = Math.sin(bth) * brr;
+      this.sd[i * 3] = Math.cos(sth) * srr;
+      this.sd[i * 3 + 1] = sy0;
+      this.sd[i * 3 + 2] = Math.sin(sth) * srr;
       this.pu[i] = Math.random();
       this.pv[i] = Math.random();
       this.pr1[i] = Math.random();
@@ -285,9 +277,12 @@ export class Field {
       /* 直接吃位移，拖起来"抓住球在转"；0.0062 rad/px ≈ 1px→0.36° */
       this.yaw += dx * 0.0062;
       this.pitch = clamp(this.pitch + dy * 0.0062, -1.30, 1.30);
-      /* 记角速度，松手后顺着方向继续滑一段 */
-      this.yawV = dx * 0.0062 / dt;
-      this.pitchV = dy * 0.0062 / dt;
+      /* 记角速度，松手后顺着方向继续滑一段。
+         夹到 ±3.2 rad/s：20px/16ms 的快甩会算出 8 rad/s，松手后自己再转两圈半，
+         观感是"球飞出去了"。 */
+      const cap = 3.2;
+      this.yawV = clamp(dx * 0.0062 / dt, -cap, cap);
+      this.pitchV = clamp(dy * 0.0062 / dt, -cap, cap);
     };
 
     const up = (e) => {
@@ -420,8 +415,11 @@ export class Field {
         T[i * 3 + 1] = 0;
         T[i * 3 + 2] = (row / (rows - 1) - 0.5) * 1.28;
       }
-      this.waveF = 2.2 + seed * 1.4;
-      this.waveA = 0.07 + ((seed * 5.17) % 1) * 0.05;
+      /* 频率要换算：原型 x 跨度 36 世界单位、f=0.30~0.52 → 横跨 1.7 个波长。
+         这里跨度是 1.28（归一化），所以 f 要乘 36/1.28 ≈ 28 → 8.4~14.6。
+         原来写 2.2，波长 2.85 比整张网格还宽，看到的是"整块倾斜"而不是涟漪。 */
+      this.waveF = 8.4 + seed * 4.2;
+      this.waveA = 0.075 + ((seed * 5.17) % 1) * 0.05;
     }
   }
 

@@ -7,14 +7,18 @@
  *      它会把 `src/*.js` 从自己的 cache 里吐出来，改多少遍都没用。
  * 这里统一发 `no-store`，并给 HTML 塞一个构建戳，方便一眼看出跑的是哪一版。
  *
- *   node serve.mjs [port=8822]
+ *   node serve.mjs [port=8822] [root]
  */
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
+/* 默认服务 serve.mjs 所在目录；第三个参数可以指定别的目录
+   （shell/ 也有 index.html + src/，同一个服务就能预览桌面） */
+const ROOT = process.argv[3]
+  ? path.resolve(process.argv[3])
+  : path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.argv[2] || 8822);
 
 const MIME = {
