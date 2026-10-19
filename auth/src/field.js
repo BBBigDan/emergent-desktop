@@ -589,11 +589,21 @@ export class Field {
           else continue;
           this.byKey.set(key, idx);
           this.key[idx] = key;
-          this.pos[idx * 2] = wx;
-          this.pos[idx * 2 + 1] = wy;
+          /* 新点从**指针**出发 —— 打字时观感就是"指针周围那一撮粒子飞过去，
+             组成刚打的那个字符"。原来是把 pos 直接设成目标点再 fade 0→1，
+             看到的就是"凭空亮起一个新点"，然后指针周围的粒子去补位，
+             补的却是边框上的空洞（见 setSlots 的补位规则）。 */
+          if (this.ptr.on) {
+            this.pos[idx * 2] = this.ptr.x + (Math.random() - 0.5) * 44;
+            this.pos[idx * 2 + 1] = this.ptr.y + (Math.random() - 0.5) * 44;
+            this.fade[idx] = 1;      // 全程可见，才看得到它飞过去
+          } else {
+            this.pos[idx * 2] = wx;
+            this.pos[idx * 2 + 1] = wy;
+            this.fade[idx] = 0;      // 初次绘制：就地淡入
+          }
           this.vel[idx * 2] = 0;
           this.vel[idx * 2 + 1] = 0;
-          this.fade[idx] = 0;
           /* 逐粒子点径/亮度差异：印刷网点每颗都不同，模子刻出来的一眼就是假的 */
           this.sJit[idx] = 0.82 + ((h >>> 11) % 100) / 100 * 0.38;
           this.aJit[idx] = 0.78 + ((h >>> 17) % 100) / 100 * 0.28;
@@ -687,8 +697,16 @@ export class Field {
 
     /* ② 补空位：从环绕粒子按"离控件中心由近及远"取，看起来是从指针那边灌进去 */
     if (used < useCount) {
+      /* 只补「这一帧新出现的格子」。
+         claimed 之外的空格子有两种：①新密码点带来的新格子；②CAPK<1 造成的、
+         本来就没粒子的旧格子（边框上到处都是）。两种混着补，每敲一个键指针
+         周围的粒子就会去填边框上的洞 —— 那就是"向框体补充粒子"。 */
       const free = [];
-      for (let k = 0; k < M; k++) if (!claimed[k]) free.push(k);
+      for (let k = 0; k < M; k++) {
+        if (claimed[k]) continue;
+        if (this.prevKeys && this.prevKeys.has(pts[k * 4 + 3])) continue;  // 旧格子：保持空着
+        free.push(k);
+      }
 
       let ccx = 0, ccy = 0;
       for (let k = 0; k < M; k++) { ccx += sx[k]; ccy += sy[k]; }
@@ -718,6 +736,10 @@ export class Field {
       }
     }
 
+    /* 记住这一帧的格子集合，下一帧据此区分"新冒出来的格子"和"本来空着的格子" */
+    this.prevKeys = new Set();
+    for (let k = 0; k < M; k++) this.prevKeys.add(pts[k * 4 + 3]);
+
     this.slot.fill = used / CLOUD_N;
     this.applyHot(id, scale);   // 骨架里属于该控件的点整体提亮
     this.rebuildSlotLinks();
@@ -739,6 +761,7 @@ export class Field {
     this.slot.fill = 0;
     this.cMode.fill(0);
     this.cRole.fill(0);
+    this.prevKeys = null;
     this.lnkSlot.n = 0;
     this.lnkSlot.obj.visible = false;
     this.applyHot(null);
@@ -934,7 +957,7 @@ export class Field {
     if (this.dying.length) {
       const rest = [];
       for (const i of this.dying) {
-        this.fade[i] -= dt * 7;
+        this.fade[i] -= dt * 12;
         if (this.fade[i] <= 0) {
           this.fade[i] = 0;
           this.aScale[i] = 0;
