@@ -31,7 +31,19 @@ const MIME = {
 };
 
 const URL_RAW = (req) => decodeURIComponent(req.url || '/');
-const BUILD = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '');  // 20261019T1622
+
+/* 构建戳 = index.html + src/*.js 里**最新的 mtime**。
+   这样"标签页标题"永远等于"当前代码的时间"，不用重启服务、也不会说谎。 */
+function buildStamp() {
+  const files = ['index.html', ...fs.readdirSync(path.join(ROOT, 'src')).map((f) => path.join('src', f))];
+  let t = 0;
+  for (const f of files) {
+    try { t = Math.max(t, fs.statSync(path.join(ROOT, f)).mtimeMs); } catch { /* ignore */ }
+  }
+  const d = new Date(t);
+  const p2 = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}T${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+}
 
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -61,11 +73,11 @@ http.createServer((req, res) => {
       'expires': '0',
     };
     if (ext === '.html') {
-      buf = Buffer.from(buf.toString('utf8').replaceAll('__BUILD__', BUILD));
+      buf = Buffer.from(buf.toString('utf8').replaceAll('__BUILD__', buildStamp()));
     }
     res.writeHead(200, headers);
     res.end(buf);
   });
 }).listen(PORT, '0.0.0.0', () => {
-  console.log(`emergent-auth dev  →  http://127.0.0.1:${PORT}/   (build ${BUILD})`);
+  console.log(`emergent-auth dev  →  http://127.0.0.1:${PORT}/`);
 });

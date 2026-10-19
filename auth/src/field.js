@@ -32,6 +32,28 @@ const ROLE_S = [0, 1.12, 0.92, 0.96, 1.1, 1.02, 0.9, 1.06, 0.88];
 /* role → 所属控件（悬停时该控件的点阵要整体提亮） */
 const ROLE_PART = [null, 'name', 'hint', 'input', 'input', 'button', 'input', 'input', 'error'];
 
+/* ─────────────── 工况色谱（原型 TEMP_STOPS，逐字搬过来） ───────────────
+ * 点阵的颜色不是固定的淡蓝：色相 = "温度"，冷 → 暖，亮度也跟着涨。
+ * UI 模式取的是模拟遥测的均值，会缓慢漂移 —— 所以整片字在电青和洋青之间
+ * 轻轻呼吸。写死一个 rgb 等于把这层信息全丢了。 */
+const TEMP_STOPS = [
+  { at: 0.00, c: [0x44, 0xaa, 0xff] },  // 冰蓝 · 低温
+  { at: 0.25, c: [0x2e, 0xe4, 0xd8] },  // 电青
+  { at: 0.50, c: [0x18, 0xe0, 0xb9] },  // 洋青
+  { at: 0.75, c: [0xb2, 0x77, 0xff] },  // 淡紫
+  { at: 1.00, c: [0xff, 0xb0, 0x40] },  // 琥珀 · 高温
+];
+const _rgb = [0, 0, 0];
+function tempColor(temp) {
+  const t = clamp(temp, 0, 1);
+  let i = 0;
+  while (i < TEMP_STOPS.length - 2 && t > TEMP_STOPS[i + 1].at) i++;
+  const a = TEMP_STOPS[i], b = TEMP_STOPS[i + 1];
+  const f = (t - a.at) / (b.at - a.at);
+  for (let k = 0; k < 3; k++) _rgb[k] = (a.c[k] + (b.c[k] - a.c[k]) * f) / 255;
+  return _rgb;
+}
+
 /* 骨架：弹簧刚度 / 阻尼（px 单位）。k 越大越"钉"，ω=sqrt(k)≈13rad/s，
  * 阻尼比 0.9 —— 略欠阻尼，跟随时有一点点回弹，不是生硬的直给。 */
 const SKEL_K = 170;
@@ -84,7 +106,8 @@ function fbm(x, y, z, seed) {
 const VERT = `
   attribute float aAlpha; attribute float aSize; attribute float aSeed; attribute float aHot;
   varying float vA;
-  uniform float uDpr; uniform float uTime; uniform float uGain;
+  uniform float uDpr; uniform float uTime; uniform float uGain; uniform float uSizeMul;
+  uniform vec3 uColor;
   void main(){
     /* 亮度呼吸：每个点自己的相位 → 星点闪烁（**位置**的呼吸在 CPU 流场里，
        那是整群相干的；这里的 alpha 抖动只是个高光，幅度很小） */
@@ -94,14 +117,14 @@ const VERT = `
     vA = clamp(aAlpha * breathe * uGain * (1.0 + aHot * 0.55), 0.0, 1.0);
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     gl_Position = projectionMatrix * mv;
-    gl_PointSize = aSize * uDpr * (1.0 + aHot * 0.10);
+    gl_PointSize = aSize * uDpr * uSizeMul * (1.0 + aHot * 0.10);
   }`;
 
 /* 加色版：重叠的点会互相叠亮 —— 原型就是 Additive，所以每颗点的"热度"
    都不一样（簇上的点更白更亮），这是"不规整"的重要一半。 */
 const FRAG_HARD = `
   varying float vA;
-  uniform float uAdd;
+  uniform float uAdd; uniform vec3 uColor;
   void main(){
     vec2 d = gl_PointCoord - 0.5;
     float r = sqrt(dot(d, d)) * 2.0;
@@ -110,28 +133,30 @@ const FRAG_HARD = `
     float a = vA * (1.0 - smoothstep(0.82, 1.0, r));
     /* uAdd=1 → 非预乘（加色混合按 SrcAlpha 计权）；
        uAdd=0 → 预乘（NormalBlending，叠在头像上不会变黑） */
-    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * mix(a, 1.0, uAdd), a);
+    gl_FragColor = vec4(uColor * mix(a, 1.0, uAdd), a);
   }`;
 
 const FRAG_SOFT = `
   varying float vA;
-  uniform float uAdd;
+  uniform float uAdd; uniform vec3 uColor;
   void main(){
     vec2 d = gl_PointCoord - 0.5;
     float r2 = dot(d, d) * 4.0;
     if (r2 > 1.0) discard;
     float core = pow(1.0 - r2, 1.7);
     float a = core * vA;
-    gl_FragColor = vec4(vec3(0.62, 0.90, 1.0) * mix(a, 1.0, uAdd), a);
+    gl_FragColor = vec4(uColor * mix(a, 1.0, uAdd), a);
   }`;
 
-function makeMat(hard, additive) {
+function makeMat(hard, additive, sizeMul = 1, gain = 1) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uDpr: { value: 1 },
       uTime: { value: 0 },
-      uGain: { value: 1 },
+      uGain: { value: gain },
       uAdd: { value: additive ? 1 : 0 },
+      uSizeMul: { value: sizeMul },
+      uColor: { value: new THREE.Color(0.18, 0.88, 0.85) },
     },
     vertexShader: VERT,
     fragmentShader: hard ? FRAG_HARD : FRAG_SOFT,
@@ -190,6 +215,13 @@ export class Field {
     this.points.frustumCulled = false;
     this.points.position.z = 1;
 
+    /* 同一份 geometry 再用一个"大号、暗"的材质画一遍 = 廉价 bloom。
+       原型的点周围有一圈明显的光晕（点阵屏在暗处的溢光），只画硬芯永远是干巴巴的圆。 */
+    this.matGlow = makeMat(false, true, 3.0, 0.10);
+    this.pointsGlow = new THREE.Points(this.geo, this.matGlow);
+    this.pointsGlow.frustumCulled = false;
+    this.pointsGlow.position.z = 0.9;
+
     /* ───────────────── 云层：增援 ───────────────── */
     this.cPos = new Float32Array(CLOUD_N * 2);
     this.cVel = new Float32Array(CLOUD_N * 2);
@@ -235,6 +267,11 @@ export class Field {
     this.cPoints.frustumCulled = false;
     this.cPoints.position.z = 0;
 
+    this.cMatGlow = makeMat(false, true, 2.6, 0.09);
+    this.cPointsGlow = new THREE.Points(this.cGeo, this.cMatGlow);
+    this.cPointsGlow.frustumCulled = false;
+    this.cPointsGlow.position.z = -0.1;
+
     /* ───────────────── 头像光晕（顶点着色器算轨道） ───────────────── */
     this.oA = new Float32Array(AVA_N);
     this.oW = new Float32Array(AVA_N);
@@ -274,6 +311,7 @@ export class Field {
         uR: { value: 80 },
         uPx: { value: 1 },
         uOpacity: { value: 1 },
+        uColorA: { value: new THREE.Color(0.18, 0.88, 0.85) },
       },
       vertexShader: `
         attribute float aA; attribute float aW; attribute float aOff;
@@ -296,13 +334,14 @@ export class Field {
         }`,
       fragmentShader: `
         varying float vA;
+        uniform vec3 uColorA;
         void main(){
           vec2 d = gl_PointCoord - 0.5;
           float r2 = dot(d, d) * 4.0;
           if (r2 > 1.0) discard;
           float core = pow(1.0 - r2, 1.5);
           float a = core * vA;
-          gl_FragColor = vec4(vec3(0.56, 0.92, 1.0) * a, a);
+          gl_FragColor = vec4(uColorA * a, a);
         }`,
       transparent: true,
       depthTest: false,
@@ -329,7 +368,9 @@ export class Field {
     this.scene.add(this.lnkSkel.obj);
     this.scene.add(this.lnkSlot.obj);
     this.scene.add(this.lnkOrb.obj);
+    this.scene.add(this.cPointsGlow);
     this.scene.add(this.cPoints);
+    this.scene.add(this.pointsGlow);
     this.scene.add(this.points);
     this.scene.add(this.oPoints);
 
@@ -357,6 +398,8 @@ export class Field {
     this.renderer.setSize(this.W, this.H, false);
     this.mat.uniforms.uDpr.value = dpr;
     this.cMat.uniforms.uDpr.value = dpr;
+    this.matGlow.uniforms.uDpr.value = dpr;
+    this.cMatGlow.uniforms.uDpr.value = dpr;
     this.oMat.uniforms.uDpr.value = dpr;
     this.cam.left = -this.W / 2;
     this.cam.right = this.W / 2;
@@ -742,6 +785,8 @@ export class Field {
     const t = this.time;
     this.mat.uniforms.uTime.value = t;
     this.cMat.uniforms.uTime.value = t;
+    this.matGlow.uniforms.uTime.value = t;
+    this.cMatGlow.uniforms.uTime.value = t;
     this.oMat.uniforms.uTime.value = t;
 
     if (this.avatarBurst !== undefined) {
@@ -751,6 +796,17 @@ export class Field {
     }
 
     this.updateFlow(t);
+
+    /* 温度：缓慢漂移（原型 UI 模式取模拟遥测均值）→ 整片色相在电青~洋青之间呼吸 */
+    const temp = 0.40 + 0.09 * Math.sin(t * 0.07) + 0.04 * Math.sin(t * 0.23 + 1.7);
+    const col = tempColor(temp);
+    const bright = 0.28 + temp * 0.55;              // 原型：亮度随温度涨
+    const kCol = bright / 0.55;                     // 归一化，让 temp=0.55 时保持原亮度
+    const cr = col[0] * kCol, cg = col[1] * kCol, cb = col[2] * kCol;
+    for (const m of [this.mat, this.matGlow, this.cMat, this.cMatGlow]) {
+      m.uniforms.uColor.value.setRGB(cr, cg, cb);
+    }
+    this.oMat.uniforms.uColorA.value.setRGB(col[0], col[1], col[2]);
 
     /* 呼吸包络：整群统一（不是逐粒子）→ 起伏有节奏，像呼吸而不是抖动 */
     const env = 0.5 + 0.5 * Math.sin(t * 0.42);
