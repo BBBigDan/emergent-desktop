@@ -48,6 +48,10 @@ const VMAX = 9000;
 /* ============================ 布局 ============================ */
 const portal = $('portal');
 const frame = $('frame');
+const veil = $('veil');
+
+/* 边缘雾化的运行时状态（CSS 那边是规则，这边只负责推变量） */
+const DREAM = { edge: 64, veilK: 1.45, veilMax: 0.95 };
 
 let W = 0, H = 0, rw = 0, rh = 0, hw = 0, hh = 0;
 let camera, renderer;
@@ -92,6 +96,15 @@ function layout() {
   portal.style.height = rh + 'px';
   portal.style.left = Math.round((W - rw) / 2) + 'px';
   portal.style.top = Math.round((H - rh) / 2) + 'px';
+
+  /* 雾化带宽度：跟着窗口尺寸走，但上下限卡死。
+     太窄（<38px）看不清"渗化"，太宽（>86px）会把页面有效内容吃掉。 */
+  const edge = Math.round(clamp(Math.min(rw, rh) * 0.098, 44, 94));
+  portal.style.setProperty('--edge', edge + 'px');
+  // 纵向收窄到 0.72：窗口的页头/页脚只有 40~56px 高，同宽会把标题整条削掉
+  portal.style.setProperty('--edge-y', Math.round(edge * 0.72) + 'px');
+  portal.style.setProperty('--corner', Math.round(edge * 2.15) + 'px');
+  DREAM.edge = edge;
 }
 
 /* ============================ 粒子数据 ============================ */
@@ -500,7 +513,9 @@ function simulate(dt, pe) {
       a *= 1 + 2.4 * pk;
     }
     if (kd === KIND_HALO) a *= 0.45 + 0.55 * smoothstep(0.25, 0.85, pe);
-    if (kd === KIND_INTR) a *= 1 - smoothstep(1, 16, pen);
+    // 侵入粒子的淡出距离要盖住雾化带：只在 16px 内消失的话，看着是"碰一下就没了"；
+    // 拉长到 46px 才会像"游进毛玻璃里被慢慢吸收"
+    if (kd === KIND_INTR) a *= 1 - smoothstep(2, 46, pen);
     if (pointer.on) {
       const dx = x - pointer.x, dy = y - pointer.y;
       const d = Math.sqrt(dx * dx + dy * dy);
@@ -563,14 +578,28 @@ function scatterStep(dt) {
 }
 
 /* ============================ 窗口揭示 ============================ */
+/* 内容不是"淡入"，而是"从雾里析出"：
+   rev=0 → 整页一层毛玻璃（看不到内容，只见一团被抹开的影子）
+   rev=1 → 雾退到只剩边缘与四角
+   中间段两个动作同时发生，所以看起来像是页面从粒子流里被慢慢"擦"出来。 */
 let lastRev = -1;
+let settledNow = false;
+
 function applyReveal(rev) {
-  if (Math.abs(rev - lastRev) < 1.5e-3) return;
+  if (Math.abs(rev - lastRev) < 3e-4) return;
   lastRev = rev;
   portal.style.opacity = rev.toFixed(3);
   portal.style.visibility = rev < 0.003 ? 'hidden' : 'visible';
-  // blur 只在很淡时给一次（每帧改 filter 会逼 GPU 反复重绘 iframe）
-  portal.style.filter = rev < 0.55 ? 'blur(3px)' : 'none';
+
+  // 全屏雾：只在出现/消失过程存在，且要“先浓后散”，所以用 1.45 次幂压后段
+  veil.style.opacity = (Math.pow(1 - rev, DREAM.veilK) * DREAM.veilMax).toFixed(3);
+
+  // 到位后关掉全屏雾层：一个 opacity 0 的全屏 backdrop-filter 依然要参与合成
+  const settled = rev > 0.994;
+  if (settled !== settledNow) {
+    settledNow = settled;
+    portal.classList.toggle('settled', settled);
+  }
 }
 
 /* ============================ 主循环 ============================ */
@@ -689,6 +718,9 @@ layout();
 initParticles();
 frame.src = IF_URL;
 applyReveal(0);
+
+// ?frost=0：关掉边缘毛玻璃（软渲染/弱机上那一层全屏 blur 挺贵）
+if (qs.get('frost') === '0') portal.classList.add('nofrost');
 
 // 无条件先算一帧，防止 freeze 时首帧空白
 simulate(1 / 60, peOf(now));

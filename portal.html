@@ -35,9 +35,99 @@
      不用 transform:scale（内容跟着缩放，中途一直糊），也不用 clip-path（像从中心开窥视孔）。
      opacity 完全不碰内容的栅格化，所以字从第一帧到最后一帧都是 1:1 锐利。 */
   #portal{position:fixed;left:0;top:0;z-index:2;border-radius:18px;overflow:hidden;
+    --edge:64px;          /* 左右雾化带宽度（JS 按视口改写） */
+    --edge-y:46px;        /* 上下雾化带：窗口的页头/页脚只有 ~40px，带子太宽会直接把标题削掉 */
+    --corner:150px;       /* 四角雾化外扩半径 */
     background:transparent;opacity:0;visibility:hidden;will-change:opacity;
-    box-shadow:0 0 0 1px rgba(126,196,255,.20), 0 0 26px rgba(88,178,255,.26), 0 0 90px rgba(44,130,255,.18)}
-  #portal iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#070b14}
+    /* backdrop root 收到本元素内部：毛玻璃只吃 iframe 自己的像素，
+       不会把外层星空一起糊成一片灰 */
+    isolation:isolate;
+    box-shadow:0 0 26px rgba(88,178,255,.20), 0 0 90px rgba(44,130,255,.14)}
+  #portal.settled{will-change:auto}
+  /* 弱机降级：?frost=0 关掉毛玻璃，只留半透明与暗角（仍比纯淡入像样，但省一整个全屏 blur） */
+  #portal.nofrost #frost{display:none}
+  /* iframe 自身在边缘半透明 —— 这是"页面不是贴上去的、是从粒子流里渗出来"的关键。
+     若边缘完全不透明，外面模糊得再狠也只是"板子上贴了层雾"，永远透不出背后的星空。
+     两层 mask 用 intersect（alpha 相乘）：四角两层都被衰减 → 角落比四边更透、更虚。 */
+  #portal iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#070b14;
+    --fm:
+      linear-gradient(to right,  rgba(0,0,0,.40) 0, rgba(0,0,0,.70) calc(var(--edge) * .42), #000 calc(var(--edge) * 1.20), #000 calc(100% - var(--edge) * 1.20), rgba(0,0,0,.70) calc(100% - var(--edge) * .42), rgba(0,0,0,.40) 100%),
+      linear-gradient(to bottom, rgba(0,0,0,.40) 0, rgba(0,0,0,.70) calc(var(--edge-y) * .42), #000 calc(var(--edge-y) * 1.20), #000 calc(100% - var(--edge-y) * 1.20), rgba(0,0,0,.70) calc(100% - var(--edge-y) * .42), rgba(0,0,0,.40) 100%);
+    -webkit-mask-image:var(--fm); mask-image:var(--fm);
+    -webkit-mask-composite:source-in; mask-composite:intersect}
+
+  /* ── 边缘毛玻璃 ────────────────────────────────────────────────
+     一层 backdrop-filter + 八层 mask（四边线性渐隐 + 四角径向外扩）。
+     刻意只做"一层 filter、多组 mask"：每多一层 backdrop-filter 就是一遍全屏模糊，
+     9000 粒子在上面跑时，三层叠起来直接把帧率吃干。
+     mask 的 alpha 从边缘的 1 渐降到 0，模糊强度也就跟着渐变——
+     这就是"越靠近粒子流越糊、往中间越清"的过渡。 */
+  #frost{position:absolute;inset:0;pointer-events:none;
+    /* 衰减曲线做成 S 形（不是线性）：边缘一圈是实的，走到 60% 处已经开始透，
+       最后 20% 只剩一点毛边。线性渐变会读成"一条发白的框"。 */
+    --m:
+      linear-gradient(to right, #000 0, rgba(0,0,0,.82) calc(var(--edge) * .22), rgba(0,0,0,.46) calc(var(--edge) * .55), rgba(0,0,0,.15) calc(var(--edge) * .82), transparent var(--edge)),
+      linear-gradient(to left,  #000 0, rgba(0,0,0,.82) calc(var(--edge) * .22), rgba(0,0,0,.46) calc(var(--edge) * .55), rgba(0,0,0,.15) calc(var(--edge) * .82), transparent var(--edge)),
+      linear-gradient(to bottom,#000 0, rgba(0,0,0,.82) calc(var(--edge-y) * .22), rgba(0,0,0,.46) calc(var(--edge-y) * .55), rgba(0,0,0,.15) calc(var(--edge-y) * .82), transparent var(--edge-y)),
+      linear-gradient(to top,   #000 0, rgba(0,0,0,.82) calc(var(--edge-y) * .22), rgba(0,0,0,.46) calc(var(--edge-y) * .55), rgba(0,0,0,.15) calc(var(--edge-y) * .82), transparent var(--edge-y)),
+      radial-gradient(circle at 0 0,    rgba(0,0,0,.92), transparent var(--corner)),
+      radial-gradient(circle at 100% 0, rgba(0,0,0,.92), transparent var(--corner)),
+      radial-gradient(circle at 0 100%, rgba(0,0,0,.92), transparent var(--corner)),
+      radial-gradient(circle at 100% 100%, rgba(0,0,0,.92), transparent var(--corner));
+    -webkit-mask-image:var(--m); mask-image:var(--m);
+    -webkit-mask-composite:source-over; mask-composite:add;
+    -webkit-backdrop-filter:blur(15px) saturate(1.24) brightness(1.14);
+    backdrop-filter:blur(15px) saturate(1.24) brightness(1.14)}
+
+  /* 雾面半透明：给边缘补一层冷色玻璃底色。frost 的模糊会把 iframe 的内容
+     抹平成一团亮色，不加这层 tint 会显得发白而不是"玻璃"。 */
+  #tint{position:absolute;inset:0;pointer-events:none;
+    --m:
+      linear-gradient(to right, rgba(150,205,255,.27) 0, rgba(120,185,255,.07) calc(var(--edge) * .5), transparent var(--edge)),
+      linear-gradient(to left,  rgba(150,205,255,.27) 0, rgba(120,185,255,.07) calc(var(--edge) * .5), transparent var(--edge)),
+      linear-gradient(to bottom,rgba(150,205,255,.18) 0, rgba(120,185,255,.06) calc(var(--edge-y) * .5), transparent var(--edge-y)),
+      linear-gradient(to top,   rgba(150,205,255,.18) 0, rgba(120,185,255,.06) calc(var(--edge-y) * .5), transparent var(--edge-y)),
+      radial-gradient(circle at 0 0,    rgba(140,200,255,.20), transparent var(--corner)),
+      radial-gradient(circle at 100% 0, rgba(140,200,255,.15), transparent var(--corner)),
+      radial-gradient(circle at 0 100%, rgba(140,200,255,.15), transparent var(--corner)),
+      radial-gradient(circle at 100% 100%, rgba(140,200,255,.20), transparent var(--corner));
+    -webkit-mask-image:var(--m); mask-image:var(--m);
+    -webkit-mask-composite:source-over; mask-composite:add;
+    mix-blend-mode:screen;
+    /* 极慢的明暗起伏：让边界像"活的"而不是一张静态的雾图。
+       只动 opacity（合成层即可完成），不触发重排/重绘。 */
+    animation:dreamBreath 6.4s ease-in-out infinite alternate}
+
+  @keyframes dreamBreath{ from{opacity:.50} to{opacity:.74} }
+  @media (prefers-reduced-motion:reduce){ #tint{animation:none;opacity:.60} }
+
+  /* ── 出现期的整页雾 ──────────────────────────────────────────
+     rev 从 0 升到 1 时这里从 1 降到 0：内容先是雾里的一团影子，再慢慢析出。
+     到位后 display:none，不再参与合成（否则一个透明层的全屏 blur 也要算钱）。 */
+  #veil{position:absolute;inset:0;pointer-events:none;opacity:0;
+    background:linear-gradient(180deg,rgba(14,32,62,.40),rgba(6,14,30,.30));
+    -webkit-backdrop-filter:blur(12px) saturate(1.10);
+    backdrop-filter:blur(12px) saturate(1.10)}
+  #portal.settled #veil{display:none}
+
+  /* ── 玻璃的"厚度" ─────────────────────────────────────────────
+     内侧压暗 + 极淡内边线 + 四角冷光。纯渐变，不用 backdrop，几乎不花性能。
+     压暗很关键：内容在边缘处应该"沉下去"，否则会像是浮在雾上的一块贴纸。 */
+  #rim{position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+    box-shadow:inset 0 0 calc(var(--edge) * 1.05) rgba(5,12,26,.34),
+               inset 0 0 calc(var(--edge) * .58) rgba(96,190,255,.075),
+               inset 0 0 0 1px rgba(160,208,255,.05);
+    background:
+      radial-gradient(56% 56% at 0% 0%,    rgba(96,190,255,.10), transparent 66%),
+      radial-gradient(56% 56% at 100% 0%,  rgba(96,190,255,.06), transparent 66%),
+      radial-gradient(56% 56% at 0% 100%,  rgba(96,190,255,.06), transparent 66%),
+      radial-gradient(56% 56% at 100% 100%,rgba(96,190,255,.10), transparent 66%)}
+
+  /* 不支持 backdrop-filter 时至少还是半透明雾，不会退化成一块硬边 */
+  @supports not ((backdrop-filter:blur(4px)) or (-webkit-backdrop-filter:blur(4px))){
+    #frost{-webkit-mask-image:var(--m);mask-image:var(--m);background:rgba(14,28,52,.62)}
+    #veil{background:rgba(10,22,44,.86)}
+  }
 
   /* HUD */
   .panel{position:fixed;z-index:4;background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -77,10 +167,10 @@
 <div id="bg"></div>
 <canvas id="scene"></canvas>
 
-<div id="portal"><iframe id="frame" title="portal content" allow="clipboard-read; clipboard-write"></iframe></div>
+<div id="portal"><iframe id="frame" title="portal content" allow="clipboard-read; clipboard-write"></iframe><div id="frost"></div><div id="tint"></div><div id="veil"></div><div id="rim"></div></div>
 
-<div id="title" class="panel">粒子门 · iframe 包裹试验 <span style="opacity:.45">v0.16</span>
-  <small>小点阶段粒子就在流动 → 缓缓扩成窗口大小的环 → 内部够大时 iframe 淡入 → Esc 让粒子四散、页面淡出</small>
+<div id="title" class="panel">粒子门 · iframe 包裹试验 <span style="opacity:.45">v0.17</span>
+  <small>小点先流动 → 缓缓扩环 → 内部够大时页面从雾里析出（边缘/四角毛玻璃 + 半透明）→ Esc 粒子四散、页面退回雾中</small>
 </div>
 <div id="selftest" class="panel" hidden></div>
 
