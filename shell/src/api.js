@@ -86,6 +86,7 @@ export async function myApps() {
       if (!app.url) continue;
       out.push({
         id: app.id || app.name,
+        name: app.name,
         title: app.title || app.name,
         icon: app.icon || '',
         host: stripHost(app.url),
@@ -96,6 +97,7 @@ export async function myApps() {
     for (const e of ents) {
       out.push({
         id: `${app.id || app.name}:${e.name}`,
+        name: e.name,
         title: e.title || e.name,
         icon: e.icon || SYS_ICON[e.name] || app.icon || '',
         host: stripHost(e.url),

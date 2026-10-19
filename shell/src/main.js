@@ -3,6 +3,7 @@
  */
 import { Field } from './field.js';
 import { ShellWindow } from './window.js';
+import { createDockIcon } from './dockicon.js';
 import { myApps, gotoLogin, logout, terminusBase } from './api.js';
 
 const field = new Field(document.getElementById('scene'));
@@ -70,6 +71,7 @@ function openApp(app) {
     field.close(g);
   };
   stage(w, app);
+  dockIcons.get(app.id)?.burst();
   field.open(g, w.rect);
 }
 
@@ -83,22 +85,38 @@ function stage(w, app) {
 }
 
 /* ------------------------------- dock ------------------------------- */
+/* 图标不是 <img>，是粒子画的：glyph.js 出字形 → dockicon.js 采样成点阵 */
+const ICON = 52;
+const dockIcons = new Map();     // app.id -> icon
+
+function dockButton(cls, label) {
+  const b = document.createElement('button');
+  b.className = 'dock-item' + (cls ? ' ' + cls : '');
+  b.title = label;
+  const slot = document.createElement('span');
+  slot.className = 'dock-icon';
+  b.appendChild(slot);
+  b.addEventListener('pointerenter', () => iconOf(b)?.setHover(true));
+  b.addEventListener('pointerleave', () => iconOf(b)?.setHover(false));
+  return { b, slot };
+}
+const iconOf = (b) => b.__icon;
+
 function renderDock(apps) {
   dockEl.innerHTML = '';
+  dockIcons.clear();
   for (const app of apps) {
-    const b = document.createElement('button');
-    b.className = 'dock-item';
+    const { b, slot } = dockButton('', app.title);
     b.dataset.id = app.id;
-    b.title = app.title;
-    b.innerHTML = `<span class="dock-icon">${app.icon ? `<img src="${app.icon}" alt="">` : escapeHtml(app.title.slice(0, 1))}</span>`;
-    b.addEventListener('click', () => openApp(app));
+    const ic = createDockIcon(slot, { name: app.name, title: app.title, size: ICON });
+    b.__icon = ic;
+    dockIcons.set(app.id, ic);
+    b.addEventListener('click', () => { ic.burst(); openApp(app); });
     dockEl.appendChild(b);
   }
   // 登出放在最右
-  const out = document.createElement('button');
-  out.className = 'dock-item dock-logout';
-  out.title = '登出';
-  out.textContent = '⏻';
+  const { b: out, slot: oslot } = dockButton('dock-logout', '登出');
+  out.__icon = createDockIcon(oslot, { glyph: 'power', title: '登出', size: ICON });
   out.addEventListener('click', logout);
   dockEl.appendChild(out);
 }

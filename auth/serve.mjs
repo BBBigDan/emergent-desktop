@@ -39,7 +39,9 @@ const URL_RAW = (req) => decodeURIComponent(req.url || '/');
 /* 构建戳 = index.html + src/*.js 里**最新的 mtime**。
    这样"标签页标题"永远等于"当前代码的时间"，不用重启服务、也不会说谎。 */
 function buildStamp() {
-  const files = ['index.html', ...fs.readdirSync(path.join(ROOT, 'src')).map((f) => path.join('src', f))];
+  let srcs = [];
+  try { srcs = fs.readdirSync(path.join(ROOT, 'src')).map((f) => path.join('src', f)); } catch { /* 没有 src 的目录 */ }
+  const files = ['index.html', ...srcs];
   let t = 0;
   for (const f of files) {
     try { t = Math.max(t, fs.statSync(path.join(ROOT, f)).mtimeMs); } catch { /* ignore */ }

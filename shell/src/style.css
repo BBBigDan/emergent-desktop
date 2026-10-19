@@ -165,17 +165,18 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
   backdrop-filter: blur(14px) saturate(1.1);
   -webkit-backdrop-filter: blur(14px) saturate(1.1);
 }
+/* 图标是粒子画的（dockicon.js）：按钮开到 56px，才有 22 格点阵的空间画清字形 */
 .dock-item {
-  width: 46px; height: 46px; border: 0; border-radius: 13px; cursor: pointer;
-  background: rgba(255, 255, 255, 0.045);
-  color: var(--text); font-size: 17px; font-family: inherit;
+  width: 56px; height: 56px; border: 0; border-radius: 15px; cursor: pointer;
+  background: transparent;                 /* 图标本身是粒子，底板会挡光 */
+  color: var(--text); font-size: 17px; font-family: inherit; padding: 0;
   display: flex; align-items: center; justify-content: center;
   transition: transform .18s cubic-bezier(.2,.9,.3,1.2), background .18s;
 }
-.dock-item:hover { transform: translateY(-6px) scale(1.06); background: rgba(255, 255, 255, 0.10); }
-.dock-item.active { background: rgba(95, 216, 255, 0.16); box-shadow: 0 0 0 1px rgba(95,216,255,.35), 0 0 18px rgba(95,216,255,.22); }
-.dock-icon { width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; }
-.dock-icon img { width: 100%; height: 100%; object-fit: contain; }
+.dock-item:hover { transform: translateY(-6px) scale(1.04); background: rgba(255, 255, 255, 0.06); }
+.dock-item.active { background: rgba(95, 216, 255, 0.14); box-shadow: 0 0 0 1px rgba(95,216,255,.35), 0 0 18px rgba(95,216,255,.22); }
+.dock-icon { width: 52px; height: 52px; display: block; }
+.dock-icon canvas { display: block; }
 .dock-logout { margin-left: 6px; color: var(--dim); font-size: 15px; }
 .dock-logout:hover { color: #ffb3b3; }
 
