@@ -1,6 +1,11 @@
 {
   "name": "olares-particle-sphere",
+  "version": "0.14.0",
   "private": true,
   "type": "module",
-  "description": "涌现式粒子原型 v0.1 - Olares 社区版概念验证"
+  "description": "涌现式粒子原型 · Olares 社区版概念验证（当前 v0.14 点阵字体工程）",
+  "scripts": {
+    "start": "python -m http.server 8765",
+    "build": "node build-standalone.mjs"
+  }
 }
