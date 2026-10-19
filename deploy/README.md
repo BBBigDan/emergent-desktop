@@ -48,12 +48,36 @@ scp deploy/switch.sh root@HOST:/root/
 ssh root@HOST 'bash /root/switch.sh dev'
 ```
 
+## 登录页（auth）
+
+登录入口跟桌面同一套路，但**多一个坑**：官方 `auth-front` 监听 **80**，我们的
+`emergent-auth` 监听 **91**（`server_name _` 在 80 上会被镜像自带的
+`default.conf`（default_server）抢走，所以不能简单让 pod 也听 80）。
+因此切 selector 时必须同时把 `targetPort` 一起改：
+
+```bash
+scp -r auth/index.html auth/src auth/vendor root@HOST:/olares/emergent-auth/www/
+ssh root@HOST 'bash /root/switch.sh auth dev'       # selector + targetPort 91
+ssh root@HOST 'bash /root/switch.sh auth official'  # selector + targetPort 80
+```
+
+部署前把 index.html 里的 `__BUILD__` 换成构建戳（缓存排查用）：
+
+```bash
+sed "s/__BUILD__/$(date +%Y%m%d%H%M)/g" auth/index.html > /tmp/i.html
+scp /tmp/i.html root@HOST:/olares/emergent-auth/www/index.html
+```
+
 ## 日常迭代
 
 ```bash
 # 改完代码，同步一个文件
 scp shell/src/field.js root@HOST:/olares/emergent-shell/www/src/
 # 浏览器刷新即可（nginx 对这个路径发了 no-cache）
+
+本地预览别用 `python -m http.server` —— 它不发 `Cache-Control`，ES Module 会被浏览器
+启发式缓存，改完刷新还是旧文件；同源若还有 `scope=/` 的 Service Worker，更是怎么刷
+都不变。用 `node auth/serve.mjs 8822`（见下）。
 ```
 
 ## 一键切换

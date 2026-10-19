@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#04060c">
+<meta name="build" content="__BUILD__">
 <title>Olares</title>
 <link rel="icon" href="/favicon.ico">
-<link rel="stylesheet" href="./src/style.css">
+<link rel="stylesheet" href="./src/style.css?b=__BUILD__">
 <script>
   /* 官方桌面/登录注册过 scope=/ 的 Service Worker，会一直喂旧缓存。切到本页先注销一次。 */
   if ('serviceWorker' in navigator) {
@@ -33,6 +34,6 @@
 
   <p class="sr-only">Olares 登录。请输入密码后按回车进入桌面。</p>
 
-  <script type="module" src="./src/login.js"></script>
+  <script type="module" src="./src/login.js?b=__BUILD__"></script>
 </body>
 </html>

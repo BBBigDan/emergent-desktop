@@ -15,8 +15,13 @@ auth/
 本地跑：
 
 ```bash
-cd auth && python -m http.server 8811     # → http://127.0.0.1:8811/
+node auth/serve.mjs 8822     # → http://127.0.0.1:8822/
 ```
+
+**别用 `python -m http.server`**：它不发 `Cache-Control`，浏览器对 ES Module 会做启发式
+缓存 —— 改完代码刷新还是旧文件；如果这个 origin 以前注册过 `scope=/` 的 Service
+Worker，还会从它的 cache 里吐旧 `src/*.js`，怎么刷都没用。`serve.mjs` 统一发
+`no-store`，并给 HTML 塞构建戳（控制台 `__build`）。
 
 `/bfl/info/v1/olares-info`、`/api/state` 取不到时自动降级（用户名回落 `owner`），
 所以纯静态也能看效果，只有提交密码需要真实后端。

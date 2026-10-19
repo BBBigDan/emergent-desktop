@@ -281,6 +281,10 @@ async function submit() {
 /* ------------------------------- 启动 -------------------------------- */
 async function boot() {
   S.scale = calcScale();
+  /* 构建戳：控制台里 `__build` 能一眼看出跑的是哪一版（排查缓存/SW 用） */
+  window.__build = document.querySelector('meta[name="build"]')?.content || 'dev';
+  document.title = 'Olares · ' + window.__build;   // 标签页标题就是构建戳，一眼看出跑的是哪版
+  console.log('%c[emergent-auth] build ' + window.__build, 'color:#8fd8ff');
 
   /* 实例信息 */
   let avatarUrl = DEFAULT_AVA;
