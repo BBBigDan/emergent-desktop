@@ -35,7 +35,25 @@ function pickColor() {
   return PAL[0];
 }
 
-const AMBIENT_N = 3200;
+/* ---------------------- 空闲态形态（照原型 SHAPE_ORDER） ----------------------
+ * 桌面没有窗口时，ambient 粒子不是散着漂，而是聚成形态并自动重组：
+ *   sphere 球 / torus 环面 / galaxy 五臂星系 / wave 网格涟漪
+ * 原型的 5 种里 sculpture（纯引力井）依赖 3D 引力场，正交投影下看不出结构，
+ * 这里先不做；其余四种按原型的参数逐条搬过来。
+ */
+/* 球面纬度带（原型：5 带、带高 0.168、间隔 0.030，从 y≈1 铺到赤道） */
+const BANDS = 5;
+const BAND_H = 0.168;
+const BAND_GAP = 0.030;
+const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+
+const SHAPES = ['sphere', 'torus', 'galaxy', 'wave'];
+const SHAPE_MS = 9000;    // 原型 shapeState.interval = 9
+const FLOURISH_S = 0.9;   // 重组后 0.9s 内先向核心收拢再展开
+
+const AMBIENT_N = 4600;
+const PER_BAND = Math.ceil(AMBIENT_N / BANDS);
+const LINK_CAP = 5200;   // 形态连线容量
 const RIM_PER_WIN = 760;
 const MAX_WIN = 3;
 const N = AMBIENT_N + RIM_PER_WIN * MAX_WIN;
@@ -103,10 +121,45 @@ export class Field {
     this.baseS = new Float32Array(n);
     this.phase = new Float32Array(n);
 
+    /* --- 空闲态形态 --- */
+    this.sd = new Float32Array(n * 3);   // 单位球方向（sphere 直接复用）
+    this.ta = new Float32Array(n * 3);   // 当前形态目标（3D，归一化半径 1）
+    this.pu = new Float32Array(n);
+    this.pv = new Float32Array(n);
+    this.pr1 = new Float32Array(n);
+    this.pr2 = new Float32Array(n);
+    this.tp = new Uint8Array(n);         // 0..4 分区（环面分段 / 星系旋臂）
+    this.form = 0;                       // 0 = 自由漂移，1 = 完全成形态
+    this.shapeId = 0;
+    this.shapeSeed = Math.random();
+    this.shapeT = 0;                     // 距上次重组的毫秒数
+    this.shapeAt = -99;                  // 上次重组时刻（flourish 用）
+    this.waveF = 2.6;                    // wave 的频率/振幅（重组时按 seed 变）
+    this.waveA = 0.10;
+
     for (let i = 0; i < n; i++) {
-      const c = pickColor();
+      /* ambient 按纬度带取色（五色分区）；rim 仍用加权随机 */
+      const c = i < AMBIENT_N ? PAL[Math.min(BANDS - 1, Math.floor(i / PER_BAND))] : pickColor();
       this.col[i * 3] = c[0]; this.col[i * 3 + 1] = c[1]; this.col[i * 3 + 2] = c[2];
       this.phase[i] = Math.random() * Math.PI * 2;
+      /* 球面：Fibonacci 分布 + 按 5 条纬度带切分（照原型 baseDir）。
+         均匀球面出来只是一团散点；纬度带才有原型那种横条纹和分区配色。 */
+      const b = Math.min(BANDS - 1, Math.floor(i / PER_BAND));
+      const j = i - b * PER_BAND;
+      const cnt = Math.min(PER_BAND, AMBIENT_N - b * PER_BAND);
+      const y0 = 1 - b * (BAND_H + BAND_GAP) - 0.006;
+      const y1 = y0 - BAND_H;
+      const by = y1 + (y0 - y1) * (cnt === 1 ? 0.5 : j / (cnt - 1));
+      const brr = Math.sqrt(Math.max(0, 1 - by * by));
+      const bth = GOLDEN * j + b * 2.399;
+      this.sd[i * 3] = Math.cos(bth) * brr;
+      this.sd[i * 3 + 1] = by;
+      this.sd[i * 3 + 2] = Math.sin(bth) * brr;
+      this.pu[i] = Math.random();
+      this.pv[i] = Math.random();
+      this.pr1[i] = Math.random();
+      this.pr2[i] = Math.random();
+      this.tp[i] = i < AMBIENT_N ? Math.min(BANDS - 1, Math.floor(i / PER_BAND)) : i % 5;
       if (i < AMBIENT_N) {
         this.kind[i] = 0;
         this.size[i] = this.baseS[i] = 1.1 + Math.random() * 2.1;
@@ -167,7 +220,27 @@ export class Field {
 
     this.points = new THREE.Points(this.geo, this.mat);
     this.points.frustumCulled = false;
+
+    /* ---- 形态连线：只点亮不连，出来是一团散沙；连起来才是原型那种"神经网" ---- */
+    this.linkPairs = new Int32Array(LINK_CAP * 2);
+    this.linkPos = new Float32Array(LINK_CAP * 6);
+    this.linkN = 0;
+    this.linkGeo = new THREE.BufferGeometry();
+    this.linkGeo.setAttribute('position', new THREE.BufferAttribute(this.linkPos, 3).setUsage(THREE.DynamicDrawUsage));
+    this.linkGeo.setDrawRange(0, 0);
+    this.linkMat = new THREE.LineBasicMaterial({
+      color: 0x49c8e8,
+      transparent: true,
+      opacity: 0.24,
+      blending: THREE.AdditiveBlending,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.links = new THREE.LineSegments(this.linkGeo, this.linkMat);
+    this.links.frustumCulled = false;
+
     this.scene = new THREE.Scene();
+    this.scene.add(this.links);
     this.scene.add(this.points);
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
@@ -176,6 +249,8 @@ export class Field {
     this.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);
     this.cam.position.z = 10;
     this.resize();
+    this.computeShape();   // 先算一次，否则 ta 全 0，第一帧粒子会全飞向原点
+    this.buildLinks();
   }
 
   resize() {
@@ -237,6 +312,177 @@ export class Field {
     }
   }
 
+  /* ------------------- 空闲态：聚成形态并自动重组 -------------------
+   * 坐标一律归一化到半径 1，最后乘一个和屏幕相关的 scale，
+   * 这样换分辨率/窗口尺寸时形态大小自动跟着变。
+   */
+  /** 在形态目标（归一化 3D）上按近邻建连，每点最多 2 条 */
+  buildLinks() {
+    const n = AMBIENT_N, T = this.ta;
+    const cell = 0.085;
+    const off = 2048;
+    const K = (cx, cy, cz) => ((cx + off) * 4096 + (cy + off)) * 4096 + (cz + off);
+    const buckets = new Map();
+    for (let i = 0; i < n; i++) {
+      const k = K(Math.floor(T[i * 3] / cell), Math.floor(T[i * 3 + 1] / cell), Math.floor(T[i * 3 + 2] / cell));
+      let b = buckets.get(k);
+      if (!b) { b = []; buckets.set(k, b); }
+      b.push(i);
+    }
+    const pr = this.linkPairs, cap = LINK_CAP;
+    let cnt = 0;
+    for (let i = 0; i < n && cnt < cap; i++) {
+      const x = T[i * 3], y = T[i * 3 + 1], z = T[i * 3 + 2];
+      const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell);
+      let made = 0;
+      for (let dx = -1; dx <= 1 && made < 2; dx++)
+        for (let dy = -1; dy <= 1 && made < 2; dy++)
+          for (let dz = -1; dz <= 1 && made < 2; dz++) {
+            const b = buckets.get(K(cx + dx, cy + dy, cz + dz));
+            if (!b) continue;
+            for (let k = 0; k < b.length && made < 2; k++) {
+              const j = b[k];
+              if (j <= i) continue;
+              const ax = T[j * 3] - x, ay = T[j * 3 + 1] - y, az = T[j * 3 + 2] - z;
+              if (ax * ax + ay * ay + az * az > cell * cell * 2.2) continue;
+              pr[cnt * 2] = i; pr[cnt * 2 + 1] = j;
+              cnt++; made++;
+            }
+          }
+    }
+    this.linkN = cnt;
+    this.linkGeo.setDrawRange(0, cnt * 2);
+    this.syncLinks();
+  }
+
+  /** 每帧把粒子当前位置写进线段端点（连的是粒子，不是目标点） */
+  syncLinks() {
+    const n = this.linkN;
+    if (!n) return;
+    const p = this.linkPos, pr = this.linkPairs, P = this.pos;
+    for (let k = 0; k < n; k++) {
+      const a = pr[k * 2], b = pr[k * 2 + 1], o = k * 6;
+      p[o] = P[a * 3]; p[o + 1] = P[a * 3 + 1]; p[o + 2] = 0;
+      p[o + 3] = P[b * 3]; p[o + 4] = P[b * 3 + 1]; p[o + 5] = 0;
+    }
+    this.linkGeo.attributes.position.needsUpdate = true;
+  }
+
+  computeShape() {
+    const n = AMBIENT_N;
+    const T = this.ta, seed = this.shapeSeed;
+    const S = SHAPES[this.shapeId];
+
+    if (S === 'sphere') {
+      for (let i = 0; i < n; i++) {
+        T[i * 3] = this.sd[i * 3];
+        T[i * 3 + 1] = this.sd[i * 3 + 1];
+        T[i * 3 + 2] = this.sd[i * 3 + 2];
+      }
+    } else if (S === 'torus') {
+      /* 主/次半径随 seed 变；tp 把环按 5 段分色（原型是 5 种硬件类型沿管长分布） */
+      const R1 = 0.62 + seed * 0.10;
+      const R2 = 0.19 + ((seed * 7.71) % 1) * 0.07;
+      for (let i = 0; i < n; i++) {
+        const u = (this.tp[i] * 0.2 + this.pu[i] * 0.2) * Math.PI * 2 * 3 + seed * 0.4;
+        const v = this.pv[i] * Math.PI * 2 + seed * Math.PI * 2;
+        const rr = R1 + R2 * Math.cos(v);
+        T[i * 3] = rr * Math.cos(u);
+        T[i * 3 + 1] = R2 * Math.sin(v);
+        T[i * 3 + 2] = rr * Math.sin(u);
+      }
+    } else if (S === 'galaxy') {
+      /* 五条旋臂；旋向/缠绕度随 seed，盘面厚度向外递减 */
+      const dir = seed > 0.5 ? 1 : -1;
+      const spin = 1.6 + ((seed * 3.31) % 1) * 1.3;
+      for (let i = 0; i < n; i++) {
+        const t01 = this.pu[i];
+        const r = 0.10 + t01 * 0.90;
+        const ang = this.tp[i] * Math.PI * 2 / 5 + dir * t01 * spin * Math.PI
+          + (this.pr1[i] - 0.5) * 0.55;
+        T[i * 3] = r * Math.cos(ang);
+        T[i * 3 + 1] = (this.pr2[i] - 0.5) * 0.09 * (1.25 - t01);
+        T[i * 3 + 2] = r * Math.sin(ang);
+      }
+    } else {
+      /* wave：五列分区网格，y 在 step 里按时间算涟漪 */
+      const cols = Math.max(10, Math.ceil(Math.sqrt(n * 1.7)));
+      const rows = Math.max(2, Math.ceil(n / cols));
+      const cols5 = Math.max(1, Math.floor(cols / 5));
+      for (let i = 0; i < n; i++) {
+        const col = this.tp[i] * cols5 + Math.floor(this.pu[i] * cols5);
+        const row = Math.floor(this.pv[i] * rows);
+        T[i * 3] = (col / (cols - 1) - 0.5) * 1.28;
+        T[i * 3 + 1] = 0;
+        T[i * 3 + 2] = (row / (rows - 1) - 0.5) * 1.28;
+      }
+      this.waveF = 2.2 + seed * 1.4;
+      this.waveA = 0.07 + ((seed * 5.17) % 1) * 0.05;
+    }
+  }
+
+  /** 每帧：投影 + 弹簧。正交相机没有透视，深度得手工换成大小/亮度 */
+  stepShape(dt) {
+    const t = this.time;
+    const n = AMBIENT_N;
+    const T = this.ta, P = this.pos, V = this.vel;
+    const S = SHAPES[this.shapeId];
+
+    /* 重组节奏：9s 一次；切换后 0.9s 内向核心收拢再展开（原型 flourish + 呼吸包络） */
+    this.shapeT += dt * 1000;
+    if (this.shapeT >= SHAPE_MS) {
+      this.shapeT = 0;
+      this.shapeId = (this.shapeId + 1) % SHAPES.length;
+      this.shapeSeed = Math.random();
+      this.computeShape();
+      this.buildLinks();
+      this.shapeAt = t;
+    }
+    const flour = Math.max(0, 1 - (t - this.shapeAt) / FLOURISH_S);
+    const breath = 0.5 + 0.5 * Math.sin(t * 0.9);
+    const R = Math.min(this.W, this.H) * 0.33;
+    const scale = R * (1 - 0.62 * flour) * (0.95 + 0.10 * breath);
+
+    /* 缓慢自转 + 固定俯角 —— 把 3D 形态压成 2D 投影 */
+    const ry = t * 0.20 + this.shapeSeed * 6.28;
+    const cy = Math.cos(ry), sy = Math.sin(ry);
+    const tilt = S === 'wave' ? 0.92 : S === 'galaxy' ? 0.62 : 0.36;
+    const cx = Math.cos(tilt), sx = Math.sin(tilt);
+
+    const k = 46 * this.form;
+    const c = 2 * Math.sqrt(46 * this.form) * 0.9;
+    const f = this.form;
+
+    for (let i = 0; i < n; i++) {
+      const i3 = i * 3, i2 = i * 2;
+      let x3 = T[i3], y3 = T[i3 + 1], z3 = T[i3 + 2];
+      if (S === 'wave') {
+        y3 = Math.sin(x3 * this.waveF + t * 1.25) * this.waveA
+          + Math.cos(z3 * this.waveF * 1.15 + t) * this.waveA * 0.8;
+      }
+      /* 先绕 Y 再绕 X */
+      const x1 = x3 * cy + z3 * sy;
+      const z1 = -x3 * sy + z3 * cy;
+      const y2 = y3 * cx - z1 * sx;
+      const z2 = y3 * sx + z1 * cx;
+
+      const tx = x1 * scale, ty = y2 * scale;
+
+      V[i2] = (V[i2] + (tx - P[i3]) * k * dt) / (1 + c * dt);
+      V[i2 + 1] = (V[i2 + 1] + (ty - P[i3 + 1]) * k * dt) / (1 + c * dt);
+      P[i3] += V[i2] * dt;
+      P[i3 + 1] += V[i2 + 1] * dt;
+
+      /* 远侧更小更暗：正交投影里唯一的立体线索（ambient 的 baseA 只有 0.2~0.54，
+         形态态要提上去才看得清，否则整团是灰的） */
+      const dzk = clamp(0.62 + z2 * 0.45, 0.30, 1.20);
+      const sa = this.baseA[i] * dzk * 2.6;
+      const ss = this.baseS[i] * (1.05 + 0.75 * dzk);
+      this.alpha[i] += (sa - this.alpha[i]) * f;
+      this.size[i] += (ss - this.size[i]) * f;
+    }
+  }
+
   peOf(t) {
     if (t <= SEED_MS) return 0.019;
     const u = clamp((t - SEED_MS) / GROW_MS, 0, 1);
@@ -256,22 +502,38 @@ export class Field {
     this.time += dt;
     const t = this.time;
 
-    /* ---- ambient：缓慢漂移 + 边界环绕 ---- */
+    /* ---- 空闲态判定：所有窗口都关了 → 粒子聚成形态 ---- */
+    const idle = !this.groups.some((g) => g.active || g.closing);
+    this.form = clamp(this.form + (idle ? 1 : -1) * dt * 1.3, 0, 1);
+
+    /* ---- ambient：自由漂移，强度按 (1-form) 衰减 ---- */
+    const free = 1 - this.form;
     const hw = this.W / 2 + 60, hh = this.H / 2 + 60;
     for (let i = 0; i < AMBIENT_N; i++) {
+      if (free <= 0.02) break;
       const ph = this.phase[i];
-      this.vel[i * 2] += Math.cos(t * 0.23 + ph) * 3.2 * dt;
-      this.vel[i * 2 + 1] += Math.sin(t * 0.19 + ph * 1.3) * 3.2 * dt;
-      this.vel[i * 2] *= 1 - 0.55 * dt;
-      this.vel[i * 2 + 1] *= 1 - 0.55 * dt;
+      this.vel[i * 2] += Math.cos(t * 0.23 + ph) * 3.2 * free * dt;
+      this.vel[i * 2 + 1] += Math.sin(t * 0.19 + ph * 1.3) * 3.2 * free * dt;
+      this.vel[i * 2] *= 1 - 0.55 * free * dt;
+      this.vel[i * 2 + 1] *= 1 - 0.55 * free * dt;
       let x = this.pos[i * 3] + this.vel[i * 2] * dt;
       let y = this.pos[i * 3 + 1] + this.vel[i * 2 + 1] * dt;
-      if (x > hw) x = -hw; else if (x < -hw) x = hw;
-      if (y > hh) y = -hh; else if (y < -hh) y = hh;
+      /* 只在基本自由时才做边界环绕；形态期间粒子本来就该待在屏幕内 */
+      if (free > 0.4) {
+        if (x > hw) x = -hw; else if (x < -hw) x = hw;
+        if (y > hh) y = -hh; else if (y < -hh) y = hh;
+      }
       this.pos[i * 3] = x;
       this.pos[i * 3 + 1] = y;
       this.alpha[i] = this.baseA[i] * (0.78 + 0.22 * Math.sin(t * 0.7 + ph));
     }
+
+    /* ---- 形态：弹簧把粒子拉向投影后的目标 ---- */
+    if (this.form > 0.01) this.stepShape(dt);
+    /* 连线跟着粒子走；形态退场时一起淡出 */
+    this.links.visible = this.form > 0.04;
+    this.linkMat.opacity = 0.24 * this.form;
+    if (this.links.visible) this.syncLinks();
 
     /* ---- rim：每个窗口一组 ---- */
     for (let g = 0; g < MAX_WIN; g++) {
