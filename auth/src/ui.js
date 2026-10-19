@@ -1,69 +1,71 @@
 /**
  * 登录界面「墨稿」—— 用 2D canvas 画出应该有的字形与线条，再栅格化成点阵。
  *
- * 布局不是自己编的，是照官方登录页量的（1440×900 下）：
- *   卡片 262×300 居中、透明
- *   头像 124×124 圆形，水平居中，距卡片顶 16
- *   用户名 24px/700，margin 16 0 4
- *   提示「登录 Olares」14px，margin 0 0 12
- *   输入框 220×32，圆角 8，背景 rgba(255,255,255,.4)
- *   输入框右侧留了 18px 给箭头
+ * 内容照官方登录页（头像 / 用户名 / 提示 / 密码框 + 箭头），
+ * **但尺度不照官方** —— 官方那个 262×300 的卡片是为 14px 文字设计的，
+ * 塞进点阵里根本立不起来。这里用原型 UI 模式的那套尺度：
  *
- * 点阵需要字更大才认得出，所以整体放大 K 倍；比例完全照官方。
+ *   原型：UI_W=760 UI_H=490 逻辑画布，SCAN_CELL=2.5，UI_S=0.144，
+ *         相机距 48 / fov 55 → 可见世界高 50 → 逻辑像素上屏放大 2.59 倍。
+ *         于是标题 72 逻辑 px 在屏幕上是 187px，汉字 98px 高，
+ *         点距 6.5 屏幕 px、点径 12.2 屏幕 px —— 点径是点距的 1.9 倍，
+ *         点与点重叠，笔画汇成一条连续的亮线。
+ *
+ * 本文件：LW=600 LH=400 逻辑画布、CELL=2.5（和原型同一个密度），
+ * 上屏缩放由 login.js 的 calcScale 取 min(W/LW, H/LH)，
+ * 在 1440×900 下是 2.25 倍 → 缩放比、点距、点径三项都和原型对齐。
+ *
+ * 直接照官方那个小卡片放大是没用的：字号 ÷ 点距 只有 16 格（原型 28.8 格），
+ * 汉字少四成格子，怎么调都是「散」或「糊」。
+ *
  * 头像不在这里画 —— 它是真实照片，用 DOM img 渲染，外圈另有粒子流包裹。
  *
  * 每个控件能**单独绘制 + 单独扫描**（scanPart）：悬停时增援粒子要按更细的
  * 网格灌进那个控件，灌得越密控件越清楚。所以 paint() 只是把几个 draw 串起来。
  */
 
-export const LW = 820;
-export const LH = 560;
+export const LW = 600;
+export const LH = 400;
 
-/* 点阵栅格：cell = 逻辑 px。
-   2.5 时拉丁字很干净，但 CJK 小字（登录 Olares / 密码）笔画间距正好等于一格，
-   抗锯齿后随机合并成一片。收到 2.2 让字怀能稳定留出一格暗缝。 */
-/* 1.9：字号 32~35px 的等线 Light 笔画 ≈1.6px = 0.84 格 —— 恰好"一笔一格"，
-   字怀还能留出一格暗缝。格子再大（2.2）笔画只有 0.7 格，点阵就碎成散点。 */
-export const CELL = 1.9;
-/* 增援层用更密的网格：悬停控件的槽位数 ×(2.2/1.4)² ≈ 2.5 倍，
-   不然 2400 颗增援粒子无槽可去，只能在鼠标周围空转。 */
-export const CELL_R = 1.2;
-const TH = 0.40;
-const TH_R = 0.34;   // 细网格的覆盖率阈值也降一点，细笔画才不至于整条丢失
+/* 点阵栅格（逻辑 px）—— 原型的 SCAN_CELL。
+   字号 ÷ 2.5 ≥ 25 时汉字才有 25 格以上可辨；配合覆盖率阈值 0.45
+   就能保证「每个笔画横截面恒为 1 格、笔画之间恒留 1 格暗缝」。 */
+export const CELL = 2.5;
+/* 增援层用更密的网格：(2.5/1.35)² ≈ 3.4 倍槽位，悬停的控件才会明显变实 */
+export const CELL_R = 1.35;
+const TH = 0.45;     // 原型 SCAN_TH
+const TH_R = 0.36;
 
-/* 官方尺寸 → 本画布的放大系数 */
-const K = 1.16;
-
-const CARD_H = 300 * K;
-const Y_OFF = 12;                       // 目测校准：内容在画布上偏上，往下压一点
-const CARD_TOP = (LH - CARD_H) / 2 + Y_OFF;
 const CX = LW / 2;
 
-/* 头像：124 圆，距卡片顶 16 */
+/* 头像：直径 132 逻辑（屏幕 ~297px），圆心偏上留出文字空间 */
 export const AVA = {
-  d: 124 * K,
+  d: 96,
   cx: CX,
-  cy: CARD_TOP + (16 + 62) * K,
-  r: (124 * K) / 2,
+  cy: 101.25,
+  r: 48,
 };
 
-/* 用户名 / 提示 / 输入框，y 取官方相对卡片的偏移 */
-const NAME_Y = CARD_TOP + 156 * K;
-const HINT_Y = CARD_TOP + 196 * K;
+const NAME_Y = 188;
+const HINT_Y = 250;
 
+/* 所有坐标都对齐到**格心**（n + 0.5）× CELL。
+   差半格就会让 1 格宽的边框跨 2 行点 —— 2.4px 的线落在 2.5px 格边界上时，
+   两格各占 1.2/2.5 = 0.48，都刚过阈值 0.45，于是边框变成两排点。
+   对齐到格心后覆盖率 0.96 只点亮一格，就是原型那种「单行珠子」。 */
 export const HIT = {
   input: {
-    x: CX - 110 * K,
-    y: CARD_TOP + 234 * K,
-    w: 220 * K,
-    h: 32 * K,
+    x: 66.25,
+    y: 281.25,
+    w: 467.5,
+    h: 77.5,
   },
-  /* 输入框右端的箭头，官方那 18px 留白就是它 */
+  /* 输入框右端的箭头，就是官方那 18px 留白放大后的样子 */
   button: {
-    x: CX + 110 * K - 26 * K,
-    y: CARD_TOP + 234 * K,
-    w: 24 * K,
-    h: 32 * K,
+    x: 66.25 + 467.5 - 56.25,
+    y: 281.25,
+    w: 48.75,
+    h: 77.5,
   },
 };
 
@@ -85,42 +87,68 @@ const tone = (role) => `rgb(${role * 25}, 0, 0)`;   // R = role×25
  *   微软雅黑 400 / SimHei：笔画 ≈1.2 格，邻域连通度 2.6~3.0 → 每个笔画横截面
  *   占 2 格，字怀（笔画之间的空隙）被填死 = 糊成块。
  *   等线 Light：笔画 ≈0.8 格 → 笔画恰 1 格、字怀留 1 格暗缝 = 能认的点阵字。
- * 所以中文走等线 Light，西文走 Bahnschrift Light（可变字重 + 窄字宽），
- * 字重一律 300；再给汉字加一格字距（全角字默认紧贴，两个字会并成一团）。
- * 之前用 700 PingFang，那就是"太粗、影响阅读"的根源。 */
+ * 所以中文走等线 Light，西文走 Bahnschrift（可变字重 + 窄字宽），
+ * 字重一律 300；再给汉字加一格字距（全角字默认紧贴，两个字会并成一团）。 */
 const F_CJK = '"DengXian Light","Microsoft YaHei Light","Microsoft YaHei","PingFang SC","Noto Sans CJK SC",sans-serif';
 const F_LAT = '"Bahnschrift Light",Bahnschrift,Candara,"Segoe UI","Helvetica Neue",sans-serif';
 const TRACK = CELL;                 // 汉字之间留一格暗缝
-const CJK = /[㐀-鿿豈-﫿　-〿＀-￯]/;
+const CJK = /[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/;
 const hasCJK = (t) => CJK.test(t);
 
+/** 把一行文本切成「中文段 / 拉丁段」—— 两段字体栈、字号都不同 */
+function splitRuns(str) {
+  const runs = [];
+  let cur = '', curCJK = null;
+  for (const ch of str) {
+    const isC = CJK.test(ch);
+    if (curCJK === null) { curCJK = isC; cur = ch; }
+    else if (isC === curCJK) cur += ch;
+    else { runs.push([cur, curCJK]); cur = ch; curCJK = isC; }
+  }
+  if (cur) runs.push([cur, curCJK]);
+  return runs;
+}
+
+function fontOf(isCJK, px) {
+  /* 中文 300（等线 Light 笔画刚好 0.8 格）；西文 400 —— Light 在同样像素下
+     笔画太细，点不亮一格。拉丁再降 12% 字号，视觉高度才和汉字齐平
+     （Bahnschrift 的 cap height 比汉字高，同字号下看着大一号）。 */
+  const size = Math.round(isCJK ? px : px * 0.80);
+  return `${isCJK ? 300 : 400} ${size}px ${isCJK ? F_CJK : F_LAT}`;
+}
+
 /**
- * 画一行字：自动挑字体栈、加字距、居中补偿。
- * @returns {number} 实测宽度（含字距）
+ * 画一行混排文字：逐段选字体、量宽、整体居中。
+ * @returns {number} 实测总宽度
  */
 function uiText(c, role, px, str, x, y, align = 'center') {
-  const cjk = hasCJK(str);
-  const size = Math.round(px);
-  /* 中文 300（等线 Light 的笔画刚好 0.8 格）；西文 400 —— Bahnschrift Light
-     在 30px 这个尺寸笔画只有 ~1.3px（0.6 格），点阵会碎成散点。 */
-  c.font = `${cjk ? 300 : 400} ${size}px ${cjk ? F_CJK : F_LAT}`;
-  c.textAlign = align;
+  const runs = splitRuns(str);
   c.textBaseline = 'middle';
   c.fillStyle = tone(role);
 
-  let w;
-  if (cjk && 'letterSpacing' in c) {
-    c.letterSpacing = TRACK + 'px';
-    /* Chrome 把尾随字距算进宽度 → 居中时视觉左偏半格，补回来 */
-    const dx = align === 'center' ? -TRACK / 2 : 0;
-    w = c.measureText(str).width;
-    c.fillText(str, x + dx, y);
-    c.letterSpacing = '0px';
-  } else {
-    w = c.measureText(str).width;
-    c.fillText(str, x, y);
-  }
-  return w;
+  /* 先量：每段宽度（中文段要带字距） */
+  const widths = runs.map(([t, isC]) => {
+    c.font = fontOf(isC, px);
+    if (isC && 'letterSpacing' in c) c.letterSpacing = TRACK + 'px';
+    const w = c.measureText(t).width;
+    if (isC && 'letterSpacing' in c) c.letterSpacing = '0px';
+    return w;
+  });
+  const total = widths.reduce((a, b) => a + b, 0);
+
+  let cur = align === 'center' ? x - total / 2 : align === 'right' ? x - total : x;
+  const dx = align === 'center' ? -TRACK / 2 : 0;   // 尾随字距补偿（视觉居中）
+  c.textAlign = 'left';
+  let first = true;
+  runs.forEach(([t, isC], i) => {
+    c.font = fontOf(isC, px);
+    if (isC && 'letterSpacing' in c) c.letterSpacing = TRACK + 'px';
+    c.fillText(t, cur + (first ? dx : 0), y);
+    if (isC && 'letterSpacing' in c) c.letterSpacing = '0px';
+    cur += widths[i];
+    first = false;
+  });
+  return total;
 }
 
 function roundRect(c, x, y, w, h, r) {
@@ -150,20 +178,23 @@ export function partAt(lx, ly) {
 
 /* 容量系数：线条类灌满更亮（一维结构越密越像实线），大段文字低一点
    （字怀本来就靠暗缝成立，灌太满会糊回去）。和原型的分档一致。 */
-export const CAPK = { button: 0.95, input: 0.95, name: 0.5, hint: 0.5 };
+export const CAPK = { button: 0.5, input: 0.48, name: 0.34, hint: 0.34 };
+/* 为什么不是 1：灌到 1 时 2400 颗全进控件，指针周围一颗旋转的都不剩 ——
+   而"大量旋转的粒子"本身就是原型的一半观感。留一半在指针周围转，
+   灌进去的那一半把控件填实，这才是"随鼠标移动、同时增加到附近组件上"。 */
 
 /* ------------------------------------------------------------ 各控件绘制 */
 function drawName(c, s) {
   const shortName = (s.olaresId || 'Olares').split('@')[0];
-  /* 中文 ID 要比拉丁大两号才够格数（30px/2.2 ≈ 13.6 格，34px ≈ 15.5 格） */
-  const size = hasCJK(shortName) ? 36 : 34;
+  /* 汉字 64px/2.5 = 25.6 格（原型标题 72/2.5 = 28.8 格） */
+  const size = hasCJK(shortName) ? 66 : 62;
   const w = uiText(c, ROLE.NAME, size, shortName, CX, NAME_Y, 'center');
   RECT.name = { x: CX - w / 2 - 2, y: NAME_Y - size / 2, w: w + 4, h: size };
 }
 
 function drawHint(c) {
-  /* 汉字点阵 13 格勉强、15 格才稳 → 提示比官方 14px 放大到约 2.4 倍 */
-  const size = 32;
+  /* 18.4 格 —— 再小笔画就填不满一格，竖笔会断成虚线 */
+  const size = 46;
   const txt = '登录 Olares';
   const w = uiText(c, ROLE.HINT, size, txt, CX, HINT_Y, 'center');
   RECT.hint = { x: CX - w / 2 - 2, y: HINT_Y - size / 2, w: w + 4, h: size };
@@ -172,23 +203,24 @@ function drawHint(c) {
 function drawInput(c, s) {
   const I = HIT.input;
   c.strokeStyle = tone(ROLE.FRAME);
-  c.lineWidth = s.focused ? 3.0 : 2.2;
-  roundRect(c, I.x, I.y, I.w, I.h, 9 * K);
+  /* 线宽 4 逻辑 = 1.6 格 → 边框占 2 行点，才连成一条带子而不是虚线 */
+  c.lineWidth = s.focused ? 3.4 : 2.4;
+  roundRect(c, I.x, I.y, I.w, I.h, 18);
   c.stroke();
 
   const cy = I.y + I.h / 2;
+  const padX = I.x + 28;
   const n = s.password.length;
   c.textBaseline = 'middle';
 
   if (n === 0 && !s.focused) {
-    /* 占位：两个字比四个更经得起点阵（字间至少留一格） */
-    uiText(c, ROLE.PLACE, 30, '密码', I.x + 14 * K, cy, 'left');
+    uiText(c, ROLE.PLACE, 46, '密码', padX, cy, 'left');
   } else {
-    /* 密码点：一格一个方点，左对齐 */
-    const box = 12 * K;
-    const gap = 15 * K;
-    let dx = I.x + 14 * K;
-    const maxVisible = Math.floor((I.w - 46 * K) / (box + gap));
+    /* 密码点：6.4 格见方的实心块，一眼看出有几个字符 */
+    const box = 16;
+    const gap = 26;
+    let dx = padX;
+    const maxVisible = Math.floor((I.w - 100) / (box + gap));
     for (let i = 0; i < Math.min(n, maxVisible); i++) {
       c.fillStyle = tone(ROLE.DOT);
       c.fillRect(dx, cy - box / 2, box, box);
@@ -200,9 +232,9 @@ function drawInput(c, s) {
       c.fillRect(dx, cy - box / 2, box, box);
     }
     if (n > maxVisible) {
-      /* 溢出的用三个点表示：一条细横线在 1.9 的格子上会缩成一个孤点 */
+      /* 溢出的用三个点表示 */
       c.fillStyle = tone(ROLE.HINT);
-      const d3 = 3.2 * K, g3 = 3.4 * K;
+      const d3 = 7, g3 = 8;
       for (let i = 0; i < 3; i++) {
         c.fillRect(dx + i * (d3 + g3), cy - d3 / 2, d3, d3);
       }
@@ -221,27 +253,26 @@ function drawArrow(c, s) {
   if (s.busy) {
     /* 忙碌：箭头变成一小段正在走的横线 */
     c.fillStyle = tone(ROLE.ARROW);
-    c.fillRect(ax - 9 * K, cy - 1.5, 18 * K, 3);
+    c.fillRect(ax - 20, cy - 3, 40, 6);
   } else {
-    /* 一个向右的箭头：横线 + 箭尖 */
-    c.lineWidth = 2.1;
+    /* 一个向右的箭头：横线 + 箭尖，整体 38 逻辑 px 宽 */
+    c.lineWidth = 3.2;
     c.beginPath();
-    c.moveTo(ax - 8 * K, cy);
-    c.lineTo(ax + 7 * K, cy);
-    c.moveTo(ax + 1 * K, cy - 6 * K);
-    c.lineTo(ax + 7 * K, cy);
-    c.lineTo(ax + 1 * K, cy + 6 * K);
+    c.moveTo(ax - 19, cy);
+    c.lineTo(ax + 17, cy);
+    c.moveTo(ax + 3, cy - 14);
+    c.lineTo(ax + 17, cy);
+    c.lineTo(ax + 3, cy + 14);
     c.stroke();
   }
 
-  RECT.button = { x: ax - 10 * K, y: cy - 10 * K, w: 20 * K, h: 20 * K };
+  RECT.button = { x: ax - 24, y: cy - 26, w: 48, h: 52 };
 }
 
 function drawError(c, s) {
   if (!s.error) return;
   const I = HIT.input;
-  /* 报错要看清：比提示小一号，但仍守住 12 格以上 */
-  uiText(c, ROLE.ERROR, 24, s.error, CX, I.y + I.h + 30 * K, 'center');
+  uiText(c, ROLE.ERROR, 34, s.error, CX, Math.min(LH - 14, I.y + I.h + 30), 'center');
 }
 
 const DRAW = {
@@ -352,8 +383,7 @@ export function scanPart(ctx, s, id, scale) {
   const d = ctx.getImageData(0, 0, W, H).data;
   const sat = buildSat(d, W, H);
   /* 槽位坐标要跟骨架落在同一个世界坐标里，所以这里用同一个 scale；
-     但 cell 仍按逻辑 px 取 → 屏幕上大约 1.4×scale CSS px 的密度。
-     scale 很小时（窄屏）槽位会稀，这里按 scale 反向补偿一点。 */
+     但 cell 仍按逻辑 px 取 → 屏幕上大约 1.35×scale CSS px 的密度。 */
   const cell = CELL_R / Math.max(0.72, Math.min(1.15, scale));
   const pad = 2;
   return scanIn(

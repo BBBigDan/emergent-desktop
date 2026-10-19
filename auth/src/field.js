@@ -217,7 +217,7 @@ export class Field {
 
     /* 同一份 geometry 再用一个"大号、暗"的材质画一遍 = 廉价 bloom。
        原型的点周围有一圈明显的光晕（点阵屏在暗处的溢光），只画硬芯永远是干巴巴的圆。 */
-    this.matGlow = makeMat(false, true, 3.0, 0.10);
+    this.matGlow = makeMat(false, true, 2.4, 0.0);
     this.pointsGlow = new THREE.Points(this.geo, this.matGlow);
     this.pointsGlow.frustumCulled = false;
     this.pointsGlow.position.z = 0.9;
@@ -239,11 +239,12 @@ export class Field {
     this.cRole = new Float32Array(CLOUD_N);
 
     for (let i = 0; i < CLOUD_N; i++) {
-      /* 公转半径 16~62px：填充率低时整体外扩成光晕（见 step）。
-         别收得太紧 —— 578 颗挤在 20px 环里就是一坨糊斑，看不出"在转"。 */
-      this.cOrbR[i] = 16 + Math.pow(Math.random(), 0.8) * 46;
+      /* 公转半径 24~114 世界 px：填充率低时整体外扩成光晕（见 step）。
+         别收得太紧 —— 几百颗挤在 20px 环里就是一坨糊斑，看不出"在转"；
+         也别只给一小团，用户要的是"指针周围**大量**旋转的粒子"。 */
+      this.cOrbR[i] = 24 + Math.pow(Math.random(), 0.6) * 90;
       /* 待机时沉成星尘用的独立半径，跟悬停参数解耦 */
-      this.cParkR[i] = 190 + Math.pow(Math.random(), 0.7) * 280;
+      this.cParkR[i] = 110 + Math.pow(Math.random(), 0.72) * 190;
       this.cOrbPh[i] = Math.random() * TAU;
       this.cOrbS[i] = 0.75 + Math.random() * 0.65;
       this.cSize[i] = 2.0 + Math.random() * 2.2;
@@ -267,7 +268,7 @@ export class Field {
     this.cPoints.frustumCulled = false;
     this.cPoints.position.z = 0;
 
-    this.cMatGlow = makeMat(false, true, 2.6, 0.09);
+    this.cMatGlow = makeMat(false, true, 2.2, 0.0);
     this.cPointsGlow = new THREE.Points(this.cGeo, this.cMatGlow);
     this.cPointsGlow.frustumCulled = false;
     this.cPointsGlow.position.z = -0.1;
@@ -360,18 +361,17 @@ export class Field {
      * - 增援·槽位：小阈值 → 槽内短网，文字/边框变"实心"
      * - 增援·公转：大阈值 → 彗光滑尾
      */
-    this.lnkSkel = this.makeLinks(2600, 0.13);
-    this.lnkSlot = this.makeLinks(4200, 0.20);
+    this.lnkSkel = this.makeLinks(2600, 0.42);
+    this.lnkSlot = this.makeLinks(4200, 0.34);
     this.lnkOrb = this.makeLinks(2600, 0.07);
 
     this.scene = new THREE.Scene();
     this.scene.add(this.lnkSkel.obj);
     this.scene.add(this.lnkSlot.obj);
     this.scene.add(this.lnkOrb.obj);
-    this.scene.add(this.cPointsGlow);
     this.scene.add(this.cPoints);
-    this.scene.add(this.pointsGlow);
     this.scene.add(this.points);
+    /* glow 层不挂进场景：原型 UI 模式是干净的点阵，没有 bloom */
     this.scene.add(this.oPoints);
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
@@ -384,8 +384,8 @@ export class Field {
     this.gw = 36;
     this.gh = 26;
     this.flow = new Float32Array((this.gw + 1) * (this.gh + 1) * 2);
-    this.gainS = 0.85;
-    this.gainC = 1.05;
+    this.gainS = 1.35;
+    this.gainC = 1.15;
 
     this.resize();
   }
@@ -553,7 +553,7 @@ export class Field {
   setPoints(pts, scale, LW, LH) {
     this.scale = scale;
     /* 硬芯点直径 ≈ 点距 ×1.45：相邻点相切、笔画连成线，仍留一圈暗缝 */
-    const pointSize = CELL * scale * 1.38;
+    const pointSize = CELL * scale * 1.06;
 
     const M = pts.length / 4;
     const keep = new Set();
@@ -801,7 +801,7 @@ export class Field {
     const temp = 0.40 + 0.09 * Math.sin(t * 0.07) + 0.04 * Math.sin(t * 0.23 + 1.7);
     const col = tempColor(temp);
     const bright = 0.28 + temp * 0.55;              // 原型：亮度随温度涨
-    const kCol = bright / 0.55;                     // 归一化，让 temp=0.55 时保持原亮度
+    const kCol = bright / 0.40;                     // 原型点色接近 #7FFFEE（亮青白）
     const cr = col[0] * kCol, cg = col[1] * kCol, cb = col[2] * kCol;
     for (const m of [this.mat, this.matGlow, this.cMat, this.cMatGlow]) {
       m.uniforms.uColor.value.setRGB(cr, cg, cb);
@@ -809,7 +809,7 @@ export class Field {
     this.oMat.uniforms.uColorA.value.setRGB(col[0], col[1], col[2]);
 
     /* 呼吸包络：整群统一（不是逐粒子）→ 起伏有节奏，像呼吸而不是抖动 */
-    const env = 0.5 + 0.5 * Math.sin(t * 0.42);
+    const env = 0.5 + 0.5 * Math.sin(t * 1.36);   // 周期 4.6s：3 秒内能看清一个起落
     const breath = (0.35 + 0.65 * env) * 1.05;
 
     const burst = this.burstAt >= 0 ? clamp(1 - (t - this.burstAt) / 0.95, 0, 1) : 1;
@@ -826,11 +826,20 @@ export class Field {
       if (this.fade[i] < 1) this.fade[i] = Math.min(1, this.fade[i] + dt * 6.5);
 
       this.flowAt(px, py);
-      /* 径向呼吸：从画布中心外推一点点，整片一起胀缩 */
+      /* 径向呼吸：从画布中心外推 —— 原型 UI 模式 calmS=0.07 时骨架的呼吸位移
+         仍有 ~5 屏幕 px（4.6·kS·env·amp·calmS / kS ≈ 0.32·amp 世界单位）。
+         我原来给 2.3 世界 px（屏幕 ±0.8px），肉眼等于静止 —— 这就是"粒子不会动"。
+         这里用 scale 归一化，直接锁定屏幕量级。 */
       const rl = Math.hypot(px, py) || 1;
-      const br = 2.3 * (breath - 0.7);
-      const tx = st[i2] + this._fx * FLOW_SKEL + (px / rl) * br;
-      const ty = st[i2 + 1] + this._fy * FLOW_SKEL + (py / rl) * br;
+      const br = 4.2 * (breath - 0.7) * this.scale;
+      /* 逐粒子微环：每颗绕自己的格心画一个独立相位的小圆。
+         整片呼吸之外还要有**颗粒级**的活气，否则只像整体在缩放；
+         这是点阵"沙沙在动"的来源（原型骨架 flowCalm=0.03，靠呼吸 + 逐粒子相位）。 */
+      const ph = this.seed[i] * 6.2831;
+      const aRot = t * 3.6 + ph;
+      const ja = 2.4 / this.scale;          // 屏幕 ±2.4px（约点距 42%：能看出在扭，又不散字）
+      const tx = st[i2] + this._fx * FLOW_SKEL + (px / rl) * br + Math.cos(aRot) * ja;
+      const ty = st[i2 + 1] + this._fy * FLOW_SKEL + (py / rl) * br + Math.sin(aRot) * ja;
 
       const dx = tx - px, dy = ty - py;
 
@@ -948,7 +957,7 @@ export class Field {
       /* 槽位粒子更亮（正好压在笔画上，是"充能"）；公转粒子是光尘 */
       /* 槽位：压在笔画上 → 亮；公转：光尘。指针在时公转粒子收得很紧，
          太亮会糊成一团脏斑，压到 0.55；待机星尘散得开，0.72 才看得见 */
-      const base = this.cMode[i] === 1 ? 1.0 : (this.ptr.on ? 0.8 : 0.62);
+      const base = this.cMode[i] === 1 ? 1.15 : (this.ptr.on ? 1.0 : 0.30);
       this.cAlpha[i] = this.cAmp[i] * base * this.cFade[i] * burst * this.gainC;
     }
 
