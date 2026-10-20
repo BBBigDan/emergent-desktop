@@ -14,7 +14,17 @@
  *   3. 采样只做一次、结果存成静态缓冲，不要每帧重算（每帧抖动 = 噪点）
  */
 
-const FONT = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+/* 字体：走原型调过的那一套 —— **细体**，不是系统默认。
+ *
+ * 这件事对点阵影响非常大：600 字重的汉字在 2~3px 点距下每一笔都是 2~3 颗点，
+ * 糊成一块墨；换成 Light（DengXian Light / PingFang 300）笔画只剩一条中线，
+ * 正好一颗点，字才立得起来。
+ *
+ * Mac 上没有等线，靠 "PingFang SC" + font-weight:300 落到 Light 字面。
+ * 纯拉丁/数字（71%、10-17）用 Bahnschrift Light：更窄，粒子下更像仪表盘。 */
+export const FONT = '"DengXian Light","Microsoft YaHei Light","PingFang SC","Microsoft YaHei",ui-sans-serif,sans-serif';
+export const FONT_LAT = '"Bahnschrift Light",Bahnschrift,Candara,"PingFang SC","Segoe UI",sans-serif';
+const WEIGHT = 300;
 
 /* 表情库：只参数化三样东西 —— 眼型、眉斜率、嘴曲率。
  * 让模型说 "happy" 比自己写两条贝塞尔曲线可靠得多，也便宜得多。 */
@@ -236,7 +246,7 @@ function paintLayer(g, L, W, H) {
     }
     case 'text': {
       const size = L.size || 96;
-      g.font = `${L.weight || 600} ${size}px ${L.font || FONT}`;
+      g.font = `${L.weight ?? WEIGHT} ${size}px ${L.font || FONT}`;
       g.textAlign = L.align || 'center';
       g.textBaseline = L.baseline || 'middle';
       if (L.width && L.stroke) {

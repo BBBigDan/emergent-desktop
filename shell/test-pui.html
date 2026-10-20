@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>粒子 UI 验证</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+  #scene { display: block; width: 100%; height: 100%; }
+  #hud {
+    position: fixed; left: 12px; top: 10px; color: #6d7e93;
+    font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none;
+  }
+  /* 真实输入框：**完全透明**，只保留插入符与命中区。
+     文字由粒子画，光标由浏览器画 —— 中文输入法的候选框要靠这个真 caret 定位。 */
+  #type {
+    position: absolute; display: none;
+    background: transparent; border: 0; outline: 0;
+    color: transparent; caret-color: #7fd4ff;
+    font-family: "DengXian Light", "Microsoft YaHei Light", "PingFang SC", "Microsoft YaHei", ui-sans-serif, sans-serif;
+    font-size: 22px; font-weight: 300; letter-spacing: 0;
+    padding: 0; margin: 0;
+  }
+  #type::selection { background: rgba(111, 198, 255, 0.3); }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hud"></div>
+<input id="type" spellcheck="false" autocomplete="off" />
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module">
+import { Field } from './src/field.js';
+import { compileDraw, FONT, FONT_LAT } from './src/draw.js';
+
+const f = new Field(document.getElementById('scene'));
+const hud = document.getElementById('hud');
+window.__field = f;
+
+const q = new URLSearchParams(location.search);
+const scene = q.get('scene') || 'ladder';
+
+/* 绘制区：780×620，居中 */
+const AREA = { w: 780, h: 620 };
+const area = () => ({
+  w: AREA.w, h: AREA.h,
+  x: Math.round((innerWidth - AREA.w) / 2),
+  y: Math.round((innerHeight - AREA.h) / 2),
+});
+
+const C = {
+  ink: '#a9d4f7',      // 主文字
+  dim: '#6f93b8',      // 次要
+  line: '#4d7ba8',     // 发丝线
+  accent: '#7fe3cf',   // 强调
+};
+
+/* ───────── 场景一：字号阶梯 —— 粒子文字的可读下限在哪 ───────── */
+const SENTENCE = '服务器负载偏高';
+const LADDER = [13, 16, 20, 24, 28, 34, 42];
+
+function ladderLayers() {
+  const L = [];
+  L.push({ type: 'text', text: '同一句话，七种字号 —— 粒子能读到多小？', at: [20, 26], size: 15, color: C.dim, align: 'left' });
+  let y = 70;
+  LADDER.forEach((size) => {
+    L.push({ type: 'text', text: String(size) + 'px', at: [20, y], size: 13, color: C.line, align: 'left', baseline: 'alphabetic' });
+    L.push({ type: 'text', text: SENTENCE, at: [96, y], size, color: C.ink, align: 'left', baseline: 'alphabetic' });
+    y += Math.round(size * 1.9) + 8;
+  });
+  L.push({ type: 'line', from: [20, y + 4], to: [760, y + 4], width: 1, color: C.line });
+  return L;
+}
+
+/* ───────── 场景二：一屏粒子界面（含真输入框） ───────── */
+const state = { text: '下载完了告诉我', hover: false, focus: false };
+if (q.get('text')) state.text = q.get('text');   // 预设文本，便于截图看稳定态
+
+const BTN = { x: 26, y: 330, w: 148, h: 40, r: 10 };
+const FIELD = { x: 26, y: 404, w: 420, h: 46 };
+
+function roundRect(x, y, w, h, r) {
+  return `M${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r}`
+    + ` V${y + h - r} Q${x + w},${y + h} ${x + w - r},${y + h}`
+    + ` H${x + r} Q${x},${y + h} ${x},${y + h - r}`
+    + ` V${y + r} Q${x},${y} ${x + r},${y} Z`;
+}
+
+function uiLayers() {
+  const L = [];
+  /* 窗框 + 标题栏：两条细线就够表达"这是一扇窗"，不需要毛玻璃 */
+  L.push({ type: 'path', d: roundRect(0.5, 0.5, AREA.w - 1, AREA.h - 1, 16), width: 1, color: C.line });
+  L.push({ type: 'line', from: [16, 50], to: [AREA.w - 16, 50], width: 1, color: C.line });
+
+  L.push({ type: 'text', text: '服务器状态', at: [26, 25], size: 21, color: C.dim, align: 'left' });
+  L.push({ type: 'text', text: '10-17', at: [AREA.w - 26, 25], size: 15, font: FONT_LAT, color: C.line, align: 'right' });
+
+  /* 大数字：粒子最适合的就是这种"一眼可见"的信息 */
+  L.push({ type: 'text', text: '71%', at: [26, 118], size: 68, weight: 300, font: FONT_LAT, color: C.ink, align: 'left' });
+  L.push({ type: 'text', text: 'CPU 峰值 · 持续 4 小时', at: [26, 156], size: 20, color: C.dim, align: 'left' });
+
+  L.push({ type: 'line', from: [26, 190], to: [AREA.w - 26, 190], width: 1, color: C.line });
+
+  /* 正文：24px 是阶梯测出来的下限附近，这里用 24 */
+  const body = [
+    'n8n 的一个工作流在反复重启，',
+    '已经把并发从 8 降到 3。',
+    '内存最低还剩 3.1 GB。',
+  ];
+  body.forEach((t, i) => {
+    L.push({ type: 'text', text: t, at: [26, 224 + i * 34], size: 24, color: C.ink, align: 'left' });
+  });
+
+  /* 按钮：粒子画框 + 粒子画字；hover 只改颜色，不改几何 */
+  L.push({ type: 'path', d: roundRect(BTN.x, BTN.y, BTN.w, BTN.h, BTN.r), width: 1,
+    color: state.hover ? C.accent : C.line });
+  L.push({ type: 'text', text: '查看日志', at: [BTN.x + BTN.w / 2, BTN.y + BTN.h / 2], size: 22,
+    color: state.hover ? C.accent : C.dim });
+
+  /* 输入行：框线 + 粒子文字（真的字在下面的透明 input 里） */
+  L.push({ type: 'path', d: roundRect(FIELD.x, FIELD.y, FIELD.w, FIELD.h, 10), width: 1,
+    color: state.focus ? C.accent : C.line });
+  const shown = state.text || '说点什么…';
+  L.push({ type: 'text', text: shown, at: [FIELD.x + 14, FIELD.y + FIELD.h / 2], size: 22,
+    color: state.text ? C.ink : C.line, align: 'left' });
+
+  return L;
+}
+
+/* ───────── 渲染 ───────── */
+const typeEl = document.getElementById('type');
+let lastMs = 0;
+
+function layoutOverlay(a) {
+  if (scene !== 'ui') return;
+  const r = typeEl.getBoundingClientRect();
+  typeEl.style.display = 'block';
+  typeEl.style.left = a.x + FIELD.x + 14 + 'px';
+  typeEl.style.top = a.y + FIELD.y + 9 + 'px';
+  typeEl.style.width = FIELD.w - 28 + 'px';
+  typeEl.style.height = FIELD.h - 18 + 'px';
+  typeEl.style.lineHeight = FIELD.h - 18 + 'px';
+  void r;
+}
+
+function render(opt = {}) {
+  const a = area();
+  const t0 = performance.now();
+  const layers = scene === 'ladder' ? ladderLayers() : uiLayers();
+  const pack = compileDraw({ points: opt.points || Number(q.get('pts') || 6200), layers }, a);
+  const dot = Number(opt.dot ?? q.get('dot') ?? 1);
+  const r = f.setDraw(pack, { ...a, drawOnMs: opt.drawOnMs ?? 0, dot, dim: scene === 'ui' ? 0.96 : 0.82 });
+  lastMs = performance.now() - t0;
+  layoutOverlay(a);
+  hud.textContent = [
+    `scene    ${scene}`,
+    `points   ${r.used} / 6400`,
+    `spacing  ${pack.spacing.toFixed(2)}px`,
+    `compile  ${lastMs.toFixed(1)}ms  dot ${dot}`,
+    `text     ${state.text.length} 字`,
+  ].join('\n');
+  return { used: r.used, spacing: pack.spacing, ms: lastMs };
+}
+
+window.__render = render;
+window.__state = state;
+
+/* 输入：每敲一个字重编译一次，量一下够不够快 */
+typeEl.addEventListener('input', () => {
+  state.text = typeEl.value.slice(0, 24);
+  render();
+});
+typeEl.addEventListener('focus', () => { state.focus = true; render(); });
+typeEl.addEventListener('blur', () => { state.focus = false; render(); });
+
+/* 按钮 hover：只在状态翻转时重编译，不是每帧 */
+addEventListener('pointermove', (e) => {
+  if (scene !== 'ui') return;
+  const a = area();
+  const x = e.clientX - a.x;
+  const y = e.clientY - a.y;
+  const on = x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h;
+  if (on !== state.hover) { state.hover = on; render(); }
+  const onField = x > FIELD.x && x < FIELD.x + FIELD.w && y > FIELD.y && y < FIELD.y + FIELD.h;
+  if (onField) typeEl.style.cursor = 'text';
+});
+
+/* 点输入框区域就聚焦 */
+addEventListener('pointerdown', (e) => {
+  if (scene !== 'ui') return;
+  const a = area();
+  const x = e.clientX - a.x;
+  const y = e.clientY - a.y;
+  if (x > FIELD.x && x < FIELD.x + FIELD.w && y > FIELD.y && y < FIELD.y + FIELD.h) typeEl.focus();
+});
+
+let last = performance.now();
+let frames = 0;
+let fpsT = 0;
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  f.step(dt);
+  f.render();
+  frames++;
+  fpsT += dt;
+  if (fpsT > 0.5) { window.__fps = Math.round(frames / fpsT); frames = 0; fpsT = 0; }
+  requestAnimationFrame(loop);
+}
+
+setTimeout(() => {
+  render({ drawOnMs: 1800 });
+  typeEl.value = state.text;
+  requestAnimationFrame(loop);
+}, 250);
+</script>
+</body>
+</html>

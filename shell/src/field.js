@@ -1738,7 +1738,9 @@ export class Field {
          否则整幅画上下颠倒（字会翻过来、柱状图会从顶边往下挂）。 */
       this.drawY[i] = cy - (p.y + oy);
       this.drawA[i] = 0.55 + 0.45 * ink;      // 墨越厚越亮
-      this.drawS[i] = 1.9 + 0.8 * ink;
+      /* dot：点径缩放。绘画要"笔触"（默认 1），UI 文字要"点"——
+         点径大于字距时笔画会糊成一坨墨，20px 的汉字尤其明显。 */
+      this.drawS[i] = (1.9 + 0.8 * ink) * (geo.dot ?? 1);
       this.drawD[i] = k / cnt;
       this.drawCol[i * 3] = p.c[0];
       this.drawCol[i * 3 + 1] = p.c[1];
@@ -1749,6 +1751,7 @@ export class Field {
     this.drawOn = 1;
     this.drawStart = this.time;
     this.drawOnMs = geo.drawOnMs ?? 0;
+    this.drawDim = geo.dim ?? 0.78;   // 未进画/未占位的 ambient 压暗比例（UI 用 0.96+）
     return { used: cnt, spacing: pack.spacing || 0 };
   }
 
@@ -2001,8 +2004,10 @@ export class Field {
           * (1 + 0.45 * beat);
         ss = this.baseS[i] * (0.45 + 1.5 * dzk) * szm;
         /* 作画时其余粒子压到很暗 —— 留着是"画长在粒子海里"的层次，
-           但亮度必须低到不跟画面抢注意力（0.22 时只剩一层若有若无的底噪） */
-        if (drawMix > 0.002) sa *= 1 - 0.78 * drawMix;
+           但亮度必须低到不跟画面抢注意力（0.22 时只剩一层若有若无的底噪）。
+           UI 模式要更狠（geo.dim→0.97）：一屏粒子界面背后若还浮着球体的经纬弧，
+           那些弧会从字缝里穿过去，读起来像脏屏幕。 */
+        if (drawMix > 0.002) sa *= 1 - (this.drawDim ?? 0.78) * drawMix;
       }
       this.alpha[i] += (sa - this.alpha[i]) * f;
       this.size[i] += (ss - this.size[i]) * f;
