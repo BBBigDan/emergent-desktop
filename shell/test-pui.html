@@ -80,6 +80,8 @@ const BTN = { x: 26, y: 330, w: 148, h: 40, r: 10 };
 const FIELD = { x: 26, y: 404, w: 420, h: 46 };
 
 let parts = null;
+let pulseAt = 0;
+const FREEZE = Number(new URLSearchParams(location.search).get('freeze') || 0);
 let lastInput = { wrote: 0, ms: 0, px: 0, chars: 0 };
 
 /* ───────── 搭场景：一次分配槽位，之后只改内容 ───────── */
@@ -134,9 +136,26 @@ function build() {
   ['n8n 的一个工作流在反复重启，', '已经把并发从 8 降到 3。', '内存最低还剩 3.1 GB。'].forEach((t, i) => body[i].set(t));
   paintBtn();
   paintField();
-  paintInput({ silent: true });
+  paintInput({ silent: true, initial: true });
   layoutOverlay();
   hudAll();
+  /* 截图用：?pulse=x,y&freeze=毫秒 —— 在 x,y 处敲一下，然后在 freeze 毫秒处冻住物理，
+     这样同一场扰动的不同瞬间都能拍下来（静态图拍不出惯性，只能逐帧冻结）。 */
+  if (q.get('pulse')) {
+    const [px, py] = q.get('pulse').split(',').map(Number);
+    /* 必须等界面落定再敲：UI 是从球面飞过来的，早敲只会拍到一团乱飞 */
+    setTimeout(() => {
+      f.impulse(px, py, { r: Number(q.get('pr') || 200), power: Number(q.get('power') || 620) });
+      pulseAt = performance.now();
+    }, Number(q.get('delay') || 1400));
+  }
+
+  /* 截图用：?hover=x,y 摆一个常驻势阱（局部坐标），?swirl=1 加强旋度 */
+  if (q.get('hover')) {
+    const [hx, hy] = q.get('hover').split(',').map(Number);
+    const k = Number(q.get('k') || 1500);
+    f.setWells([{ x: hx, y: hy, r: Number(q.get('r') || 190), k, swirl: Number(q.get('swirl') || 0.28) }]);
+  }
   return parts;
 }
 
@@ -151,7 +170,7 @@ function paintBtn() {
 }
 
 function paintInput(opt = {}) {
-  const r = parts.input.set(state.text, { scl: state.text ? 1 : 0.55 });
+  const r = parts.input.set(state.text, { scl: state.text ? 1 : 0.55, spawn: !opt.initial });
   lastInput = r;
   if (!opt.silent) hudAll(r);
   return r;
@@ -187,21 +206,55 @@ typeEl.addEventListener('input', () => {
 typeEl.addEventListener('focus', () => { state.focus = true; paintField(); });
 typeEl.addEventListener('blur', () => { state.focus = false; paintField(); });
 
+/* ───────── 交互：不写 hover 状态，只放势阱 ─────────
+   光标本身是一个弱井（扫过时字会被带歪再弹回，背景也跟着弯腰）；
+   移到按钮上时，按钮中心再多一个强井 —— 粒子被吸拢，形成"可以按的东西"，
+   而不是靠变色告诉你"这里可以点"。 */
+const WELL_CURSOR = { r: 190, k: 1500, swirl: 0.28 };
+const WELL_TARGET = { r: 120, k: 3400, swirl: 0.55 };
+
+function wellsAt(x, y) {
+  const out = y == null ? [] : [{ x, y, ...WELL_CURSOR }];
+  if (x != null && inBtn(x, y)) {
+    out.push({ x: BTN.x + BTN.w / 2, y: BTN.y + BTN.h / 2, ...WELL_TARGET });
+  }
+  return out;
+}
+
+function inBtn(x, y) {
+  return x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h;
+}
+
+function setPointer(x, y) {
+  if (!parts) return;
+  f.setWells(wellsAt(x, y));
+}
+
 addEventListener('pointermove', (e) => {
   if (!parts) return;
   const { a } = parts;
   const x = e.clientX - a.x;
   const y = e.clientY - a.y;
-  const on = x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h;
+  setPointer(x, y);
+  const on = inBtn(x, y);
   if (on !== state.hover) { state.hover = on; paintBtn(); }
   if (x > FIELD.x && x < FIELD.x + FIELD.w && y > FIELD.y && y < FIELD.y + FIELD.h) typeEl.style.cursor = 'text';
 });
+addEventListener('pointerleave', () => { if (parts) f.setWells([]); });
 
 addEventListener('pointerdown', (e) => {
   if (!parts) return;
   const { a } = parts;
   const x = e.clientX - a.x;
   const y = e.clientY - a.y;
+  /* 按下的第一件事是**给场一个冲量**，不是改状态：粒子炸开，弹簧再把它们收回去。
+     状态（换文案/提交）在这之后才发生 —— 所以"按下去有回响"。 */
+  f.impulse(x, y, { r: 190, power: 620 });
+  if (inBtn(x, y)) {
+    state.hover = true;
+    paintBtn();
+    setTimeout(() => { if (parts) f.impulse(BTN.x + BTN.w / 2, BTN.y + BTN.h / 2, { r: 130, power: 300 }); }, 160);
+  }
   if (x > FIELD.x && x < FIELD.x + FIELD.w && y > FIELD.y && y < FIELD.y + FIELD.h) typeEl.focus();
 });
 
@@ -210,7 +263,9 @@ let last = performance.now();
 let frames = 0;
 let fpsT = 0;
 function loop(now) {
-  const dt = Math.min((now - last) / 1000, 0.05);
+  let dt = Math.min((now - last) / 1000, 0.05);
+  /* 冻结：到达指定时刻后 dt=0，物理停住但画面继续画 —— 于是可以随时截图 */
+  if (FREEZE && pulseAt && now - pulseAt > FREEZE) dt = 0;
   last = now;
   f.step(dt);
   f.render();
@@ -249,6 +304,8 @@ window.__clear = () => {
   return paintInput();
 };
 window.__state = state;
+window.__hover = (x, y) => { setPointer(x - 0, y - 0); return f.wells.length; };
+window.__clickAt = (x, y) => { f.impulse(x, y, { r: 200, power: 700 }); return true; };
 window.__glyph = (ch, size, o) => { const g = glyph(ch, size, o); return { n: g.pts.length, adv: +g.advance.toFixed(2), cell: +g.cell.toFixed(2), budget: g.budget, xs: [Math.min(...g.pts.map(p=>+p.x.toFixed(1))), Math.max(...g.pts.map(p=>+p.x.toFixed(1)))], ys: [Math.min(...g.pts.map(p=>+p.y.toFixed(1))), Math.max(...g.pts.map(p=>+p.y.toFixed(1)))] }; };
 window.__parts = () => parts && { slots: parts.alloc.used, base: parts.input.base };
 </script>

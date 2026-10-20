@@ -255,6 +255,7 @@ export class Field {
     this.drawStart = 0;                      // drawOn 起始时间（秒）
     this.drawOnMs = 0;                       // drawOn 总时长（ms），0 = 立刻
     this.col0 = null;                        // ambient 原色快照（退出绘画时还原）
+    this.wells = [];                         // 引力井（光标、被悬停的目标）—— 见 setWells
 
     /* --- rail（左边缘应用栏）---
      * 每颗点记着自己属于哪个图标、在图标里的局部偏移、是不是"增援"余量。
@@ -1783,11 +1784,13 @@ export class Field {
    * @param {{x:number,y:number,ink:number}[]} pts 屏幕坐标（相对视口左上）
    * @param {number[]} col [r,g,b] 0..1
    */
-  slotPut(base, pts, col, scl = 1) {
+  slotPut(base, pts, col, scl = 1, spawn = null) {
     const n = AMBIENT_N;
     const cx = this.W * 0.5;
     const cy = this.H * 0.5;
     const dot = this.drawDot ?? 0.9;
+    const P = this.pos;
+    const V = this.vel;
     for (let k = 0; k < pts.length; k++) {
       const slot = base + k;
       if (slot >= n) break;
@@ -1804,6 +1807,17 @@ export class Field {
       this.drawCol[i * 3] = col[0];
       this.drawCol[i * 3 + 1] = col[1];
       this.drawCol[i * 3 + 2] = col[2];
+      /* spawn：给新写进来的点一个"出生位置"（屏幕坐标 + 半径）。
+         打字时新字从插入符那里长出来，而不是从球面上随便某处飞过来 ——
+         这是这套界面"有笔触感"的关键，DOM 里做不到。 */
+      if (spawn) {
+        const a = Math.random() * Math.PI * 2;
+        const rr = Math.sqrt(Math.random()) * (spawn.r ?? 24);
+        P[i * 3] = spawn.x - cx + Math.cos(a) * rr;
+        P[i * 3 + 1] = cy - spawn.y + Math.sin(a) * rr;
+        V[i * 2] = 0;
+        V[i * 2 + 1] = 0;
+      }
       if (slot + 1 > this.drawN) this.drawN = slot + 1;
     }
   }
@@ -1817,6 +1831,63 @@ export class Field {
       const i = (slot * 7919 + 13) % n;
       this.drawA[i] = 0;
       this.drawS[i] = 0;
+    }
+  }
+
+  /* ───────────── 场：引力井与冲量 ─────────────
+   * 这两个原语是"粒子交互"和"DOM 交互"的分水岭。
+   *
+   * DOM 的悬停是**换一个样式**：hover 一进，颜色立刻变，没有过程。
+   * 这里是**施一个力**：点被拉过去，弹簧再把它拽回来 —— 有速度、有过冲、
+   * 有余韵，而且同一个"井"作用在背景上时，整片场都会跟着弯腰。
+   *
+   * 所以界面状态不该描述成 "hover: true"，而该描述成
+   * "这里有一个 r=170、k=2400 的势阱" —— 状态本身就是几何。
+   */
+
+  /**
+   * @param {{x:number,y:number,r:number,k:number,swirl?:number}[]} list 屏幕坐标
+   */
+  setWells(list) {
+    const cx = this.W * 0.5;
+    const cy = this.H * 0.5;
+    this.wells.length = 0;
+    for (const w of list || []) {
+      this.wells.push({
+        x: w.x - cx,
+        y: cy - w.y,          // 转成场坐标（y 向上）
+        r: w.r || 150,
+        r2: (w.r || 150) * (w.r || 150),
+        k: w.k || 2400,
+        swirl: w.swirl || 0,
+      });
+    }
+  }
+
+  /**
+   * 一次性冲量：把半径内的点朝外推一下。点击/确认用它 —— 手一按，场炸开，
+   * 然后弹簧把它们收回去，形成"按下去有回响"的手感。
+   */
+  impulse(x, y, opt = {}) {
+    const cx = this.W * 0.5;
+    const cy = this.H * 0.5;
+    const wx = x - cx;
+    const wy = cy - y;
+    const r = opt.r || 170;
+    const r2 = r * r;
+    const pw = opt.power || 520;
+    const P = this.pos;
+    const V = this.vel;
+    for (let i = 0; i < AMBIENT_N; i++) {
+      const i3 = i * 3;
+      const dx = P[i3] - wx;
+      const dy = P[i3 + 1] - wy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > r2) continue;
+      const d = Math.sqrt(d2) + 0.001;
+      const f = pw * (1 - d / r);
+      V[i * 2] += (dx / d) * f;
+      V[i * 2 + 1] += (dy / d) * f;
     }
   }
 
@@ -2034,6 +2105,28 @@ export class Field {
 
       V[i2] = (V[i2] + (tx - P[i3]) * k * dt) / (1 + c * dt);
       V[i2 + 1] = (V[i2 + 1] + (ty - P[i3 + 1]) * k * dt) / (1 + c * dt);
+
+      /* ---- 场：引力井 ----
+         弹簧负责"回到该在的位置"，井负责"此刻被谁吸引"。
+         两者叠加就得到了惯性、过冲和余韵 —— 这正是静态排版给不了的东西：
+         光标扫过一行字，字会被带歪一点再弹回，背景那一层也会跟着弯。
+         力在弹簧之后、积分之前施加，所以是"先归位，再被拨动"。 */
+      for (let wi = 0; wi < this.wells.length; wi++) {
+        const W = this.wells[wi];
+        const dx = W.x - P[i3];
+        const dy = W.y - P[i3 + 1];
+        const d2 = dx * dx + dy * dy;
+        if (d2 > W.r2) continue;
+        const d = Math.sqrt(d2) + 0.001;
+        const pull = W.k * (1 - d / W.r) * dt;
+        V[i2] += (dx / d) * pull;
+        V[i2 + 1] += (dy / d) * pull;
+        if (W.swirl) {
+          V[i2] += (-dy / d) * pull * W.swirl;
+          V[i2 + 1] += (dx / d) * pull * W.swirl;
+        }
+      }
+
       P[i3] += V[i2] * dt;
       P[i3 + 1] += V[i2 + 1] * dt;
 

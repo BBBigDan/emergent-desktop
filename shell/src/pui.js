@@ -248,7 +248,13 @@ export class ParticleText {
          这是"打字不整屏重排"的全部秘密：跳过的字连采样都不做。 */
       if (!opt.force && prev && prev.ch === ch && Math.abs(prev.x - gx) < 0.01) continue;
       const pts = metrics[i].pts.map((p) => ({ x: gx + p.x, y: this.y + p.y, ink: p.ink }));
-      this.field.slotPut(this.base + i * this.budget, pts, rgb, opt.scl ?? 1);
+      /* spawn：新字在这一格附近凝结，而不是从球面某处飞过来 ——
+         观感上是"笔尖落墨、墨自己收成字"，DOM 里没有对应的东西。
+         只有内容真的变了才给出生点；因排版位移而重算的字不该重新出生。 */
+      const spawn = opt.spawn
+        ? { x: gx + metrics[i].advance * 0.5, y: this.y - this.size * 0.34, r: this.size * 0.55 }
+        : null;
+      this.field.slotPut(this.base + i * this.budget, pts, rgb, opt.scl ?? 1, spawn);
       this._slots[i] = { ch, x: gx };
       wrote++;
     }

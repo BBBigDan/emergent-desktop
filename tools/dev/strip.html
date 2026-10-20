@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>逐帧</title>
+<style>
+  html, body { margin: 0; background: #04070d; overflow: hidden; }
+  #row { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px; }
+  .cell { flex: 0 0 calc(33.333% - 7px); }
+  .cell img {
+    width: 100%; display: block; border-radius: 6px;
+    border: 1px solid rgba(148, 178, 255, 0.12);
+  }
+  .cell b {
+    display: block; margin-top: 5px; text-align: center;
+    font: 11px/1.4 ui-monospace, Menlo, monospace;
+    color: rgba(160, 200, 240, 0.72); font-weight: 400;
+  }
+</style>
+</head>
+<body>
+<div id="row"></div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const files = (q.get('f') || '').split(',').filter(Boolean);
+  const labels = (q.get('l') || '').split(',');
+  const row = document.getElementById('row');
+  files.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.className = 'cell';
+    d.innerHTML = `<img src="${f}"><b>${labels[i] || ''}</b>`;
+    row.appendChild(d);
+  });
+</script>
+</body>
+</html>
