@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>场界面 · scene API</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+  #scene { display: block; width: 100%; height: 100%; }
+  #hud {
+    position: fixed; left: 12px; top: 10px; color: #6d7e93;
+    font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hud"></div>
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module">
+import { Field } from './src/field.js';
+import { FieldScene } from './src/scene.js';
+
+const f = new Field(document.getElementById('scene'));
+const hud = document.getElementById('hud');
+const q = new URLSearchParams(location.search);
+
+const AREA = { w: 820, h: 620 };
+const area = () => ({
+  w: AREA.w, h: AREA.h,
+  x: Math.round((innerWidth - AREA.w) / 2),
+  y: Math.round((innerHeight - AREA.h) / 2) - 10,
+});
+
+/* ───────── 这就是"给模型的接口"的样子 ─────────
+   模型只说语义：哪个是焦点、有几个指标、进度多少、是不是异常。
+   角度、半径、点距、字号、槽位，全在 scene.js 里算。 */
+const SPEC = {
+  rev: 1,
+  focus: 'job',
+  mood: 'working',
+  layers: [
+    { id: 'cpu',  kind: 'gauge', label: 'CPU',  value: Number(q.get('cpu') || 0.71) },
+    { id: 'mem',  kind: 'gauge', label: '内存', value: Number(q.get('mem') || 0.60) },
+    { id: 'disk', kind: 'gauge', label: '磁盘', value: Number(q.get('disk') || 0.48),
+      color: '#b9a6ff' },
+    { id: 'job', kind: 'stream', label: '追剧 S03',
+      progress: Number(q.get('p') || 0.62), rate: '2.1 MB/s',
+      detail: '62% · 2.1 MB/s' },
+    { id: 'choice', kind: 'fork', label: '要处理 n8n 重启吗',
+      options: [{ id: 'yes', label: '重启 n8n' }, { id: 'no', label: '先看着' }] },
+    { id: 'n8n',  kind: 'turbulence', level: 0.4 },
+  ],
+};
+
+const scene = new FieldScene({ field: f, area: area() });
+scene.set(SPEC);
+
+/* ───────── 交互：只放势阱 / 敲冲量，不写 hover 状态 ───────── */
+addEventListener('pointermove', (e) => {
+  const a = area();
+  const x = e.clientX, y = e.clientY;
+  const id = scene.hit(x, y);
+  const wells = [{ x, y, r: 150, k: 380, swirl: 0.22 }];
+  if (id) {
+    const l = scene.layers.get(id);
+    if (l?.anchor) wells.push({ x: l.anchor.x, y: l.anchor.y, r: 110, k: 900, swirl: 0.4 });
+  }
+  f.setWells(wells);
+});
+addEventListener('pointerdown', (e) => {
+  const id = scene.hit(e.clientX, e.clientY);
+  f.impulse(e.clientX, e.clientY, { r: 170, power: 520 });
+  scene.pulse('confirm', { at: id || scene.focus });
+});
+
+/* 演示：进度自己往前走，观察"沉积" */
+let auto = q.get('auto') === '1';
+let prog = Number(q.get('p') || 0.62);
+const timer = setInterval(() => {
+  if (!auto) return;
+  prog = Math.min(1, prog + 0.012);
+  scene.patch([{ id: 'job', progress: prog }]);
+  hudAll();
+}, 420);
+
+/* ───────── 主循环 ───────── */
+let last = performance.now();
+let frames = 0;
+let fpsT = 0;
+let pulseAt = 0;
+const FREEZE = Number(q.get('freeze') || 0);
+
+function hudAll(extra = '') {
+  hud.textContent = [
+    `scene    ${scene.rev} rev · focus=${scene.focus} · mood=${SPEC.mood}`,
+    `slots    ${scene.alloc.used} / 6400`,
+    `layers   ${scene.layers.size} · flows ${scene.flows.length}`,
+    `progress ${Math.round(prog * 100)}%`,
+    extra,
+  ].join('\n');
+}
+hudAll();
+
+function loop(now) {
+  let dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (FREEZE && pulseAt && now - pulseAt > FREEZE) dt = 0;
+  f.step(dt);
+  scene.step(dt);
+  f.render();
+  frames++;
+  fpsT += dt;
+  if (fpsT > 0.5) { window.__fps = Math.round(frames / fpsT); frames = 0; fpsT = 0; }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* 截图/自动化 */
+if (q.get('pulse')) {
+  const kind = q.get('pulse');
+  setTimeout(() => { scene.pulse(kind, { at: q.get('at') }); pulseAt = performance.now(); },
+    Number(q.get('delay') || 1600));
+}
+window.__scene = scene;
+window.__patch = (h) => { scene.patch([{ id: 'job', progress: h }]); prog = h; hudAll(); };
+window.__pulse = (k, at) => { scene.pulse(k, { at }); pulseAt = performance.now(); };
+window.__spec = SPEC;
+</script>
+</body>
+</html>
