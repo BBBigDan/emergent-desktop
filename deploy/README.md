@@ -26,6 +26,7 @@ envoy ──► Service edge-desktop (80 → 91)
 |---|---|---|
 | 静态文件 | hostPath `/olares/emergent-shell/www` | 改完 `scp` 即可，不用重启 pod、不用打镜像 |
 | 只接管 `/` | nginx `try_files`，`/api` `/server` `/kapis` … 反代到 `olares-app-official:91` | 登录态、接口、其他应用完全不受影响 |
+| `/bfl/` 单独直连 bfl 网关 | 官方前端 pod 自己不代理 `/bfl`（桌面是跨域走 auth 域名 + JWT 拿遥测的），所以壳层直接 `proxy_pass` 到 `bfl` 服务 | 右下角设备状态面板的 `/bfl/monitor/v1alpha1/cluster` 能用同域 cookie 取到数据 |
 | 切换 | 改 `edge-desktop` 的 selector | 一条 patch 命令，秒级生效，随时回滚 |
 | 工作负载类型 | **裸 Pod**（不是 Deployment） | Olares 的 `appns-validating-webhook` 只校验 deployments/statefulsets/daemonsets 的 CREATE，裸 Pod 不受拦截 |
 
