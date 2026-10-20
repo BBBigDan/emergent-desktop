@@ -267,17 +267,6 @@ export class Field {
     this.railActive = -1;              // 已打开应用对应的图标
     this.railDirty = false;
 
-    /* --- 光标周围那一撮（唯一进到窗口中央的粒子）---
-     * 单独一层、**普通透明混合**：背景那团是加法发光，叠在浅色 iframe 上等于看不见
-     * （白底加白点还是白），只能靠普通 alpha 才会显出青色的点。
-     * 每颗点按 i % 11 从 ambient 里"借"，位置不是弹簧算的，直接绕光标转。 */
-    const cn = Math.ceil(AMBIENT_N / 6);
-    this.curN = cn;
-    this.cPos = new Float32Array(cn * 3);
-    this.cCol = new Float32Array(cn * 3);
-    this.cSize = new Float32Array(cn);
-    this.cAlpha = new Float32Array(cn);
-
     /* --- 设备状态面板（右下角）---
      * 和 rail 同构：每颗点记着"从团里哪出发、目标在哪、什么时候出发"，
      * 位置由流的进度决定。区别是这里的目标会**被数据改**
@@ -360,13 +349,6 @@ export class Field {
     this.yawV = 0;
     this.pitchV = 0;
     this.dragging = false;
-
-    /* 鼠标位置（CSS px，视口左上角原点）。只有"有窗口"时才用得上：
-     * 留一小撮粒子跟着光标绕，其余全在窗口外面流。 */
-    this.mx = this.W / 2;
-    this.my = this.H / 2;
-    this.mouseOn = false;
-    this.inFrame = false;    // 指针在 iframe 里：坐标会冻在跨过边界那一点
 
     /* 心跳 */
     this.beat = 0;           // 当前包络 0..1
@@ -546,53 +528,10 @@ export class Field {
     this.statPoints.frustumCulled = false;
     this.statPoints.renderOrder = 3;
 
-    /* ---- 光标粒子层：压在窗口内容之上，用普通混合 ----
-       柔和圆点（不是 rail 的圆角方块，那个是给图标密铺用的）。
-       renderOrder 给到最大：窗口内容和日冕都画完之后才轮到它。 */
-    this.curGeo = new THREE.BufferGeometry();
-    this.curGeo.setAttribute('position', new THREE.BufferAttribute(this.cPos, 3).setUsage(THREE.DynamicDrawUsage));
-    this.curGeo.setAttribute('aColor', new THREE.BufferAttribute(this.cCol, 3).setUsage(THREE.DynamicDrawUsage));
-    this.curGeo.setAttribute('aSize', new THREE.BufferAttribute(this.cSize, 1).setUsage(THREE.DynamicDrawUsage));
-    this.curGeo.setAttribute('aAlpha', new THREE.BufferAttribute(this.cAlpha, 1).setUsage(THREE.DynamicDrawUsage));
-
-    this.curMat = new THREE.ShaderMaterial({
-      uniforms: { uDpr: { value: 1 } },
-      vertexShader: `
-        attribute float aSize; attribute float aAlpha; attribute vec3 aColor;
-        varying vec3 vColor; varying float vAlpha;
-        uniform float uDpr;
-        void main(){
-          vColor = aColor; vAlpha = aAlpha;
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          gl_Position = projectionMatrix * mv;
-          gl_PointSize = aSize * uDpr;
-        }`,
-      fragmentShader: `
-        varying vec3 vColor; varying float vAlpha;
-        void main(){
-          /* 圆点，边缘留一点点柔化：pow 太软会整层糊成"蓝雾"（试过 1.6），
-             这里芯是实的、只在外沿 40% 化开 */
-          float d = length(gl_PointCoord - 0.5) * 2.0;
-          if (d > 1.0) discard;
-          float a = smoothstep(1.0, 0.58, d);
-          gl_FragColor = vec4(vColor, a * vAlpha);
-        }`,
-      transparent: true,
-      depthTest: false,
-      depthWrite: false,
-      blending: THREE.NormalBlending,
-    });
-
-    this.curPoints = new THREE.Points(this.curGeo, this.curMat);
-    this.curPoints.frustumCulled = false;
-    this.curPoints.renderOrder = 6;
-
-
     this.scene = new THREE.Scene();
     this.scene.add(this.points);
     this.scene.add(this.railPoints);
     this.scene.add(this.statPoints);
-    this.scene.add(this.curPoints);
 
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
     this.renderer.setClearColor(0x000000, 0);
@@ -697,34 +636,6 @@ export class Field {
     window.addEventListener('pointerup', up);
     window.addEventListener('pointercancel', up);
 
-    /* 光标的**全局**位置：上面那个 move 只在"按住"时工作，而这一小撮跟着光标的
-       粒子需要一直知道它在哪。没有 pointermove 时（指针移出窗口）就把光圈收掉。 */
-    window.addEventListener('pointermove', (e) => {
-      this.mx = e.clientX;
-      this.my = e.clientY;
-      this.mouseOn = true;
-      this.inFrame = false;     // 能从父文档收到 move，说明指针不在 iframe 里
-    }, { passive: true });
-    /* 指针进 / 出 iframe：父文档只在**跨过边界那一下**收到事件，之后移动全被 iframe
-       吞掉（跨文档，拿不到坐标）。所以要记住这一下：一是别把它误判成"指针离开桌面"
-       （跨文档时 relatedTarget 也是 null），二是让光圈知道该切到"跟不动"的形态。 */
-    document.addEventListener('pointerover', (e) => {
-      const inF = !!e.target && e.target.tagName === 'IFRAME';
-      this.inFrame = inF;
-      if (inF) {
-        this.mx = e.clientX;
-        this.my = e.clientY;
-        this.mouseOn = true;
-      }
-    }, { passive: true });
-    document.addEventListener('pointerout', (e) => {
-      if (e.relatedTarget) return;
-      /* relatedTarget 为 null 有两种情况：真的移出视口、或指针进了 iframe。
-         只有坐标贴在视口边缘才当它离开（否则窗口内容一悬停，光圈就没了）。 */
-      if (e.clientX <= 0 || e.clientY <= 0
-        || e.clientX >= this.W - 1 || e.clientY >= this.H - 1) this.mouseOn = false;
-    }, { passive: true });
-    window.addEventListener('blur', () => { if (!this.inFrame) this.mouseOn = false; });
   }
 
   /**
@@ -792,7 +703,6 @@ export class Field {
     this.renderer.setSize(this.W, this.H, true);
     this.mat.uniforms.uDpr.value = dpr;
     this.railMat.uniforms.uDpr.value = dpr;
-    this.curMat.uniforms.uDpr.value = dpr;
     this.cam.left = -this.W / 2;
     this.cam.right = this.W / 2;
     this.cam.top = this.H / 2;
@@ -1816,12 +1726,6 @@ export class Field {
       );
       bandMax = clamp(room * 0.94, 6, AURA_MAX);
     }
-    /* 跟着光标的那一小撮（每 6 颗取 1 颗 ≈ 17%）：只有"有窗口"时才出现 */
-    const mw = this.mouseOn && auraW > 0.05 ? auraW : 0;
-    /* 应用列表里不出现：那里每个图标自己有一圈流，再叠一层会抢戏 */
-    const curOn = mw > 0.002 && this.launchMode === 0;
-    if (!curOn) this.cAlpha.fill(0);      // 没窗口 / 指针不在：整层立刻收掉
-
     /* 拖动（或松手后还在惯性转）时把弹簧压紧：
        目标位置每帧都在跳，弹簧软了粒子就追不上——球会被拖成椭圆（实测横向掉 10%）。
        停稳后回落到 46，保留粒子自己那点呼吸。 */
@@ -1834,8 +1738,6 @@ export class Field {
     for (let i = 0; i < n; i++) {
       const i3 = i * 3, i2 = i * 2;
       let tx, ty, z2 = 0, em = 1, szm = 1;
-      /* 光标粒子不在球面上，深度明暗不适用（否则一半点会被"后侧变暗"压掉） */
-      let cursorDot = false;
       /* 流线：沿"流动方向"把圆点拉长，静止画面也读得出在往哪边流（和窗口门同一套） */
       let dirX = 0, dirY = 0, strK = 0;
 
@@ -1943,71 +1845,16 @@ export class Field {
         em = lerp(em, emA, auraW);
       }
 
-      /* ---- 光标周围那一撮：**唯一被豁免进窗口中央**的粒子 ----
-         它单独一层（普通混合、renderOrder 最大），所以能压在窗口内容上面而不被遮掉；
-         位置不经过弹簧，直接绕光标转 —— 少了阻尼，跟手。 */
-      if (curOn && i % 6 === 0) {
-        cursorDot = true;
-        const ci = (i / 6) | 0;
-        const jn = ci;
-        const tier = jn % 10;
-        /* 九分之一贴身（9~32px）：不留成"空心环"——一圈亮尘中间空一块，
-           远看像个黑洞。贴身的点最小最淡，压不住光标箭头 */
-        const close = jn % 9 === 0;
-        const near = close ? 0.55 : tier < 5 ? 1 : tier < 8 ? 0.62 : 0.34;
-        const rr = close
-          ? 10 + (jn % 6) * 4.0
-          : tier < 5 ? 34 + (jn % 6) * 6.2
-            : tier < 8 ? 68 + (jn % 5) * 8.0 : 104 + (jn % 4) * 12;
-        const spin = close ? 1.55 : tier < 5 ? 1.15 : tier < 8 ? 0.66 : 0.34;
-        /* 三条旋臂 + 臂内散布 + 半径越大越超前（rr*0.010）：
-           均匀撒角度是一团"雪"，拧成臂才看得出是在转的一小团涡旋 */
-        const arm = (jn % 3) * 2.0944;
-        const jit = (((jn * 0.6180339887) % 1) - 0.5) * 1.15;
-        const ang = arm + jit + t * spin + rr * 0.013;
-        const br = 1 + 0.08 * Math.sin(t * 1.8 + jn * 1.3);   // 径向轻呼吸
-        let px = Math.cos(ang) * rr * br;
-        let py = Math.sin(ang) * rr * br * 0.84;               // 略扁：一层沿光标铺开的尘
-        if (this.inFrame) {
-          /* 指进 iframe 之后父文档再也收不到 move（跨文档），坐标会冻在跨过边界那一点。
-             让它在那儿慢慢游走，别"死停"——至少看得出来是活的。 */
-          px += Math.sin(t * 0.55 + jn * 1.7) * 14;
-          py += Math.cos(t * 0.47 + jn * 2.3) * 14;
-        }
-        const wx = this.mx - this.W / 2 + px;
-        const wy = this.H / 2 - this.my + py;
-        this.cPos[ci * 3] = wx;
-        this.cPos[ci * 3 + 1] = wy;
-        this.cPos[ci * 3 + 2] = 0;
-        /* 点径按层给：近芯小而亮、外晕更小更淡（大的会像"饼"） */
-        /* 点径压到 4.8px 以内：再大就叠成一块"膏"，读不出是一颗颗的点 */
-        this.cSize[ci] = (1.9 + 2.3 * near) * (1 + 0.30 * beat);
-        this.cAlpha[ci] = mw * (0.52 + 0.34 * near) * (1 + 0.45 * beat);
-        /* 颜色：近芯偏青白，外晕偏靛蓝 —— 在浅色内容上是一层冷暖交替的尘 */
-        const ct = near;
-        this.cCol[ci * 3] = 0.26 + 0.42 * ct;
-        this.cCol[ci * 3 + 1] = 0.62 + 0.30 * ct;
-        this.cCol[ci * 3 + 2] = 1.0;
-      }
-
       V[i2] = (V[i2] + (tx - P[i3]) * k * dt) / (1 + c * dt);
       V[i2 + 1] = (V[i2 + 1] + (ty - P[i3 + 1]) * k * dt) / (1 + c * dt);
       P[i3] += V[i2] * dt;
       P[i3 + 1] += V[i2 + 1] * dt;
 
-      if (cursorDot) {
-        /* 这一颗只在光标层画：主层是加法发光，叠在浅色 iframe 上等于看不见，
-           留着只会让"日冕"在边缘多一层没用的白雾 */
-        this.alpha[i] = 0;
-        this.aStr[i] = 0;
-        continue;
-      }
-
       /* 远侧更小更暗：正交投影里唯一的立体线索（ambient 的 baseA 只有 0.2~0.54，
          形态态要提上去才看得清，否则整团是灰的）。
          深处的点更小更暗：球面投影在轮廓处会挤成一道亮弧（看着像盘子边），
          用"前大后小"把这个堆积压掉，球体感也更明确。 */
-      const dzk = grid || cursorDot ? 1 : clamp(0.52 + z2 * 0.50, 0.22, 1.18);
+      const dzk = grid ? 1 : clamp(0.52 + z2 * 0.50, 0.22, 1.18);
       /* occ：有窗口时压暗 —— 但改道到日冕之后（auraW→1）就不压了，
          否则窗口外面那圈会灰得看不见 */
       const sa = this.baseA[i] * dzk * 2.9 * dim * em
@@ -2024,10 +1871,6 @@ export class Field {
 
     this.geo.attributes.aDir.needsUpdate = true;
     this.geo.attributes.aStr.needsUpdate = true;
-    this.curGeo.attributes.position.needsUpdate = true;
-    this.curGeo.attributes.aColor.needsUpdate = true;
-    this.curGeo.attributes.aSize.needsUpdate = true;
-    this.curGeo.attributes.aAlpha.needsUpdate = true;
   }
 
   /**

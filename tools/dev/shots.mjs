@@ -210,7 +210,7 @@ async function main() {
   await sleep(2400);
   await settle(2);                      // 星系形态，和面板一起入镜
   /* 用 JS 展开面板、再把光标挪开：真实交互下光标必须一直待在角落，
-     但截图里光标光圈压在面板上不好看。打开后把光标移走，面板会保持到指针移出。 */
+     打开后把光标移走，面板会保持到指针移出。 */
   await ev('__em.status.open()');
   await sleep(3400);
   await mouse(980, 330);
@@ -225,7 +225,7 @@ async function main() {
   await ev('__em.status.close()');
   await sleep(700);
 
-  /* 6. 开窗：先拍"门"撑开的中途，再拍定型（粒子让开中央 + 光标光圈） */
+  /* 6. 开窗：先拍"门"撑开的中途，再拍定型（粒子全部让到窗口外缘的日冕） */
   await settle(0);
   await mouse(10, 450);
   await sleep(2400);
@@ -234,8 +234,7 @@ async function main() {
   await shot('shell-door');
   await sleep(1900);
   await sleep(600);
-  /* 光标停在标题栏上：iframe 内容区吞事件，父文档收不到 pointermove，
-     光圈会停在进入 iframe 前的位置 —— 截图别拍那个瞬间 */
+  /* 光标停在标题栏上：别停在内容区边缘，免得 hover 态和截图对不上 */
   await mouse(900, 124);
   await sleep(1200);
   await shot('shell-window');
