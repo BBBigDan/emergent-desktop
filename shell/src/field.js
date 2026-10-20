@@ -257,6 +257,23 @@ export class Field {
     this.col0 = null;                        // ambient 原色快照（退出绘画时还原）
     this.wells = [];                         // 引力井（光标、被悬停的目标）—— 见 setWells
 
+    /* --- 相干度 ---
+     * 0 = 完全溶解：点还在这里、还在动，但失去了"该在哪"这件事，摊成一团噪雾。
+     * 1 = 完全成形：每颗点都精确落在它该在的位置上。
+     *
+     * 这是"相变换页"的唯一开关 —— 换景时不叠两套状态层，而是把相干度压到 0、
+     * 重新布景、再拉回 1。同一批粒子，中途没有一刻是"两个界面同时在屏幕上"。
+     * jit 是每点固定方向的噪声向量（不是每帧随机，否则是闪屏不是溶解）。 */
+    this.coh = 1;
+    this.stiff = 1;                          // 弹簧刚度倍率（相变重组时临时抬高）
+    this.jit = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r = 0.55 + Math.random() * 0.65;
+      this.jit[i * 2] = Math.cos(a) * r;
+      this.jit[i * 2 + 1] = Math.sin(a) * r;
+    }
+
     /* --- rail（左边缘应用栏）---
      * 每颗点记着自己属于哪个图标、在图标里的局部偏移、是不是"增援"余量。
      * 目标位置每帧由「图标中心 + 局部偏移 × 悬停缩放 + 微环/漂移」算出，
@@ -1761,6 +1778,30 @@ export class Field {
     this.drawOn = 0;
   }
 
+  /**
+   * 相干度。0 = 溶解成噪雾，1 = 精确成形。
+   *
+   * 不写成"过渡动画"，因为这里根本没有"从 A 到 B 的补间"这回事：
+   * 每颗点一直是"朝目标飞 + 弹簧阻尼"，相干度只是决定目标有多可信。
+   * 相干度低 → 目标被一股固定的噪声推开 → 结构自己塌掉；
+   * 拉回 1 → 目标重新可信 → 结构自己长回来。补间曲线是算出来的，不是画出来的。
+   */
+  setCoherence(k) {
+    this.coh = clamp(k, 0, 1);
+  }
+
+  /**
+   * 弹簧刚度倍率。默认 1；相变的"重组"阶段抬到 2~3。
+   *
+   * 为什么要这个：换几何之后，点要走的路程比平时大得多（从一个元素的位置到另一个元素），
+   * 用平时的刚度要 1.2s 才稳住，而相干度 0.8s 就回到 1 了 —— 结果是"已经宣布成形，
+   * 但字形还在抖"。刚度抬上去，相干度回升和位置落定就同时完成。
+   * 阻尼比不变（c 和 k 一起放大），所以不会变成弹来弹去。
+   */
+  setStiff(k) {
+    this.stiff = k;
+  }
+
   /* ───────────── 槽位写入（粒子界面用，见 pui.js） ─────────────
    * 和 setDraw 的区别：setDraw 收一整幅点云、按 stride 打散分配，一次全量；
    * 这里是"往指定的槽位段里写" —— 同一槽位永远对应同一颗粒子，
@@ -1974,7 +2015,7 @@ export class Field {
        目标位置每帧都在跳，弹簧软了粒子就追不上——球会被拖成椭圆（实测横向掉 10%）。
        停稳后回落到 46，保留粒子自己那点呼吸。 */
     const moving = this.dragging || Math.abs(this.yawV) + Math.abs(this.pitchV) > 0.22;
-    const kB = moving ? 250 : 46;
+    const kB = (moving ? 250 : 46) * this.stiff;
     const k = kB * this.form;
     const c = 2 * Math.sqrt(kB * this.form) * (moving ? 0.98 : 0.9);
     const f = this.form;
@@ -2095,8 +2136,18 @@ export class Field {
          坐标已是屏幕系，必须绕开上面的 ry/tilt，否则画会被球体拖着转。 */
       const isDraw = drawLive && this.drawUse[i] === 1 && this.drawD[i] <= drawProg + 0.001;
       if (isDraw) {
-        tx = this.drawX[i];
-        ty = this.drawY[i];
+        /* 相干度：目标按每点固定的噪声方向被推开，位移 ∝ (1-coh)。
+           线性而不是平方 —— 平方在 coh 0.8 时只推 1.5px，看上去像"有点糊"，
+           要到 0.2 才突然炸开；线性是"一开口就散"，让溶解的前半段也有信息。 */
+        const loose = 1 - this.coh;
+        if (loose > 0.001) {
+          const push = loose * 40;
+          tx = this.drawX[i] + this.jit[i * 2] * push;
+          ty = this.drawY[i] + this.jit[i * 2 + 1] * push;
+        } else {
+          tx = this.drawX[i];
+          ty = this.drawY[i];
+        }
         z2 = 0;
         strK = 0;
         dirX = 0;
@@ -2148,6 +2199,9 @@ export class Field {
           rev = clamp(el / 450, 0, 1);
         }
         sa = this.drawA[i] * drawMix * rev;
+        /* 溶解时亮度也掉：点摊开了，密度本来就在降，亮度不跟着降就只是"变模糊"，
+           不是"失去结构"。0.35 是保底 —— 场不能空，空的瞬间看起来像断了。 */
+        if (this.coh < 0.999) sa *= 0.35 + 0.65 * this.coh;
         ss = this.drawS[i];
       } else {
         /* occ：有窗口时压暗 —— 但改道到日冕之后（auraW→1）就不压了，

@@ -5,8 +5,8 @@
 <title>逐帧</title>
 <style>
   html, body { margin: 0; background: #04070d; overflow: hidden; }
-  #row { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px; }
-  .cell { flex: 0 0 calc(33.333% - 7px); }
+  #row { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 20px 16px; }
+  .cell { flex: 0 0 calc(var(--w) - 8px); }
   .cell img {
     width: 100%; display: block; border-radius: 6px;
     border: 1px solid rgba(148, 178, 255, 0.12);
@@ -24,6 +24,8 @@
   const q = new URLSearchParams(location.search);
   const files = (q.get('f') || '').split(',').filter(Boolean);
   const labels = (q.get('l') || '').split(',');
+  const rows = Math.max(1, Number(q.get('c') || 3));
+  document.getElementById('row').style.setProperty('--w', `${100 / rows}%`);
   const row = document.getElementById('row');
   files.forEach((f, i) => {
     const d = document.createElement('div');

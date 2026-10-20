@@ -16,7 +16,10 @@
  *   fork       二选一 → 两股流
  *   turbulence 异常 → 局部湍流
  *   condense   读数 → 凝聚成字
- *   trace      历史 → 尾迹（未实现）
+ *   trace      时间序列 → 曲线 + 扫掠头（历史靠"余晖"免费留在场里）
+ *
+ * 三个动词之外还有第四个：transition(next) —— 相变换页（溶解 → 重组）。
+ * 它不是"两套 UI 交叉淡入淡出"，而是把相干度压到 0、换几何、再拉回 1。
  */
 
 import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
@@ -64,8 +67,15 @@ export class FieldScene {
     this.layers = new Map();     // id -> { spec, nodes }
     this.texts = [];             // ParticleText
     this.flows = [];             // { idx:Uint16Array, path, speed, span, s0 }
+    this.traces = [];            // 时间序列（曲线 + 扫掠头）
     this.t = 0;
     this.rev = 0;
+    this.tr = null;              // 进行中的相变
+    this.a11y = o.a11y || null;  // 可访问性镜像层（见 aria.js）
+    /* 系统级降低动态：场的"活着"本身是动态，所以这里只能减幅不能归零，
+       否则"流到哪了"这种信息就没了。 */
+    this.reduced = typeof matchMedia === 'function'
+      && matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
   /** 布局：整场重建。幂等，可以反复调用。 */
@@ -76,11 +86,13 @@ export class FieldScene {
     this.layers.clear();
     this.texts.length = 0;
     this.flows.length = 0;
+    this.traces.length = 0;
     this.rev = spec.rev ?? this.rev + 1;
 
     /* 全局相干度基调：calm 静一点，alert 抖一点。抖动在后面逐帧加，
        这里先记住幅度（0 = 完全不抖）。 */
     this.jitter = spec.mood === 'alert' ? 1.1 : spec.mood === 'working' ? 0.55 : 0.3;
+    if (this.reduced) this.jitter *= 0.35;
 
     f.slotBegin({ dim: 0.97, dot: 0.95 });
 
@@ -93,6 +105,8 @@ export class FieldScene {
     gauges.forEach((l, i) => this._gauge(l, i, gauges.length, a));
 
     list.filter((l) => l.kind === 'stream').forEach((l, i) => this._stream(l, i, a));
+
+    list.filter((l) => l.kind === 'trace').forEach((l, i) => this._trace(l, i, a));
 
     const forks = list.filter((l) => l.kind === 'fork');
     forks.forEach((l) => this._fork(l, a));
@@ -107,7 +121,37 @@ export class FieldScene {
 
     this.spec = spec;
     this.focus = focus;
+    if (this.a11y && !this._noAnnounce) this.a11y.announce(spec, { force: true });
     return this;
+  }
+
+  /**
+   * 相变换页：溶解 → 重组。
+   *
+   * 为什么不叠两套状态层：那需要一个"出场容器"和"入场容器"，两套布局、两次槽位分配，
+   * 而且要处理"旧的在淡出、新的已可点"这段混乱期。场里不需要 ——
+   * 相干度压到 0 时，旧结构自己就不成立了；换完几何再拉回 1，新结构自己长出来。
+   * 全程同一批粒子，中途没有任何一刻是"两个界面同时在屏幕上"。
+   *
+   * @param {object} spec 新场景
+   * @param {{outMs?:number, inMs?:number}} [opt]
+   */
+  transition(spec, opt = {}) {
+    const from = this.field.coh;
+    this.tr = {
+      spec,
+      phase: 'out',
+      t: 0,
+      from,
+      /* 从当前相干度出发，时长按比例缩 —— 半途被新景打断时不会先"补满"再溶 */
+      outMs: Math.max(80, (opt.outMs ?? 380) * from),
+      inMs: opt.inMs ?? 760,
+    };
+    return this;
+  }
+
+  get busy() {
+    return this.tr != null;
   }
 
   /** 只改数值，不重排（进度推进、指标刷新走这里） */
@@ -125,7 +169,15 @@ export class FieldScene {
         this._gauge(layer.spec, layer.i, layer.n, this.area, layer);
         if (layer.detail) this._detail(layer.spec, this.area, layer);
       }
+      if (op.data != null && layer.spec.kind === 'trace') {
+        /* 换一批数据 = 每条曲线的目标高度变了。**不重画**，只改目标：
+           弹簧自己会把整条曲线滑过去（DOM 里要逐点 FLIP 才做得到）。 */
+        layer.spec.data = op.data;
+        this._tracePoints(layer);
+        if (layer.now) layer.now.set(`${Math.round((op.data[op.data.length - 1] ?? 0) * 100)}%`);
+      }
     }
+    if (this.a11y) this.a11y.announce(this.spec);
     return this;
   }
 
@@ -152,14 +204,50 @@ export class FieldScene {
     } else if (kind === 'settle') {
       f.impulse(p.x, p.y, { r: 300, power: 90 });
     }
+    if (this.a11y) this.a11y.event(kind, opt);
     return this;
   }
 
-  /** 每帧：让"流"真的在流。这是 DOM 给不了的部分。 */
+  /** 每帧：让"流"真的在流，推进相变，扫掠 tail 的头。这是 DOM 给不了的部分。 */
   step(dt) {
     this.t += dt;
     const f = this.field;
     const t = this.t;
+
+    /* ── 相变时钟 ──
+       和物理共用 dt，所以冻结物理时它也冻住，可以逐帧取样。 */
+    const tr = this.tr;
+    if (tr) {
+      tr.t += dt * 1000;
+      if (tr.phase === 'out') {
+        const k = clamp(tr.t / tr.outMs, 0, 1);
+        f.setCoherence(tr.from * (1 - k * k));   // 慢起步、越散越快
+        if (k >= 1) {
+          f.setCoherence(0);
+          this._noAnnounce = true;
+          this.set(tr.spec);                        // 几何换掉，此时相干度还是 0
+          this._noAnnounce = false;
+          tr.phase = 'in';
+          tr.t = 0;
+        }
+      } else {
+        const k = clamp(tr.t / tr.inMs, 0, 1);
+        f.setCoherence(1 - Math.pow(1 - k, 3));     // 快起步、慢慢收
+        /* 重组阶段提刚度：相干度 0.8s 就回 1，而平时的弹簧要走 1.2s 才落定，
+           不提就会"已经宣布成形、字形还在抖"。
+           注意**不能**写成随 k 衰减回 1：正好在收尾最需要硬的时候变软了，
+           实测平均位置误差停在 6px（点距才 2.4px），看着就是"毛边"。 */
+        f.setStiff(2.4);
+        if (k >= 1) {
+          f.setCoherence(1);
+          f.setStiff(1);
+          this.tr = null;
+          if (this.a11y) this.a11y.announce(this.spec, { force: true });
+        }
+      }
+    }
+
+    const slow = this.reduced ? 0.35 : 1;
     for (const fl of this.flows) {
       const { idx, s0, s1, speed, path, jitter } = fl;
       for (let k = 0; k < idx.length; k++) {
@@ -167,12 +255,34 @@ export class FieldScene {
            之后的段以 speed 流过，视觉上就是"还没到的地方在流"。 */
         const span = 1 - s0;
         if (span <= 0.001) continue;
-        let s = s0 + (((k / idx.length) * span + t * speed) % span);
+        let s = s0 + (((k / idx.length) * span + t * speed * slow) % span);
         const p = path(s);
         const w = jitter * Math.sin(t * 3.1 + k * 2.7) * 4;
         const i = idx[k];
         f.drawX[i] = p.x + w - f.W * 0.5;
         f.drawY[i] = f.H * 0.5 - (p.y + Math.cos(t * 2.3 + k) * w);
+      }
+    }
+
+    /* ── trace：扫掠头 + 逐点余晖 ──
+       数据本身不动，动的只是"哪一段被照亮"。这一点很关键：
+       DOM 里要让一条曲线持续活着，你得逐帧重算 path；这里只是改亮度。 */
+    for (const tl of this.traces) {
+      const { idx, xs, ys, N } = tl;
+      const head = ((t * 0.13 * slow) % 1.35) - 0.18;    // 走出右边界再绕回来
+      const boostR = 0.10;
+      for (let k = 0; k < N; k++) {
+        const s = k / (N - 1);
+        const i = idx[k];
+        const g = Math.exp(-((s - head) * (s - head)) / (2 * boostR * boostR));
+        const drift = Math.sin(s * 9 + t * 1.1) * 1.4;
+        f.drawX[i] = xs[k] - f.W * 0.5;
+        f.drawY[i] = f.H * 0.5 - (ys[k] + drift - g * 3.5);
+        /* 余晖：越靠右（越新）越亮；扫掠头再叠一层高光。
+           于是"时间"这个维度没占任何额外槽位 —— 它就是亮度。 */
+        /* 扫掠头不只是更亮，还被"抬起来"3.5px —— 于是它读作一个正在移动的东西，
+           而不是一段碰巧更亮的点。 */
+        f.drawA[i] = Math.min(1.35, 0.48 + 0.46 * Math.pow(s, 0.7) + 1.15 * g) * (tl.spec.fill ?? 1);
       }
     }
   }
@@ -316,6 +426,105 @@ export class FieldScene {
     return layer;
   }
 
+  /**
+   * 时间序列：一条曲线 + 一个扫掠头。
+   *
+   * 这个编码器是"历史免费"那句话的实证：曲线的形状就是数据，**时间维度用亮度编码**
+   * （越靠右越新、越亮），没有刻度、没有网格、没有单独的"现在"标记 —— 却随时能看出
+   * 哪段是刚才、哪段很久了。DOM 要表达同一件事得画折线 + 轴 + 高亮段。
+   */
+  _trace(spec, i, a) {
+    const f = this.field;
+    const N = 280;
+    const x0 = a.x + 70;
+    const x1 = a.x + a.w - 70;
+    const yTop = a.y + 244;
+    const yBase = a.y + 408;
+
+    const layer = this.layers.get(spec.id) || {};
+    layer.spec = spec;
+    layer.N = N;
+    layer.box = { x0, x1, yTop, yBase };
+    layer.anchor = { x: (x0 + x1) / 2, y: yTop - 34 };
+    this.layers.set(spec.id, layer);
+
+    if (layer.base == null) {
+      layer.base = this.alloc.alloc(N, `trace-${spec.id}`);
+      layer.idx = Uint16Array.from({ length: N }, (_, k) => ((layer.base + k) * 7919 + 13) % 6400);
+    }
+    this._tracePoints(layer);
+
+    /* 地平线：72 颗极暗的点标出"零"在哪。没有它，曲线是一条飘着的划痕，
+       有它才读得出"离底多远"。这是整套设计里最便宜的一笔（72 槽位）。 */
+    if (layer.axisBase == null) {
+      layer.axisBase = this.alloc.alloc(72, `trace-axis-${spec.id}`);
+      const ax = [];
+      for (let k = 0; k < 72; k++) ax.push({ x: x0 + (x1 - x0) * (k / 71), y: yBase, ink: 0.5 });
+      f.slotPut(layer.axisBase, ax, rgb(COL.line), 0.7);
+    }
+
+    if (!layer.label) {
+      layer.label = new ParticleText({
+        field: f, alloc: this.alloc, x: x0, y: yTop - 30, size: 17, max: 12,
+        color: '#93b8d8', font: FONT, label: `tr-${spec.id}`,
+      });
+      layer.now = new ParticleText({
+        field: f, alloc: this.alloc, x: x1, y: yTop - 30, size: 20, max: 6,
+        color: COL.ink, align: 'right', font: FONT_LAT, label: `trn-${spec.id}`,
+      });
+    }
+    layer.label.set(spec.label || '');
+    const d = spec.data || [];
+    layer.now.set(`${Math.round((d[d.length - 1] ?? 0) * 100)}%`);
+    this.traces.push(layer);
+    return layer;
+  }
+
+  /** 把数据重采样到 N 个点，写进槽位。patch 换数据时也走这里 —— 只改目标，弹簧负责滑过去。 */
+  _tracePoints(layer) {
+    const { x0, x1, yTop, yBase } = layer.box;
+    const N = layer.N;
+    const data = (layer.spec.data || []).map((v) => clamp(Number(v) || 0, 0, 1));
+    const M = data.length;
+
+    /* 纵向标度。缺省自适应（数据峰值的 1.2 倍，向上取到 0.1 的整数倍），
+       否则 0~56% 的数据铺在 0~100% 的格子里，曲线永远贴着地平线。
+       要绝对标度就传 axis:[0,1] —— 那是语义（"这是百分比负载"），该由模型说。 */
+    let lo = 0;
+    let hi = 1;
+    if (Array.isArray(layer.spec.axis) && layer.spec.axis.length === 2) {
+      lo = Number(layer.spec.axis[0]);
+      hi = Number(layer.spec.axis[1]);
+    } else if (M > 1) {
+      hi = Math.max(0.3, Math.ceil(Math.max(...data) * 12) / 10);
+    }
+    if (hi - lo < 1e-3) hi = lo + 1;
+    if (!layer.xs) {
+      layer.xs = new Float32Array(N);
+      layer.ys = new Float32Array(N);
+    }
+    const pts = [];
+    for (let k = 0; k < N; k++) {
+      const s = k / (N - 1);
+      let v = 0.5;
+      if (M === 1) v = data[0];
+      else if (M > 1) {
+        const p = s * (M - 1);
+        const i0 = Math.floor(p);
+        const i1 = Math.min(M - 1, i0 + 1);
+        v = data[i0] + (data[i1] - data[i0]) * (p - i0);
+      }
+      const x = x0 + (x1 - x0) * s;
+      const y = yBase - clamp((v - lo) / (hi - lo), 0, 1.06) * (yBase - yTop);
+      layer.xs[k] = x;
+      layer.ys[k] = y;
+      /* ink 只用于首帧：之后 step() 每帧按余晖重算亮度 */
+      pts.push({ x, y, ink: 0.35 + 0.6 * s });
+    }
+    this.field.slotPut(layer.base, pts, rgb(layer.spec.color || COL.accent), 1);
+    return pts;
+  }
+
   /** 分叉：两股流从一点分开，越靠外越散；光标是第三个吸引子 */
   _fork(spec, a) {
     const cx = a.x + a.w / 2;
@@ -396,16 +605,18 @@ export class FieldScene {
   _detail(layer, a) {
     const f = this.field;
     const p = layer.anchor || { x: a.x + a.w / 2, y: a.y + 200 };
-    if (!layer.detailText) {
-      layer.detailText = new ParticleText({
-        field: f, alloc: this.alloc, x: p.x, y: p.y + 40, size: 17, max: 16,
-        color: COL.ink, align: 'center', font: FONT, label: `d-${layer.spec.id}`,
-      });
-    }
     const s = layer.spec;
     const txt = s.detail || (s.kind === 'stream'
       ? `${Math.round((s.progress ?? 0) * 100)}% · ${s.rate || ''}`
       : '');
+    /* 没东西可写就别占槽位：一行 16 字的预算够写三个仪表盘的标签 */
+    if (!txt && !layer.detailText) return;
+    if (!layer.detailText) {
+      layer.detailText = new ParticleText({
+        field: f, alloc: this.alloc, x: p.x, y: p.y + 40, size: 17, max: 16,
+        color: COL.ink, align: 'center', font: FONT, label: `d-${s.id}`,
+      });
+    }
     layer.detailText.set(txt);
   }
 

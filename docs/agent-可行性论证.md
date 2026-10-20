@@ -264,7 +264,16 @@ agent 输出的是**数据描述**，不是 HTML。三个理由：安全（渲�
 
 `shell/test-pui.html` 已接上三件事：光标势阱、按钮按下冲量、打字就地凝结。截图拍不出惯性，所以加了一个**冻结抓帧**的开关（`?pulse=x,y&freeze=ms`：物理跑到第 ms 毫秒就 `dt=0`，画面继续画），同一场扰动可以逐帧取样 —— `docs/images/pui-pulse-strip.png` 是把 0/50/130/260/480ms 拼在一起的对照。
 
-还没做的：数值的"体积化"、进度的"沉积"、决策的"两股流"、相变式的换页。这几样才是这套语法的重点，现在只搭了地基。
+**这四样都已经落地了**（`shell/src/scene.js` + `aria.js`，规格与实测见 `docs/场界面-设计与接口.md`）：
+
+- 数值的体积化 → `gauge`（环形沉积量 + 中心读数，两种编码互为校验）
+- 进度的沉积 → `stream`（沉积段 + 流动段，进度推进 = 多沉积几颗，不是重画一遍）
+- 决策的两股流 → `fork`（光标是第三个吸引子）
+- 相变换页 → `setCoherence` 溶解 → 换几何 → 重组（`docs/images/phase-strip.png` 六帧）
+- 历史免费留在场里 → `trace`（时间用亮度编码，不占槽位；`docs/images/trace-morph-strip.png`）
+- 可访问性 → `aria-live` 镜像层（顺带验证了"能翻译成人话"本身就是对 spec 的约束）
+
+接口随之定为**四个动词**：`scene_set` / `scene_patch` / `scene_pulse` / `scene_transition`。
 
 ## 5. 重心二：自造工具与技能
 

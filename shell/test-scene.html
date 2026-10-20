@@ -10,16 +10,23 @@
     position: fixed; left: 12px; top: 10px; color: #6d7e93;
     font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none;
   }
+  /* 可访问性镜像：视觉上不可见，但读屏软件读得到（不要用 display:none） */
+  #a11y {
+    position: fixed; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+  }
 </style>
 </head>
 <body>
-<canvas id="scene"></canvas>
+<canvas id="scene" aria-hidden="true"></canvas>
 <div id="hud"></div>
+<div id="a11y"></div>
 
 <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
 <script type="module">
 import { Field } from './src/field.js';
 import { FieldScene } from './src/scene.js';
+import { FieldA11y } from './src/aria.js';
 
 const f = new Field(document.getElementById('scene'));
 const hud = document.getElementById('hud');
@@ -32,11 +39,31 @@ const area = () => ({
   y: Math.round((innerHeight - AREA.h) / 2) - 10,
 });
 
-/* ───────── 这就是"给模型的接口"的样子 ─────────
+const a11y = new FieldA11y(document.getElementById('a11y'));
+
+/* ───────── 7 天负载：84 段（每 2 小时一格），周四 21:00 有个尖峰 ───────── */
+function makeSeries(n = 84) {
+  const out = [];
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let k = 0; k < n; k++) {
+    const day = Math.floor(k / 12);
+    const hour = (k % 12) * 2;
+    let v = 0.24 + 0.12 * Math.sin((hour / 24) * Math.PI * 2 - 1) + rnd() * 0.07;
+    /* 尖峰必须占几个样本：84 个样本里只高两点，重采样到 280 点后就成了小鼓包 */
+    if (day === 3) v += 0.40 * Math.exp(-((hour - 20) ** 2) / 9);
+    out.push(Math.min(1, Math.max(0.03, v)));
+  }
+  return out;
+}
+const SERIES = makeSeries();
+
+/* ───────── 两个场景 —— 这就是"给模型的接口"的样子 ─────────
    模型只说语义：哪个是焦点、有几个指标、进度多少、是不是异常。
    角度、半径、点距、字号、槽位，全在 scene.js 里算。 */
-const SPEC = {
+const SPEC_A = {
   rev: 1,
+  title: '服务器状态',
   focus: 'job',
   mood: 'working',
   layers: [
@@ -49,16 +76,30 @@ const SPEC = {
       detail: '62% · 2.1 MB/s' },
     { id: 'choice', kind: 'fork', label: '要处理 n8n 重启吗',
       options: [{ id: 'yes', label: '重启 n8n' }, { id: 'no', label: '先看着' }] },
-    { id: 'n8n',  kind: 'turbulence', level: 0.4 },
+    { id: 'n8n',  kind: 'turbulence', label: 'n8n 重启', level: 0.4 },
   ],
 };
 
-const scene = new FieldScene({ field: f, area: area() });
+const SPEC_B = {
+  rev: 2,
+  title: '过去 7 天的负载',
+  focus: 'load',
+  mood: 'calm',
+  layers: [
+    { id: 'load', kind: 'trace', label: 'CPU · 7 天', data: SERIES },
+    { id: 'mem',  kind: 'gauge', label: '内存', value: 0.60 },
+    { id: 'disk', kind: 'gauge', label: '磁盘', value: 0.48, color: '#b9a6ff' },
+    { id: 'note', kind: 'condense', text: '周四 21:00 有一次尖峰' },
+  ],
+};
+
+let cur = q.get('scene') === 'b' ? 'B' : 'A';
+let SPEC = cur === 'A' ? SPEC_A : SPEC_B;
+const scene = new FieldScene({ field: f, area: area(), a11y });
 scene.set(SPEC);
 
 /* ───────── 交互：只放势阱 / 敲冲量，不写 hover 状态 ───────── */
 addEventListener('pointermove', (e) => {
-  const a = area();
   const x = e.clientX, y = e.clientY;
   const id = scene.hit(x, y);
   const wells = [{ x, y, r: 150, k: 380, swirl: 0.22 }];
@@ -74,29 +115,42 @@ addEventListener('pointerdown', (e) => {
   scene.pulse('confirm', { at: id || scene.focus });
 });
 
-/* 演示：进度自己往前走，观察"沉积" */
+/* 进度自己往前走：观察"沉积" */
 let auto = q.get('auto') === '1';
 let prog = Number(q.get('p') || 0.62);
-const timer = setInterval(() => {
-  if (!auto) return;
+setInterval(() => {
+  if (!auto || cur !== 'A') return;
   prog = Math.min(1, prog + 0.012);
   scene.patch([{ id: 'job', progress: prog }]);
   hudAll();
 }, 420);
 
+/* 曲线滑动：每次塞一个新样本，整条曲线随之平移 */
+let morph = q.get('morph') === '1';
+let seedNext = 11;
+setInterval(() => {
+  if (!morph || cur !== 'B') return;
+  seedNext = (seedNext * 16807) % 2147483647;
+  SERIES.push(0.22 + (seedNext / 2147483647) * 0.30);
+  SERIES.shift();
+  scene.patch([{ id: 'load', data: SERIES.slice() }]);
+  hudAll();
+}, 700);
+
 /* ───────── 主循环 ───────── */
 let last = performance.now();
 let frames = 0;
 let fpsT = 0;
-let pulseAt = 0;
+let freezeFrom = 0;
 const FREEZE = Number(q.get('freeze') || 0);
 
 function hudAll(extra = '') {
   hud.textContent = [
-    `scene    ${scene.rev} rev · focus=${scene.focus} · mood=${SPEC.mood}`,
+    `scene    ${scene.rev} rev · ${cur} · focus=${scene.focus} · mood=${SPEC.mood}`,
     `slots    ${scene.alloc.used} / 6400`,
-    `layers   ${scene.layers.size} · flows ${scene.flows.length}`,
-    `progress ${Math.round(prog * 100)}%`,
+    `layers   ${scene.layers.size} · flows ${scene.flows.length} · traces ${scene.traces.length}`,
+    `coh      ${f.coh.toFixed(2)}${scene.busy ? ' (transition)' : ''} · progress ${Math.round(prog * 100)}%`,
+    `aria     ${a11y.text}`,
     extra,
   ].join('\n');
 }
@@ -105,27 +159,78 @@ hudAll();
 function loop(now) {
   let dt = Math.min((now - last) / 1000, 0.05);
   last = now;
-  if (FREEZE && pulseAt && now - pulseAt > FREEZE) dt = 0;
+  if (FREEZE && freezeFrom && now - freezeFrom > FREEZE) dt = 0;
   f.step(dt);
   scene.step(dt);
   f.render();
   frames++;
   fpsT += dt;
-  if (fpsT > 0.5) { window.__fps = Math.round(frames / fpsT); frames = 0; fpsT = 0; }
+  if (fpsT > 0.5) {
+    window.__fps = Math.round(frames / fpsT);
+    frames = 0; fpsT = 0;
+    hudAll();
+  }
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
 
-/* 截图/自动化 */
+/* ───────── 截图 / 自动化钩子 ───────── */
+function go(which) {
+  const next = which === 'B' ? SPEC_B : SPEC_A;
+  cur = which;
+  SPEC = next;
+  scene.transition(next, { outMs: Number(q.get('outMs') || 380), inMs: Number(q.get('inMs') || 820) });
+  freezeFrom = performance.now();
+  hudAll();
+}
+
+if (q.get('to')) setTimeout(() => go(q.get('to').toUpperCase()), Number(q.get('delay') || 1400));
 if (q.get('pulse')) {
   const kind = q.get('pulse');
-  setTimeout(() => { scene.pulse(kind, { at: q.get('at') }); pulseAt = performance.now(); },
-    Number(q.get('delay') || 1600));
+  setTimeout(() => { scene.pulse(kind, { at: q.get('at') }); freezeFrom = performance.now(); },
+    Number(q.get('pdelay') || 1600));
 }
+
+/* 一次"数据跳变"：整条曲线随新数据滑过去（弹簧的事，不需要逐点 FLIP） */
+if (q.get('jump')) {
+  setTimeout(() => {
+    const d = SERIES.map((v, i) => Math.min(1, v + (i > SERIES.length - 34 ? 0.32 : 0.06)));
+    scene.patch([{ id: 'load', data: d }]);
+    freezeFrom = performance.now();
+  }, Number(q.get('jdelay') || 2000));
+}
+
 window.__scene = scene;
+window.__field = f;
+window.__a11y = a11y;
+window.__to = go;
 window.__patch = (h) => { scene.patch([{ id: 'job', progress: h }]); prog = h; hudAll(); };
-window.__pulse = (k, at) => { scene.pulse(k, { at }); pulseAt = performance.now(); };
+window.__pulse = (k, at) => { scene.pulse(k, { at }); freezeFrom = performance.now(); };
 window.__spec = SPEC;
+
+/* 自检：连着打断相变，看终态是否干净（没有停在中途、没有刚度没复位） */
+if (q.get('selftest') === '1') {
+  const t0 = performance.now();
+  setTimeout(() => go('B'), 200);
+  setTimeout(() => go('A'), 380);
+  setTimeout(() => go('B'), 520);
+  /* 顺带压一下 aria 节流：10 次 patch 应该只播 1~2 次 */
+  setTimeout(() => { for (let n = 1; n <= 10; n++) { prog = 0.6 + n * 0.01; scene.patch([{ id: 'job', progress: prog }]); } }, 900);
+  setTimeout(() => {
+    const out = {
+      ms: Math.round(performance.now() - t0),
+      coh: +f.coh.toFixed(3),
+      stiff: f.stiff,
+      busy: scene.busy,
+      rev: scene.rev,
+      slots: scene.alloc.used,
+      a11yCalls: a11y.log.length,
+      a11yText: a11y.log[a11y.log.length - 1]?.text?.slice(0, 24),
+    };
+    document.title = `SELFTEST ${JSON.stringify(out)}`;
+    hud.textContent = `SELFTEST ${JSON.stringify(out, null, 0)}`;
+  }, 3200);
+}
 </script>
 </body>
 </html>
