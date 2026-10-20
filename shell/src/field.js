@@ -461,15 +461,19 @@ export class Field {
       transparent: true,
       depthTest: false,
       depthWrite: false,
-      /* 纯加法发光 + 不写 alpha：
-       * 用 THREE.AdditiveBlending 时 alpha 也会被加满（每颗点写 1.0），
-       * 于是窗口里白底的 iframe 会被粒子"盖"成黑点 —— 这是加法混合最常见的坑。 */
+      /* 纯加法发光，但 **alpha 也要跟着累加**。
+       *
+       * 早先这里写的是 blendSrcAlpha: Zero —— 画布的 alpha 永远是 0，颜色全靠 RGB 累加。
+       * 那等于把"能不能看见"寄托在浏览器对「预乘 alpha 且 alpha=0」的宽容处理上：
+       * Chrome（D3D11）会直接把 RGB 加到底色上，所以看着正常；
+       * macOS 上的 ANGLE/Metal 走的是规范路径 —— alpha=0 就是完全透明，整张画布消失。
+       * 现在让 alpha 和 RGB 一起累加，任何后端都能正确合成（越亮越实）。 */
       blending: THREE.CustomBlending,
       blendEquation: THREE.AddEquation,
       blendSrc: THREE.OneFactor,
       blendDst: THREE.OneFactor,
       blendEquationAlpha: THREE.AddEquation,
-      blendSrcAlpha: THREE.ZeroFactor,
+      blendSrcAlpha: THREE.OneFactor,
       blendDstAlpha: THREE.OneFactor,
     });
 
@@ -533,7 +537,15 @@ export class Field {
     this.scene.add(this.railPoints);
     this.scene.add(this.statPoints);
 
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: true, powerPreference: 'high-performance' });
+    /* 有些驱动（macOS 双显卡 / 虚拟机）在显式要"高性能"时反而拿不到上下文，
+       直接退回默认配置再试一次 —— 页面完全起不来比掉几帧严重得多。 */
+    const opts = { canvas, antialias: false, alpha: true };
+    try {
+      this.renderer = new THREE.WebGLRenderer({ ...opts, powerPreference: 'high-performance' });
+    } catch (e) {
+      console.warn('[field] high-performance 上下文创建失败，退回默认', e);
+      this.renderer = new THREE.WebGLRenderer(opts);
+    }
     this.renderer.setClearColor(0x000000, 0);
 
     this.cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);

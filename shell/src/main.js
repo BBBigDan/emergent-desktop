@@ -11,7 +11,19 @@ import { createLauncher } from './launcher.js';
 import { createStatus } from './status.js';
 import { myApps, gotoLogin, logout, terminusBase } from './api.js';
 
-const field = new Field(document.getElementById('scene'));
+/* WebGL 起不来时别静默失败：整个桌面就只剩一块渐变背景，没有任何报错。
+   （macOS 上曾有这个问题：画布 alpha 一直是 0，ANGLE/Metal 按规范当全透明处理。） */
+let field = null;
+try {
+  field = new Field(document.getElementById('scene'));
+} catch (e) {
+  console.error('[shell] 粒子场初始化失败', e);
+  const el = document.createElement('div');
+  el.id = 'fatal';
+  el.textContent = 'WebGL 初始化失败：' + (e && e.message ? e.message : e);
+  document.body.appendChild(el);
+  throw e;
+}
 const wins = new Map();          // group -> ShellWindow
 const freeGroups = [2, 1, 0];    // 后进先出，避免和已有窗口抢同一组粒子
 const boot = document.getElementById('boot');
@@ -248,3 +260,44 @@ window.addEventListener('keydown', (e) => {
     _esc();
   }
 });
+
+
+/* ------------------------------- 诊断 -------------------------------
+ * ?diag=1 在左上角摊开 WebGL 的真实情况 —— 专治"某个浏览器上看不到粒子"
+ * 这种没法远程复现的问题（尤其 macOS 的 ANGLE/Metal 和各家 GPU 驱动）。
+ * 只在显式带参数时出现，正常桌面一个字都没有。 */
+if (new URLSearchParams(location.search).has('diag')) {
+  const el = document.createElement('div');
+  el.id = 'diag';
+  document.body.appendChild(el);
+
+  const gl = field.renderer.getContext();
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  let frames = 0;
+  let fps = 0;
+  const tick = () => { frames++; requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+  setInterval(() => { fps = frames; frames = 0; }, 1000);
+
+  const rows = () => {
+    const ca = gl.getContextAttributes() || {};
+    const info = field.renderer.info;
+    return [
+      ['UA', navigator.userAgent],
+      ['viewport', `${innerWidth}×${innerHeight} @${devicePixelRatio}x`],
+      ['canvas', `${field.canvas.width}×${field.canvas.height} · css ${field.canvas.style.width}×${field.canvas.style.height}`],
+      ['gl', gl.getParameter(gl.VERSION)],
+      ['gpu', dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(no debug ext)'],
+      ['ctx', `alpha=${ca.alpha} premultiplied=${ca.premultipliedAlpha} depth=${ca.depth}`],
+      ['points', `${field.geo.attributes.position.count} 个顶点 · ${info.render.calls} draw calls`],
+      ['blend', `src=${field.mat.blendSrc} dst=${field.mat.blendDst} srcA=${field.mat.blendSrcAlpha}`],
+      ['fps', String(fps)],
+    ];
+  };
+
+  const paint = () => {
+    el.textContent = rows().map(([k, v]) => `${k.padEnd(9)}${v}`).join('\n');
+  };
+  paint();
+  setInterval(paint, 700);
+}

@@ -179,9 +179,10 @@ async function main() {
   const settle = (id) => ev(`(()=>{const f=__em.field;f.shapeId=${id};f.shapeT=0;f.shapeSeed=0.35;`
     + `f.computeShape();f.shapeAt=f.time-5;f.beatNext=1e9;f.beatT=0.5;return 'ok'})()`);
 
-  /* 1. 桌面空闲态 */
+  /* 1. 桌面空闲态：光标要停在"哪儿都不触发"的位置
+     （右下 168px 是状态面板的触发区，停那儿会把面板展开进画面） */
   await settle(0);
-  await mouse(1330, 800);
+  await mouse(700, 300);
   await sleep(1800);
   await shot('shell-desktop');
 
