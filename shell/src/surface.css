@@ -1,0 +1,319 @@
+/**
+ * 渲染树的组件样式。
+ *
+ * 这是 agent 唯一的"输出通道"，所以它必须长得像桌面的一部分：
+ * 同一套冷蓝、同一档字号（13px / 1.6）、同样的 1px 发丝线与毛玻璃按钮。
+ * 模型只决定「是什么」，这里决定「长什么样」—— 这就是不用 HTML 的收益。
+ */
+
+.surface {
+  --s-text: rgba(228, 238, 255, 0.92);
+  --s-dim: rgba(228, 238, 255, 0.56);
+  --s-dim2: rgba(228, 238, 255, 0.34);
+  --s-line: rgba(148, 178, 255, 0.14);
+  --s-line2: rgba(148, 178, 255, 0.24);
+  --s-accent: #6fc6ff;
+  --s-ok: #4ee0c8;
+  --s-warn: #ffb257;
+  --s-bad: #ff7c93;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: var(--s-text);
+  font-size: 13px;
+  line-height: 1.62;
+  font-variant-numeric: tabular-nums;
+}
+
+.sf-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 20px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 178, 255, 0.22) transparent;
+}
+.sf-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.sf-scroll::-webkit-scrollbar-thumb { background: rgba(148, 178, 255, 0.2); border-radius: 4px; }
+
+.sf-head { margin-bottom: 14px; }
+.sf-title {
+  font-size: 15px; font-weight: 600; letter-spacing: 0.01em;
+  color: rgba(240, 246, 255, 0.96);
+}
+.sf-sub { margin-top: 3px; font-size: 12px; color: var(--s-dim2); }
+
+/* ── 文本 ── */
+.sf-text p { margin: 0 0 8px; }
+.sf-text p:last-child { margin-bottom: 0; }
+.sf-text strong { font-weight: 600; color: rgba(244, 249, 255, 0.98); }
+.sf-text del { color: var(--s-dim2); }
+.sf-code-inline {
+  padding: 1px 5px; border-radius: 4px; font-size: 12px;
+  background: rgba(96, 190, 255, 0.09);
+  border: 1px solid rgba(96, 190, 255, 0.12);
+  color: #a8dcff;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ── 代码 ── */
+.sf-codebox {
+  margin: 10px 0; border: 1px solid var(--s-line); border-radius: 10px;
+  background: rgba(4, 10, 20, 0.55); overflow: hidden;
+}
+.sf-codehead {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px; border-bottom: 1px solid var(--s-line);
+  background: rgba(96, 190, 255, 0.04);
+}
+.sf-lang {
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--s-dim2); font-family: ui-monospace, Menlo, monospace;
+}
+.sf-codehead .sf-mini { margin-left: auto; }
+.sf-pre {
+  margin: 0; padding: 10px 12px; overflow: auto; max-height: 320px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.58; color: rgba(214, 232, 255, 0.88);
+  white-space: pre; tab-size: 2;
+}
+
+/* ── 表格 ── */
+.sf-tablebox { margin: 10px 0; }
+.sf-table { width: 100%; border-collapse: collapse; }
+.sf-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  padding: 6px 10px; text-align: left; font-weight: 500; font-size: 11.5px;
+  color: var(--s-dim2); letter-spacing: 0.02em;
+  border-bottom: 1px solid var(--s-line2);
+  background: rgba(6, 12, 22, 0.92);
+  backdrop-filter: blur(6px);
+}
+.sf-table td {
+  padding: 7px 10px; border-bottom: 1px solid rgba(148, 178, 255, 0.08);
+  vertical-align: middle; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 320px;
+}
+.sf-table tbody tr:last-child td { border-bottom: 0; }
+.sf-table tbody tr:hover td { background: rgba(96, 190, 255, 0.055); }
+.sf-right { text-align: right; }
+.sf-mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.sf-rowact { width: 1%; }
+/* 行内动作平时半隐：既告诉人「这行能操作」，又不让表格变成一排按钮墙 */
+.sf-rowact .sf-mini { opacity: 0.42; transition: opacity 0.15s; }
+tr:hover .sf-rowact .sf-mini { opacity: 1; }
+.sf-tablefoot {
+  margin-top: 8px; font-size: 12px; color: var(--s-dim2);
+}
+.sf-tablefoot > div > p { margin: 0; }
+
+/* 列内条：面积表用，一眼看出哪行最占地方。
+   右对齐列要连条一起靠右，否则数字贴着条、整列却在右边悬空。 */
+.sf-cellbar { display: flex; align-items: center; gap: 8px; }
+.sf-right .sf-cellbar { justify-content: flex-end; }
+.sf-cellbar > i {
+  height: 6px; border-radius: 3px; max-width: 96px; min-width: 2px;
+  background: linear-gradient(90deg, rgba(111, 198, 255, 0.55), rgba(78, 224, 200, 0.45));
+}
+.sf-cellbar > span { font-variant-numeric: tabular-nums; min-width: 2.6em; }
+
+/* 状态胶囊：判断列（正常 / 注意 / 失败）用，颜色由 tone 决定 */
+.sf-badge {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 11.5px; line-height: 1.5; white-space: nowrap;
+  border: 1px solid transparent;
+}
+.sf-badge.t-ok { color: #8ce8cd; background: rgba(78, 224, 200, 0.10); border-color: rgba(78, 224, 200, 0.22); }
+.sf-badge.t-warn { color: #ffcf9a; background: rgba(255, 178, 87, 0.11); border-color: rgba(255, 178, 87, 0.24); }
+.sf-badge.t-bad { color: #ffadb9; background: rgba(255, 124, 147, 0.11); border-color: rgba(255, 124, 147, 0.24); }
+.sf-badge.t-info { color: #a6d8ff; background: rgba(111, 198, 255, 0.10); border-color: rgba(111, 198, 255, 0.22); }
+
+/* ── 列表 ── */
+.sf-list { display: flex; flex-direction: column; margin: 8px 0; }
+.sf-li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 8px;
+  transition: background 0.14s;
+}
+.sf-li + .sf-li { box-shadow: inset 0 1px 0 rgba(148, 178, 255, 0.07); }
+.sf-li:hover { background: rgba(96, 190, 255, 0.055); }
+.sf-li-icon {
+  width: 6px; height: 6px; flex: none; border-radius: 50%;
+  background: rgba(111, 198, 255, 0.55);
+  box-shadow: 0 0 8px rgba(111, 198, 255, 0.5);
+  font-size: 0; color: transparent;   /* 传进来的符号只当装饰，不参与排版 */
+}
+.sf-li-body { min-width: 0; flex: 1; }
+.sf-li-title {
+  font-size: 13px; color: var(--s-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sf-li-sub { font-size: 11.5px; color: var(--s-dim2); }
+.sf-li-val { font-size: 12px; color: var(--s-dim); font-variant-numeric: tabular-nums; }
+
+/* ── 图表 ── */
+.sf-chart {
+  margin: 12px 0; padding: 10px 12px 6px;
+  border: 1px solid var(--s-line); border-radius: 12px;
+  background: linear-gradient(180deg, rgba(96, 190, 255, 0.045), rgba(96, 190, 255, 0.012));
+}
+.sf-chart-title { font-size: 12px; color: var(--s-dim); margin-bottom: 4px; }
+.sf-legend { display: flex; gap: 14px; margin-bottom: 2px; }
+.sf-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--s-dim2); }
+.sf-legend-item i { width: 7px; height: 7px; border-radius: 2px; }
+.sf-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.sf-note { margin-top: 6px; font-size: 12px; color: var(--s-dim); }
+
+/* ── 进度 ── */
+.sf-prog {
+  margin: 10px 0; padding: 12px 14px;
+  border: 1px solid var(--s-line); border-radius: 12px;
+  background: rgba(96, 190, 255, 0.035);
+}
+.sf-prog-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.sf-prog-label { font-size: 13px; }
+.sf-prog-num { margin-left: auto; font-size: 12px; color: var(--s-accent); }
+.sf-track {
+  height: 5px; border-radius: 3px; overflow: hidden;
+  background: rgba(148, 178, 255, 0.12);
+}
+.sf-track > i {
+  display: block; height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, #4aa8ff, #6fe6d8);
+  box-shadow: 0 0 10px rgba(111, 198, 255, 0.45);
+  transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.sf-track > i.sf-done { background: linear-gradient(90deg, #37c39d, #6fe6d8); }
+.sf-track > i.sf-err { background: linear-gradient(90deg, #d2546b, #ff7c93); box-shadow: none; }
+.sf-prog-detail { margin-top: 7px; font-size: 11.5px; color: var(--s-dim2); }
+.sf-steps { margin-top: 10px; display: flex; flex-direction: column; gap: 3px; }
+.sf-step { display: flex; gap: 8px; font-size: 12px; color: var(--s-dim2); }
+.sf-step-mark { width: 12px; text-align: center; }
+.sf-step-mark.sf-done { color: var(--s-ok); }
+.sf-step-mark.sf-active { color: var(--s-accent); }
+.sf-step-mark.sf-todo { opacity: 0.45; }
+.sf-step:has(.sf-active) .sf-step-text { color: var(--s-text); }
+
+/* ── 审批 ── */
+.sf-approval {
+  margin: 10px 0; padding: 13px 15px;
+  border: 1px solid rgba(255, 178, 87, 0.26); border-radius: 12px;
+  background: linear-gradient(180deg, rgba(255, 178, 87, 0.075), rgba(255, 178, 87, 0.02));
+}
+.sf-ap-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.sf-ap-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--s-warn);
+  box-shadow: 0 0 9px rgba(255, 178, 87, 0.7);
+}
+.sf-ap-title { font-size: 13px; font-weight: 600; color: #ffd9a8; }
+.sf-approval .sf-text { font-size: 12.5px; color: rgba(255, 240, 222, 0.82); }
+.sf-approval .sf-pre { background: rgba(0, 0, 0, 0.35); border-radius: 8px; margin-top: 8px; }
+.sf-diff > div { padding: 0 4px; border-radius: 3px; }
+.sf-diff .sf-add { color: #86e6b8; background: rgba(70, 210, 150, 0.09); }
+.sf-diff .sf-del { color: #ff9aa8; background: rgba(255, 110, 130, 0.09); }
+
+/* ── 按钮 ── */
+.sf-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.sf-btn {
+  padding: 6px 14px; border-radius: 8px; cursor: pointer;
+  font-size: 12.5px; font-family: inherit; color: var(--s-text);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(148, 178, 255, 0.2);
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+}
+.sf-btn:hover { background: rgba(96, 190, 255, 0.13); border-color: rgba(148, 198, 255, 0.4); }
+.sf-btn:active { transform: translateY(1px); }
+.sf-btn.sf-primary {
+  color: #eaf7ff;
+  background: linear-gradient(180deg, rgba(64, 150, 235, 0.42), rgba(40, 110, 200, 0.34));
+  border-color: rgba(120, 195, 255, 0.5);
+  box-shadow: 0 0 14px rgba(70, 160, 250, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.13);
+}
+.sf-btn.sf-primary:hover { background: linear-gradient(180deg, rgba(80, 168, 250, 0.5), rgba(48, 122, 214, 0.4)); }
+.sf-btn.sf-danger { color: #ffd0d7; border-color: rgba(255, 124, 147, 0.36); }
+.sf-btn.sf-danger:hover { background: rgba(255, 124, 147, 0.14); }
+.sf-btn.sf-busy { opacity: 0.55; pointer-events: none; }
+.sf-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.sf-mini {
+  padding: 3px 9px; border-radius: 6px; cursor: pointer; font-family: inherit;
+  font-size: 11.5px; color: var(--s-dim);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(148, 178, 255, 0.16);
+  transition: all 0.15s;
+}
+.sf-mini:hover { color: var(--s-text); background: rgba(96, 190, 255, 0.14); border-color: rgba(148, 198, 255, 0.34); }
+.sf-mini:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── 表单 ── */
+.sf-form { display: flex; flex-direction: column; gap: 11px; margin: 10px 0; }
+.sf-field { display: flex; flex-direction: column; gap: 5px; }
+.sf-flabel { font-size: 12px; color: var(--s-dim); }
+.sf-req { color: var(--s-bad); font-style: normal; margin-left: 3px; }
+.sf-input {
+  padding: 7px 10px; border-radius: 8px; font-family: inherit; font-size: 13px;
+  color: var(--s-text); background: rgba(4, 10, 20, 0.5);
+  border: 1px solid rgba(148, 178, 255, 0.18);
+  outline: none; transition: border-color 0.15s, box-shadow 0.15s;
+  resize: vertical;
+}
+.sf-input:focus {
+  border-color: rgba(111, 198, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(111, 198, 255, 0.1);
+}
+.sf-check { width: 15px; height: 15px; accent-color: #4aa8ff; }
+
+/* select 用原生外观会很脏（系统箭头 + 浅色底），换成两个渐变拼的箭头 */
+select.sf-input {
+  appearance: none; -webkit-appearance: none;
+  padding-right: 28px; cursor: pointer;
+  background-image:
+    linear-gradient(45deg, transparent 50%, rgba(148, 178, 255, 0.6) 50%),
+    linear-gradient(135deg, rgba(148, 178, 255, 0.6) 50%, transparent 50%);
+  background-position: calc(100% - 15px) calc(50% + 1px), calc(100% - 10px) calc(50% + 1px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.sf-hint { font-size: 11.5px; color: var(--s-dim2); }
+
+/* ── 其他 ── */
+.sf-section { margin-bottom: 14px; }
+.sf-section:last-child { margin-bottom: 0; }
+.sf-h3 {
+  font-size: 12px; font-weight: 600; color: var(--s-dim);
+  letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 7px;
+}
+.sf-tabs { margin: 10px 0; }
+.sf-tabbar { display: flex; gap: 4px; border-bottom: 1px solid var(--s-line); margin-bottom: 10px; }
+.sf-tab {
+  padding: 5px 12px; border: 0; border-radius: 7px 7px 0 0; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; color: var(--s-dim2);
+  background: transparent;
+}
+.sf-tab:hover { color: var(--s-text); background: rgba(96, 190, 255, 0.07); }
+.sf-tab.on { color: var(--s-text); background: rgba(96, 190, 255, 0.11); box-shadow: inset 0 -1px 0 var(--s-accent); }
+.sf-fig { margin: 10px 0; }
+.sf-fig img { max-width: 100%; border-radius: 10px; display: block; }
+.sf-fig figcaption { margin-top: 6px; font-size: 11.5px; color: var(--s-dim2); }
+.sf-file {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px; border: 1px solid var(--s-line); border-radius: 10px;
+  background: rgba(96, 190, 255, 0.03); margin: 8px 0;
+}
+.sf-file-icon { color: var(--s-accent); }
+.sf-html { margin: 10px 0; }
+.sf-html-frame {
+  width: 100%; height: 320px; border: 1px solid var(--s-line); border-radius: 10px;
+  background: #06090f; display: block;
+}
+.sf-blocked {
+  margin: 8px 0; padding: 8px 11px; border-radius: 8px; font-size: 12px;
+  color: rgba(255, 178, 87, 0.86);
+  background: rgba(255, 178, 87, 0.07);
+  border: 1px dashed rgba(255, 178, 87, 0.25);
+}
+.sf-trunc {
+  padding: 6px 20px; font-size: 11.5px; color: var(--s-dim2);
+  border-top: 1px solid var(--s-line);
+}

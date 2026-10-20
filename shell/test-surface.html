@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>渲染树验收</title>
+<link rel="stylesheet" href="./src/surface.css" />
+<style>
+  html, body {
+    width: 100%; height: 100%; margin: 0; overflow: hidden;
+    background:
+      radial-gradient(58% 46% at 50% 52%, rgba(24, 80, 150, 0.30), transparent 72%),
+      radial-gradient(34% 30% at 50% 50%, rgba(46, 228, 216, 0.09), transparent 70%),
+      #04060c;
+    font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
+    color: rgba(228, 238, 255, 0.9);
+    user-select: none;
+  }
+  /* 仿真实窗口：18px 圆角 + 1px 内发光边 + 标题栏，尺寸取默认窗口的下限 */
+  #stage { position: absolute; inset: 0; display: grid; place-items: center; }
+  .demo {
+    width: 780px; height: 690px; border-radius: 18px; overflow: hidden;
+    position: relative; isolation: isolate;
+    background: linear-gradient(180deg, rgba(12, 22, 38, 0.86), rgba(6, 12, 22, 0.92));
+    border: 1px solid rgba(148, 178, 255, 0.13);
+    box-shadow: 0 0 26px rgba(88, 178, 255, 0.16), 0 26px 80px rgba(0, 0, 0, 0.55),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    display: flex; flex-direction: column;
+  }
+  .demo-bar {
+    height: 40px; flex: none; display: flex; align-items: center; gap: 9px;
+    padding: 0 12px 0 14px;
+    border-bottom: 1px solid rgba(148, 178, 255, 0.10);
+    background: rgba(8, 16, 28, 0.55);
+  }
+  .demo-bar i {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: linear-gradient(180deg, #6fc6ff, #3f7fd0);
+    box-shadow: 0 0 10px rgba(111, 198, 255, 0.7);
+  }
+  .demo-bar span { font-size: 12.5px; color: rgba(228, 238, 255, 0.66); letter-spacing: 0.02em; }
+  .demo-bar .btns { margin-left: auto; display: flex; gap: 4px; }
+  .demo-bar .btns b {
+    width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
+    color: rgba(228, 238, 255, 0.34); font-weight: 400; font-size: 12px;
+  }
+  #host { flex: 1; min-height: 0; }
+
+  /* 动作回灌日志：真实环境里这些会进 WS，这里只打在右下角 */
+  #log {
+    position: fixed; right: 16px; bottom: 14px; width: 380px; max-height: 132px;
+    overflow: hidden; padding: 8px 10px; border-radius: 10px;
+    background: rgba(4, 8, 14, 0.82); border: 1px solid rgba(148, 178, 255, 0.14);
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; line-height: 1.5;
+    color: rgba(160, 210, 255, 0.78); white-space: pre-wrap;
+  }
+  #log b { color: #ffcf8a; font-weight: 400; }
+</style>
+</head>
+<body>
+<div id="stage"><div class="demo">
+  <div class="demo-bar"><i></i><span id="wtitle">agent</span>
+    <span class="btns"><b>–</b><b>□</b><b>×</b></span>
+  </div>
+  <div id="host"></div>
+</div></div>
+<div id="log">动作回灌：</div>
+
+<script type="module">
+import { renderSurface } from './src/surface.js';
+
+const logEl = document.getElementById('log');
+function log(s) {
+  const line = document.createElement('div');
+  line.innerHTML = s;
+  logEl.appendChild(line);
+  while (logEl.childElementCount > 7) logEl.firstElementChild.remove();
+}
+
+const api = {
+  act({ tool, args, label }) {
+    log(`<b>tool</b> ${label || ''} → ${tool}(${JSON.stringify(args)})`);
+  },
+  ask(prompt, { label } = {}) {
+    log(`<b>ask</b> ${label || ''} → “${prompt}”`);
+  },
+};
+
+/* ── 场景 1：磁盘清理（表格 + 面积列 + 行内动作 + 审批） ── */
+const disk = {
+  title: 'Downloads 里最占地方的 10 个文件',
+  subtitle: '扫了 ~/Downloads · 2.4 GB / 1832 个文件 · 用时 0.8s',
+  root: { type: 'section', children: [
+    { type: 'text', md: '总占用 **2.4 GB**，其中前 4 个文件就占了 **61%**。`ubuntu-24.04.iso` 已经装过一次系统了，大概率可以删。' },
+    { type: 'table',
+      columns: [
+        { key: 'name', label: '文件' },
+        { key: 'size', label: '大小', align: 'right', bar: true, barMax: 620, mono: true },
+        { key: 'age', label: '最后修改', align: 'right' },
+      ],
+      rows: [
+        { name: 'ubuntu-24.04.1-desktop-amd64.iso', size: 581, age: '3 个月前',
+          actions: [{ label: '归档', tool: 'fs_move', args: { from: '~/Downloads/ubuntu-24.04.1-desktop-amd64.iso', to: '~/Agent/archive/' } }] },
+        { name: 'dataset-train-v3.tar.zst', size: 402, age: '2 周前',
+          actions: [{ label: '归档', tool: 'fs_move', args: { from: '~/Downloads/dataset-train-v3.tar.zst', to: '~/Agent/archive/' } }] },
+        { name: 'Olares-Setup-1.12.3.dmg', size: 288, age: '1 个月前',
+          actions: [{ label: '归档', tool: 'fs_move', args: { from: '~/Downloads/Olares-Setup-1.12.3.dmg', to: '~/Agent/archive/' } }] },
+        { name: 'screencast-2026-09-14.mov', size: 214, age: '5 周前',
+          actions: [{ label: '归档', tool: 'fs_move', args: { from: '~/Downloads/screencast-2026-09-14.mov', to: '~/Agent/archive/' } }] },
+        { name: 'axolotl-prototype-rust.zip', size: 96, age: '6 天前' },
+        { name: 'font-SourceHanSans.zip', size: 74, age: '2 个月前' },
+      ],
+      footer: '另外 **1799** 个文件都在 10 MB 以下，合计 543 MB。' },
+    { type: 'approval',
+      title: '要执行归档吗？会移动 4 个文件、共 1.48 GB',
+      detail: '目标目录 `~/Agent/archive/`，同名文件会被覆盖。这个动作**可撤销**（`fs_move` 有对应的回退记录）。',
+      diff: '- ~/Downloads/ubuntu-24.04.1-desktop-amd64.iso\n- ~/Downloads/dataset-train-v3.tar.zst\n+ ~/Agent/archive/  （4 个文件，1.48 GB）',
+      tool: 'fs_move', args: { files: ['ubuntu-24.04.1-desktop-amd64.iso', 'dataset-train-v3.tar.zst', 'Olares-Setup-1.12.3.dmg', 'screencast-2026-09-14.mov'], to: '~/Agent/archive/' },
+      allowLabel: '归档这 4 个' },
+    { type: 'actions', items: [
+      { label: '只保留最近 90 天', prompt: '把 Downloads 里 90 天前的文件移到 ~/Agent/archive' },
+      { label: '看看最大的 20 个目录', prompt: '查一下 Home 下最大的 20 个目录' },
+    ]},
+  ]},
+};
+
+/* ── 场景 2：负载回顾（折线 + 结论） ── */
+const monitor = {
+  title: '最近 7 天服务器状态',
+  subtitle: '数据来自 /bfl/monitor/v1alpha1/cluster · 采样间隔 60s',
+  root: { type: 'section', children: [
+    { type: 'chart', kind: 'line', height: 176,
+      x: ['10-14', '10-15', '10-16', '10-17', '10-18', '10-19', '10-20'],
+      series: [
+        { name: 'CPU %', data: [22, 19, 34, 71, 46, 28, 31] },
+        { name: '内存 %', data: [58, 57, 61, 78, 69, 63, 60] },
+      ],
+      note: '10-17 有一次持续 4 小时的尖峰，CPU 摸到 71%、内存 78%。' },
+    { type: 'text', md: '**10-17 那次尖峰**对应 `n8n` 的一个工作流在反复重启（`CrashLoopBackOff` 11 次），已经把并发从 8 降到 3。\n\n内存最低还剩 **3.1 GB**，暂时安全，但离 Chromium 那种吃 600 MB/实例的东西已经很近了。' },
+    { type: 'table',
+      columns: [
+        { key: 'k', label: '指标' }, { key: 'v', label: '当前', align: 'right', mono: true },
+        { key: 'p', label: '7 天峰值', align: 'right', mono: true }, { key: 's', label: '判断', badge: true },
+      ],
+      rows: [
+        { k: 'CPU', v: '31%', p: '71%', s: { text: '正常', tone: 'ok' } },
+        { k: '内存', v: '60% (9.0G/15G)', p: '78%', s: { text: '注意', tone: 'warn' } },
+        { k: '磁盘', v: '48% (62G/128G)', p: '49%', s: { text: '正常', tone: 'ok' } },
+        { k: '网络', v: '1.2 MB/s', p: '18 MB/s', s: { text: '正常', tone: 'ok' } },
+      ]},
+    { type: 'actions', items: [
+      { label: '看看 n8n 的日志', prompt: '看一下 n8n 最近的错误日志' },
+      { label: '画成柱状图', prompt: '把内存 7 天用量画成柱状图' },
+    ]},
+  ]},
+};
+
+/* ── 场景 3：下载任务（进度 + 步骤 + 列表） ── */
+const task = {
+  title: '正在追这部剧',
+  root: { type: 'section', children: [
+    { type: 'progress', label: 'The Bear S03 · 1080p WEB-DL', value: 0.62,
+      detail: '4.2 / 6.8 GB · 2.1 MB/s · 预计 21 分钟', state: 'running',
+      steps: [
+        { label: '搜索资源（3 个候选）', state: 'done' },
+        { label: '选定 1080p WEB-DL', state: 'done' },
+        { label: '下载中', state: 'active' },
+        { label: '移动到 ~/Media/TV/The Bear/S03', state: 'todo' },
+        { label: '通知 Navidrome 刷新媒体库', state: 'todo' },
+      ]},
+    { type: 'list', items: [
+      { icon: '▸', title: 'The Bear S03E05.mkv', sub: '1.4 GB · 已完成', value: '✓' },
+      { icon: '▸', title: 'The Bear S03E06.mkv', sub: '1.6 GB · 下载中 62%', value: '2.1 MB/s' },
+      { icon: '▸', title: 'The Bear S03E07.mkv', sub: '1.5 GB · 排队', value: '—' },
+      { icon: '▸', title: 'The Bear S03E08.mkv', sub: '1.3 GB · 排队', value: '—' },
+    ]},
+    { type: 'actions', items: [
+      { label: '暂停', tool: 'qbittorrent_pause', args: { hash: 'a1b2c3' } },
+      { label: '跳过 E07', tool: 'qbittorrent_skip', args: { hash: 'd4e5f6' } },
+      { label: '下载完通知我', prompt: '这个任务下载完之后告诉我' },
+    ]},
+  ]},
+};
+
+/* ── 场景 4：其余节点（表单 + 代码 + 标签页 + 沙箱 HTML + 文件） ── */
+const extras = {
+  title: '给它写个小工具',
+  subtitle: '自造工具：manifest + 脚本 + 自测',
+  root: { type: 'section', children: [
+    { type: 'tabs', children: [
+      { title: '脚本', children: [
+        { type: 'code', lang: 'javascript', code:
+`// ~/Agent/tools/navidrome/run.mjs
+export default async function ({ album, playlist }, ctx) {
+  const base = ctx.env.NAVIDROME_URL;
+  const hits = await ctx.fetch(\`\${base}/rest/search3?query=\${album}\`);
+  const id = hits.subsonic-response.searchResult3.album[0].id;
+  return ctx.fetch(\`\${base}/rest/updatePlaylist?playlistId=\${playlist}&albumId=\${id}\`);
+}` },
+      ]},
+      { title: '声明', children: [
+        { type: 'code', lang: 'json', code:
+`{
+  "name": "navidrome_playlist_add",
+  "level": "confirm",
+  "params": { "album": "string", "playlist": "string" },
+  "needs": { "net": ["navidrome.bbigdan.olares.com"] }
+}` },
+      ]},
+    ]},
+    { type: 'form',
+      fields: [
+        { name: 'album', label: '专辑', type: 'text', value: 'Kind of Blue', required: true },
+        { name: 'playlist', label: '加到哪个歌单', type: 'select',
+          options: ['深夜', '通勤', 'Focus'], value: '深夜' },
+        { name: 'notify', label: '完成后通知我', type: 'checkbox', value: true },
+      ],
+      submitLabel: '测一下', promptTemplate: '用 {album} 试跑 navidrome_playlist_add，加到「{playlist}」，通知={notify}' },
+    { type: 'file', name: 'run.mjs', path: '~/Agent/tools/navidrome/run.mjs', size: '1.2 KB' },
+    { type: 'html', srcdoc: '<body style="margin:0;display:grid;place-items:center;height:100%;background:#06090f;color:#9fd4ff;font-family:system-ui"><div style="text-align:center"><div style="font-size:34px">25:00</div><div style="font-size:12px;opacity:.5;margin-top:6px">沙箱里的番茄钟（agent 现场生成的单文件应用）</div></div></body>' },
+    { type: 'actions', items: [
+      { label: '注册成工具', tool: 'tool_register', args: { path: '~/Agent/tools/navidrome' } },
+      { label: '看它需要什么权限', prompt: '这个工具需要访问哪些域名和路径' },
+    ]},
+  ]},
+};
+
+const SCENES = { disk, monitor, task, extras };
+const q = new URLSearchParams(location.search);
+const scene = q.get('scene') || 'disk';
+const spec = SCENES[scene] || disk;
+document.getElementById('wtitle').textContent = spec.title;
+
+const host = document.getElementById('host');
+host.appendChild(renderSurface(spec, api));
+
+/* 长内容场景要看到下半部分（沙箱 HTML / 底部按钮），用 ?scroll=bottom */
+if (q.get('scroll') === 'bottom') {
+  const sc = host.querySelector('.sf-scroll');
+  if (sc) sc.scrollTop = sc.scrollHeight;
+}
+
+/* ?demo=click：点一下行内动作和审批，验证「双向」——动作真的回灌成工具调用 */
+if (q.get('demo') === 'click') {
+  host.querySelector('.sf-rowact .sf-mini')?.click();
+  host.querySelector('.sf-approval .sf-primary')?.click();
+}
+
+/* 给自动化取数用 */
+window.__surface = {
+  scene,
+  nodes: document.querySelectorAll('.surface *').length,
+  height: host.scrollHeight,
+};
+</script>
+</body>
+</html>

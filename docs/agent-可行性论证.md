@@ -130,6 +130,32 @@ agent 输出的是**数据描述**，不是 HTML。三个理由：安全（渲�
 2. **数据必须内联** —— 不做"界面自己再去查"，避免界面与事实脱节、无法审计
 3. **节点数 ≤ 200** —— 超了让模型自己分页
 
+### 4.2.1 已实现并验收（2026-10-20）
+
+`shell/src/surface.js` 实现了全部 13 类节点（含 `tabs` 与 `html` 逃生舱），零依赖、约 700 行；`shell/src/surface.css` 是配套版式，直接复用桌面的冷蓝与发丝线。四个真实场景在 780×690 的窗口里跑通：
+
+| 场景 | 用到的节点 | DOM 元素 |
+|---|---|---|
+| Downloads 清理 | `section` `text` `table`（面积列 + 行内动作）`approval`（diff）`actions` | 99 |
+| 7 天负载回顾 | `chart`(line, 双序列) `text` `table`(胶囊状态) `actions` | 79 |
+| 追剧任务 | `progress`(steps) `list` `actions` | 56 |
+| 自造工具 | `tabs` `code` `form` `file` `html`(沙箱) `actions` | 48 |
+
+**结论：词汇够用，不需要再扩。** 这四张图覆盖了"查数据 / 看趋势 / 跟长任务 / 造东西"四种典型回答，没有一处需要退回 HTML 才能表达。
+
+过程中修掉四个真问题，都记在代码注释里：
+
+1. **面积条列在右对齐时会漂**：`td.sf-right` 只对齐文字，条还是靠左，整列看起来悬空 —— 要给 `.sf-right .sf-cellbar` 单独 `justify-content: flex-end`
+2. **状态列必须能精确控色**："正常 / 注意"这类判断用纯文本表达不出严重性，值改成 `{text, tone}` 后渲染成胶囊（`t-ok / t-warn / t-bad / t-info`）
+3. **行内动作不能全隐**：原先 `opacity: 0` 只在 hover 时出现，等于告诉模型"这行能操作"但人看不见 —— 改成常驻 42%，hover 到 100%
+4. **原生 `<select>` 会毁掉整体质感**：系统箭头 + 浅色底在深色玻璃里非常扎眼，用两个渐变拼了个箭头（`appearance: none`）
+
+**双向验证**：`?demo=click` 会点一下行内"归档"和审批的"允许"，日志里打出的正是 `fs_move({"from":…,"to":…})` 与 `fs_move({"files":[…4 个],"to":"~/Agent/archive/"})`。也就是说表格行、审批卡片、表单提交走的是**同一条回灌通道**，不需要给每种控件单独接线。
+
+**安全边界已落在代码里**：`actionButton()` 只认 `tool`（`^[a-z][a-z0-9_]{1,40}$`）与 `prompt`，任何 URL 形状直接丢弃并置灰；`image` 节点只放行 `blob:` 与 `/blob/`；`html` 节点 `sandbox="allow-scripts allow-forms allow-modals"`、**不给 `allow-same-origin`** —— 沙箱里的番茄钟能跑，但拿不到壳层的 cookie 和 DOM。
+
+
+
 ### 4.3 双向
 
 `form` 提交、`actions` 点击、表格行内动作，都作为工具结果或新指令回到对话。于是 agent 不必用自然语言反复问"要删哪个、确认吗"，它直接给一个可操作的界面。审批卡片就是这个机制的第一个用例，v1 只是把它写死了。
@@ -509,7 +535,14 @@ spec → 离屏 canvas 2D（逻辑尺寸 = 绘制区）
 | 资源 | agent request 200m/512Mi，limit 1500m/1.5Gi；memory request 100m/256Mi，limit 1000m/1Gi |
 | 卷 | Home → `/home/olares`（rw）；`~/Agent/{workspace,tools,skills,memory,audit,trash,drawings}` |
 | 网络 | nginx `location ^~ /agent/` → agent:8080；WS 不缓冲 |
-| 鉴权 | `/agent/` 用"转发 cookie 打官方 `/server/myApps`"做认证 oracle，之后发签名 HttpOnly cookie，缓存 60s |
+| 鉴权 | `/agent/` 转发 `Cookie` 打 authelia 的 forward-auth 接口（`/api/verify`），200 时读 `Remote-User`；未见 cookie 401 —— 见下 |
+
+**鉴权实测（这一条推翻了原先的设计）**：原计划拿官方 `/server/myApps` 当认证 oracle，实测**不可行** —— 从壳层 pod 里 `POST /server/myApps` 带不带 cookie 都返回 `201`，还直接给出了 `bbbigdan` 的应用列表。原因是鉴权发生在 **bfl 入口那一层**（authelia 中间件），pod 之间的跳转不过那道门，`olares-app` 的 BFF 默认信任网络边界。所以：
+
+- **`/server/myApps` 不能当 oracle**（它对谁都返回数据），但这也说明**集群内部的调用不受 SSO 约束**，agent 自己的 k8s/文件工具不需要用户凭据
+- 真正的 oracle 是 namespace 里的 `authelia-backend-svc:9091/api/verify`：不带 cookie 或假 cookie 均返回 **401**（已实测），合法会话返回 `200 + Remote-User`。agent 只需转发 `Cookie` 与 `X-Forwarded-Host/Proto`，60s 缓存按 cookie 哈希
+- 副作用：`/agent/` 自己必须校验，不能指望"反正入口会拦" —— 任何能直连 pod IP 的组件都能绕过入口
+
 | 工作负载 | 裸 Pod（webhook 限制），长期注册成 Olares 应用 |
 
 记忆服务单独容器的副作用是好的：`maturin build` 只在构建期影响它，agent 不受牵连。
@@ -578,14 +611,15 @@ M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么�
 
 1. ~~**axolotl Linux 构建**~~ ✅ 三处改动，`cargo build` 1m24s / `maturin` 出 wheel 457KB，冒烟测试全过（§6.2）
 2. ~~**粒子画可读性**~~ ✅ 五个场景截图验收：表情 2698 点 @2.2px、文字 2619 @3.5px、图表 3424 @3.2px、复合 5068 @2.2px、涂鸦 2583 @2.2px（§7.3.1）
+3. ~~**渲染树表现力**~~ ✅ 13 类节点全部实现（`shell/src/surface.js`），四个真实场景截图验收（§4.2.1），**结论：够用，词汇不用改**
+4. ~~**认证 oracle**~~ ✅ 原方案（`/server/myApps`）**被实测推翻** —— 它不鉴权；改用 `authelia-backend-svc:9091/api/verify`，401 已验（§11）
 
 **还没验**
 
-3. **`.axeb` 跨平台**：macOS 上生成的旧库在 Linux 上 `open()` 能否直接读（代码路径上看只会走纯 Rust 的 `GPUEdgeBlockGraph`，但没拿真实文件试过）
-4. **抽取质量**：用真实对话跑 200~500 轮，看节点/边的信噪比，以及五信号剪枝是否真的在剪对东西
-5. **渲染树表现力**：三个真实场景写死渲染树，看静态效果
-6. **认证 oracle**：cookie 转发给 `/server/myApps`，未登录时确认为 302 / 非 JSON
+5. **`.axeb` 跨平台**：macOS 上生成的旧库在 Linux 上 `open()` 能否直接读（代码路径上看只会走纯 Rust 的 `GPUEdgeBlockGraph`，但没拿真实文件试过）
+6. **抽取质量**：用真实对话跑 200~500 轮，看节点/边的信噪比，以及五信号剪枝是否真的在剪对东西
 7. **`drawOn` 的实际观感**：截图只能证明静态构图，1600ms 的"逐点换目标"在真实帧率下的手感还要人眼确认
+8. **authelia 正向路径**：只有 401 是实测的，`200 + Remote-User` 依赖 authelia 的 forward-auth 契约，等 M0 接上真会话再确认
 
 ---
 
