@@ -1760,6 +1760,66 @@ export class Field {
     this.drawOn = 0;
   }
 
+  /* ───────────── 槽位写入（粒子界面用，见 pui.js） ─────────────
+   * 和 setDraw 的区别：setDraw 收一整幅点云、按 stride 打散分配，一次全量；
+   * 这里是"往指定的槽位段里写" —— 同一槽位永远对应同一颗粒子，
+   * 所以界面上一个字变了，不会带动别的字重排。
+   */
+
+  slotBegin(opt = {}) {
+    if (!this.col0) this.col0 = this.col.slice();
+    this.drawUse.fill(0);
+    this.drawN = 0;
+    this.drawSeen = true;
+    this.drawOn = 1;
+    this.drawStart = this.time;
+    this.drawOnMs = 0;                    // 槽位模式不做出场波，谁写谁立刻显形
+    this.drawDim = opt.dim ?? 0.96;
+    this.drawDot = opt.dot ?? 0.9;
+  }
+
+  /**
+   * @param {number} base 起始槽位
+   * @param {{x:number,y:number,ink:number}[]} pts 屏幕坐标（相对视口左上）
+   * @param {number[]} col [r,g,b] 0..1
+   */
+  slotPut(base, pts, col, scl = 1) {
+    const n = AMBIENT_N;
+    const cx = this.W * 0.5;
+    const cy = this.H * 0.5;
+    const dot = this.drawDot ?? 0.9;
+    for (let k = 0; k < pts.length; k++) {
+      const slot = base + k;
+      if (slot >= n) break;
+      /* 槽位 → 粒子：与 6400 互质的乘法，双射且把连续槽位打散到球面各处 */
+      const i = (slot * 7919 + 13) % n;
+      const p = pts[k];
+      const ink = p.ink ?? 0.6;
+      this.drawUse[i] = 1;
+      this.drawX[i] = p.x - cx;
+      this.drawY[i] = cy - p.y;           // canvas 的 y 向下、场的 y 向上
+      this.drawA[i] = (0.55 + 0.45 * ink) * scl;
+      this.drawS[i] = (1.9 + 0.8 * ink) * dot;
+      this.drawD[i] = 0;
+      this.drawCol[i * 3] = col[0];
+      this.drawCol[i * 3 + 1] = col[1];
+      this.drawCol[i * 3 + 2] = col[2];
+      if (slot + 1 > this.drawN) this.drawN = slot + 1;
+    }
+  }
+
+  /** 清空一段槽位：点留在原地但亮度归零（下次输入直接复用，不飞回球面） */
+  slotBlank(base, len) {
+    const n = AMBIENT_N;
+    for (let k = 0; k < len; k++) {
+      const slot = base + k;
+      if (slot >= n) break;
+      const i = (slot * 7919 + 13) % n;
+      this.drawA[i] = 0;
+      this.drawS[i] = 0;
+    }
+  }
+
   stepShape(dt) {
     const t = this.time;
     const n = AMBIENT_N;
