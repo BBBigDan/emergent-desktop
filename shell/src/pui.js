@@ -215,8 +215,25 @@ export class ParticleText {
     this.weight = o.weight ?? 300;
     this.dot = o.dot ?? 1;
     this.budget = glyphBudget(o.size);
-    this.base = o.alloc.alloc(this.max * this.budget, o.label || 'text');
-    this._slots = new Array(this.max).fill(null);   // 每格记 {ch, x}，用于跳过
+    /**
+     * 槽位不够就**把字数上限往下压**，而不是抛异常。
+     *
+     * 一屏装不下的时候，正确的降级是"这行字被截短"，不是"整块场景炸掉"。
+     * 这个降级是演示页第一次超预算时补的：分叉标题多留 3 个字，就把最后
+     * 一行读数挤爆了 —— 而那一行只是"83% · 2.1 MB/s"，丢了不影响理解。
+     * 反过来，抛异常会让 set() 中途抛出，屏幕上只剩一部分元素，更难排查。
+     */
+    this.base = -1;
+    for (let m = this.max; m >= 2; m--) {
+      const need = m * this.budget;
+      if (o.alloc.used + need <= o.alloc.total) {
+        this.base = o.alloc.alloc(need, o.label || 'text');
+        this.max = m;
+        break;
+      }
+    }
+    this.dead = this.base < 0;
+    this._slots = new Array(Math.max(1, this.max)).fill(null);   // 每格记 {ch, x}，用于跳过
     this._last = 0;
     this._wrote = 0;
   }
@@ -232,6 +249,7 @@ export class ParticleText {
    */
   set(text, opt = {}) {
     const t0 = performance.now();
+    if (this.dead) return { wrote: 0, ms: 0, px: 0, chars: 0 };
     const color = opt.color || this.color;
     const rgb = hexToRgb(color);
     let chars = Array.from(String(text ?? ''));
@@ -261,6 +279,17 @@ export class ParticleText {
         ? { x: gx + metrics[i].advance * 0.5, y: this.y - this.size * 0.34, r: this.size * 0.55 }
         : null;
       this.field.slotPut(this.base + i * this.budget, pts, rgb, opt.scl ?? 1, spawn);
+      /**
+       * 每格必须"写满或清空"。
+       *
+       * 一个字的点很少（十几到几十颗），而它预占的一整段槽位（`budget`）是按上限
+       * 给的。新字比旧字点少时，**旧字的残余点会留在原地**——症状是改一行字之后，
+       * 新字中间浮出几个旧字的笔画（"把内存压到 34%？" 里透出 "n8n 重启"）。
+       * 这类毛刺不会报错，只会让人以为是渲染抖动，很难查。
+       */
+      if (pts.length < this.budget) {
+        this.field.slotBlank(this.base + i * this.budget + pts.length, this.budget - pts.length);
+      }
       this._slots[i] = { ch, x: gx };
       wrote++;
     }

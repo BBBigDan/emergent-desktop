@@ -101,18 +101,18 @@ scene.set(SPEC);
 /* ───────── 交互：只放势阱 / 敲冲量，不写 hover 状态 ───────── */
 addEventListener('pointermove', (e) => {
   const x = e.clientX, y = e.clientY;
-  const id = scene.hit(x, y);
+  const h = scene.hit(x, y);
   const wells = [{ x, y, r: 150, k: 380, swirl: 0.22 }];
-  if (id) {
-    const l = scene.layers.get(id);
-    if (l?.anchor) wells.push({ x: l.anchor.x, y: l.anchor.y, r: 110, k: 900, swirl: 0.4 });
+  if (h?.layer?.anchor) {
+    const a2 = h.layer.anchor;
+    wells.push({ x: a2.x, y: a2.y, r: 110, k: 900, swirl: 0.4 });
   }
   f.setWells(wells);
 });
 addEventListener('pointerdown', (e) => {
-  const id = scene.hit(e.clientX, e.clientY);
+  const h = scene.hit(e.clientX, e.clientY);
   f.impulse(e.clientX, e.clientY, { r: 170, power: 520 });
-  scene.pulse('confirm', { at: id || scene.focus });
+  scene.pulse('confirm', { at: h?.id || scene.focus });
 });
 
 /* 进度自己往前走：观察"沉积" */

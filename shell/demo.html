@@ -21,17 +21,13 @@
     font: 11px/1.85 ui-monospace, Menlo, "Cascadia Mono", monospace;
     pointer-events: none; white-space: pre;
   }
-  #log .ln {
-    opacity: 0; transform: translateY(5px);
-    transition: opacity 0.32s, transform 0.32s;
-  }
+  #log .ln { opacity: 0; transform: translateY(5px); transition: opacity 0.32s, transform 0.32s; }
   #log .ln.in { opacity: 1; transform: none; }
-  #log .ln b {
-    display: inline-block; width: 116px;
-    color: rgba(127, 196, 255, 0.92); font-weight: 400;
-  }
+  #log .ln b { display: inline-block; width: 120px; color: rgba(127, 196, 255, 0.92); font-weight: 400; }
   #log .ln b.you { color: rgba(232, 240, 250, 0.95); }
+  #log .ln b.act { color: rgba(255, 178, 87, 0.95); }
   #log .ln span { color: rgba(147, 184, 216, 0.55); }
+  #log .ln i { color: rgba(147, 184, 216, 0.26); font-style: normal; }
   #log .ln.dim { opacity: 0.34; }
 
   /* 读屏镜像层的可见版：证明"同一份语义也在无障碍树里" */
@@ -47,7 +43,7 @@
   #hint {
     position: fixed; right: 24px; bottom: 22px;
     font: 11px/1.6 ui-monospace, Menlo, monospace;
-    color: rgba(147, 184, 216, 0.34); pointer-events: none;
+    color: rgba(147, 184, 216, 0.34); pointer-events: none; white-space: pre; text-align: right;
   }
   #hint.paused { color: rgba(255, 178, 87, 0.8); }
 
@@ -62,7 +58,8 @@
 <div id="bar"></div>
 <div id="log"></div>
 <div id="caption"></div>
-<div id="hint">空格 暂停 · R 重播</div>
+<div id="hint">拖一个仪表 · 拖曲线 · 点乱团
+空格 暂停 · R 重播</div>
 <div id="a11y"></div>
 
 <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
@@ -72,6 +69,8 @@ import { FieldScene } from './src/scene.js';
 import { ParticleText, SlotAllocator } from './src/pui.js';
 import { FONT, FONT_LAT } from './src/draw.js';
 import { FieldA11y } from './src/aria.js';
+import { GestureTracker, describe } from './src/gesture.js';
+import { GAP, Pacer } from './src/timing.js';
 
 const q = new URLSearchParams(location.search);
 const f = new Field(document.getElementById('scene'));
@@ -80,6 +79,7 @@ const logEl = document.getElementById('log');
 const capEl = document.getElementById('caption');
 const barEl = document.getElementById('bar');
 const hintEl = document.getElementById('hint');
+const pacer = new Pacer();
 
 const W = innerWidth;
 const H = innerHeight;
@@ -94,17 +94,16 @@ AREA.y = Math.round(Math.max(70, (H - AREA.h) / 2 - 26));
 /* 场之外还要住一行"提问"。槽位是一条直线，所以先把它占住，场景从后面开始分。 */
 const head = new SlotAllocator(6400, 0);
 const question = new ParticleText({
-  field: f, alloc: head, x: Math.round(W / 2), y: 100, size: 22, max: 14,
+  field: f, alloc: head, x: Math.round(W / 2), y: 100, size: 22, max: 12,
   color: '#eaf3ff', align: 'center', font: FONT, label: 'question',
 });
 const scene = new FieldScene({ field: f, area: AREA, a11y, slotStart: head.used });
 
 /* 开场还没有场景，但"要画东西"这件事得先声明一次：
-   drawMix 从 0 涨到 1，同时把环境那团压到 62%（提问要作为焦点，但不能把球灭掉）。 */
+   drawMix 从 0 涨到 1，同时把环境那团压暗（提问要作为焦点，但不能把球灭掉）。 */
 f.slotBegin({ dim: 0.8, dot: 0.95 });
 
-/* ───────────────── 剧本 ─────────────────
-   每一行就是一个工具调用。演示的同时把 JSON 打在左下角 —— 这是接口，不是魔法。 */
+/* ───────────────── 场景 ───────────────── */
 
 const SPEC_A = {
   rev: 1, title: '服务器状态', focus: 'job', mood: 'working',
@@ -136,17 +135,45 @@ const SERIES = series();
 const SPEC_B = {
   rev: 2, title: '过去 7 天的负载', focus: 'load', mood: 'calm',
   layers: [
-    { id: 'load', kind: 'trace', label: 'CPU · 7 天', data: SERIES.slice() },
+    /* win 只开最近 3 天的窗口 —— 否则"平移"没有空间可移，拖拽会立刻撞到边界 */
+    { id: 'load', kind: 'trace', label: 'CPU · 3 天', data: SERIES.slice(), win: [0.58, 1] },
     { id: 'mem',  kind: 'gauge', label: '内存', value: 0.60 },
     { id: 'disk', kind: 'gauge', label: '磁盘', value: 0.48, color: '#b9a6ff' },
     { id: 'note', kind: 'condense', text: '周四 21:00 有一次尖峰' },
   ],
 };
 
+/* n8n 的详情场：从"总览"里点那团乱点进去 —— 不是开窗，是换一个景。
+   同一个对象的另一个粒度和另一个视角，上下文不丢。 */
+const RESTARTS = (() => {
+  const out = [];
+  for (let h = 0; h < 24; h++) {
+    let v = 0.06 + (h % 3 === 0 ? 0.1 : 0);
+    if (h >= 14 && h <= 21) v += 0.18 + 0.1 * Math.sin(h * 1.7) + 0.14;
+    out.push(Math.min(1, v));
+  }
+  return out;
+})();
+const SPEC_C = {
+  rev: 3, title: 'n8n', focus: 'rs', mood: 'alert',
+  layers: [
+    { id: 'rs',   kind: 'trace', label: 'n8n · 24 小时', data: RESTARTS.slice(), axis: [0, 1] },
+    { id: 'mem',  kind: 'gauge', label: '内存', value: 0.60 },
+    { id: 'cpu',  kind: 'gauge', label: 'CPU',  value: 0.34 },
+    { id: 'ask',  kind: 'fork', label: '卡在 Notion 节点？',
+      options: [{ id: 'off', label: '先禁用它' }, { id: 'keep', label: '保留' }] },
+  ],
+};
+
+/* ───────────────── 日志 ───────────────── */
+
+let lastLogAt = 0;
 function log(kind, detail, cls = '') {
+  const gap = lastLogAt ? `+${(clock - lastLogAt).toFixed(1)}s` : '';
+  lastLogAt = clock;
   const d = document.createElement('div');
   d.className = 'ln';
-  d.innerHTML = `<b class="${cls}">${kind}</b><span>${detail}</span>`;
+  d.innerHTML = `<b class="${cls}">${kind}</b><span>${detail}</span><i>${gap}</i>`;
   logEl.appendChild(d);
   requestAnimationFrame(() => d.classList.add('in'));
   while (logEl.children.length > 7) logEl.removeChild(logEl.firstChild);
@@ -156,8 +183,7 @@ function log(kind, detail, cls = '') {
 }
 
 /* 提问要能"留在场上"：scene.set() 会清空 drawUse（它认为整块场都换了），
-   所以每次布景后要把提问按原样重写一遍 —— 同一帧内重写，位置没变，看不见任何动静。
-   不补这一步的症状：场景一出现，问题就原地消失。 */
+   所以每次布景后要把提问按原样重写一遍 —— 同一帧内重写，位置没变，看不见任何动静。 */
 let qText = '';
 function say(txt, opt = {}) {
   qText = txt;
@@ -166,9 +192,7 @@ function say(txt, opt = {}) {
 function reassertQuestion() {
   if (qText) question.set(qText, { force: true });
 }
-
-/* 字幕淡出：亮度就是透明度，不需要另一套机制 */
-function fadeQuestion(txt, ms = 340) {
+function fadeQuestion(txt, ms = 420) {
   const t0 = performance.now();
   const step = (now) => {
     const k = Math.min(1, (now - t0) / ms);
@@ -182,109 +206,270 @@ function fadeQuestion(txt, ms = 340) {
 const cx = Math.round(W / 2);
 let prog = 0.62;
 
+/* ───────────────── 剧本 ─────────────────
+   时间点不是"播放器总长"压出来的，是按 timing.js 的 GAP 排的：
+   上一步结束 + 人读完它需要的时间 = 下一步。
+   上一版每步之间只留 1.2s，看起来"都有点短"，根因就是只算了动效多长、没算人要看多久。 */
+
 const STEPS = [
   { at: 0.9, run: () => {
     say('服务器现在怎么样', { spawn: true });
     log('› 用户', '服务器现在怎么样', 'you');
   } },
-  { at: 3.0, run: () => {
+  /* enter 900ms 成字，再停 ~0.8s 让人读 */
+  { at: 2.7, run: () => {
     scene.set(SPEC_A);
     reassertQuestion();
     log('scene_set', 'focus=job · layers=6 · mood=working');
   } },
-  { at: 3.5, run: () => {
+  /* 场景成形（~0.9s）之后再停 1s，才让提问散开：两件事要能分开看 */
+  { at: 4.6, run: () => {
     f.impulse(cx, 100, { r: 240, power: 300 });
     fadeQuestion(qText);
   } },
-  { at: 5.4, run: () => {
+  /* 数值推进：tick 240ms，间隔 1.1s（看清这一格 + 意识到"它在动"） */
+  { at: 5.8, run: () => {
     prog = 0.74;
-    scene.patch([{ id: 'job', progress: prog }]);
+    pacer.run('patch', () => scene.patch([{ id: 'job', progress: prog }]));
     log('scene_patch', 'job.progress 0.62 → 0.74');
   } },
-  { at: 6.6, run: () => {
+  { at: 6.9, run: () => {
     prog = 0.83;
-    scene.patch([{ id: 'job', progress: prog }]);
+    pacer.run('patch', () => scene.patch([{ id: 'job', progress: prog }]));
     log('scene_patch', 'job.progress 0.74 → 0.83');
   } },
-  { at: 8.0, run: () => {
-    scene.pulse('error', { at: 'n8n' });
+  /* pulse 之间至少 0.56s；这里给 1.6s —— 一次"抖起来"要让人先注意到 */
+  { at: 8.5, run: () => {
+    pacer.run('pulse', () => scene.pulse('error', { at: 'n8n' }));
     log('scene_pulse', 'error · at=n8n');
   } },
-  { at: 9.8, run: () => {
-    /* 这一下是"人点了分叉的左边"，不是一个 markdown 按钮 */
-    const br = scene.layers.get('choice')?.branches?.[0];
-    if (br) f.impulse(br.path(0.55).x, br.path(0.55).y, { r: 200, power: 460 });
-    scene.pulse('confirm', { at: 'choice' });
-    log('scene_pulse', 'confirm · at=choice  ← 用户点了「重启 n8n」');
+  /* 换景是承诺：之后至少 1.1s 不动 */
+  { at: 10.9, run: () => {
+    pacer.run('transition', () => scene.transition(SPEC_B));
+    log('scene_transition', 'focus=load · layers=4 · win=[0.58,1]');
   } },
-  { at: 11.0, run: () => {
-    scene.transition(SPEC_B, { outMs: 380, inMs: 760 });
-    log('scene_transition', 'focus=load · layers=4');
-  } },
-  { at: 14.2, run: () => {
+  { at: 13.6, run: () => {
     SERIES.push(0.30); SERIES.shift();
-    scene.patch([{ id: 'load', data: SERIES.slice() }]);
+    pacer.run('patch', () => scene.patch([{ id: 'load', data: SERIES.slice() }]));
     log('scene_patch', 'load.data 追加 1 个采样');
   } },
-  { at: 15.6, run: () => {
+  { at: 15.0, run: () => {
     SERIES.push(0.35); SERIES.shift();
-    scene.patch([{ id: 'load', data: SERIES.slice() }]);
+    pacer.run('patch', () => scene.patch([{ id: 'load', data: SERIES.slice() }]));
     log('scene_patch', 'load.data 追加 1 个采样');
-  } },
-  { at: 18.2, run: () => {
-    scene.pulse('arrive', { at: 'load' });
-    log('scene_pulse', 'arrive · at=load');
   } },
 ];
 
-const END = 20.5;
+const END = 17.5;
 let clock = 0;
 let paused = q.get('paused') === '1';
 let next = 0;
 const STOP = Number(q.get('stop') || 0);   // 到剧本第 N 秒自动停下（截图用）
 
-function resetSteps() {
-  clock = 0; next = 0; logEl.innerHTML = '';
+/* ───────────────── 手势 ─────────────────
+   手势只产生"意图"，不产生动作。拖内存 ≠ 清内存，拖曲线 = 改看哪一段（这个本地就做）。
+   两种"立即生效"的区别，是这套交互最核心的一条分界：改视图可以，改事实要问。 */
+
+let takenOver = false;
+/* 剧本停 ≠ 世界停。接管之后不再推进剧本，但场要继续演化 ——
+   否则用户点开 n8n 详情，相变会冻在半路，看起来像卡死。 */
+let scriptOn = true;
+let pendingAdjust = null;
+let lastDone = null;
+let panBase = null;
+let dragId = null;
+
+function takeOver(reason) {
+  if (!takenOver) {
+    takenOver = true;
+    scriptOn = false;
+    hintEl.classList.add('paused');
+    hintEl.textContent = '已接管 · 空格继续剧本 · R 重播';
+    log('› 用户', reason, 'you');
+  }
 }
 
-/* ───────── 交互：光标是势阱，点击是冲量。任何时候都能打断剧本摸一下 ───────── */
-addEventListener('pointermove', (e) => {
-  const x = e.clientX;
-  const y = e.clientY;
-  const id = scene.hit(x, y);
-  const wells = [{ x, y, r: 150, k: 380, swirl: 0.22 }];
-  if (id) {
-    const l = scene.layers.get(id);
-    if (l?.anchor) wells.push({ x: l.anchor.x, y: l.anchor.y, r: 110, k: 900, swirl: 0.4 });
+const gt = new GestureTracker({
+  pick: (x, y) => scene.hit(x, y),
+
+  onStart: (s) => {
+    f.setWells([{ x: s.x, y: s.y, r: 180, k: 1200, swirl: 0.3 }]);
+    if (s.id) f.impulse(s.x, s.y, { r: 120, power: 200 });
+    /* 横向拖折线：先把窗口存下来，拖动中按"起点 + 累计位移"算 ——
+       不能用增量累加，否则一次抖动会被永久算进去，越拖越偏。 */
+    if (s.hot?.gestures?.includes('pan') && s.layer?.win) {
+      panBase = s.layer.win.slice();
+      dragId = s.id;
+    }
+  },
+
+  /* 拖动过程中的视觉：井跟着手走 + 每 92ms 一个小冲量，连起来就是一道拖尾。
+     这一层完全是"被拨动的感觉"，不含任何语义。 */
+  onMove: (s) => {
+    f.setWells([{ x: s.x, y: s.y, r: 195, k: 1500, swirl: 0.34 }]);
+    if (s.trail) f.impulse(s.x, s.y, { r: 76, power: 78 });
+    /* 折线：拖动中就把窗口移过去 —— 这是本地操作，不用等模型 */
+    if (s.id && panBase && dragId === s.id) {
+      const span = panBase[1] - panBase[0];
+      const frac = -s.dx / 780;
+      const w0 = Math.min(1 - span, Math.max(0, panBase[0] + frac * span));
+      scene.resetWin(s.id, [w0, w0 + span]);
+    }
+  },
+
+  onEnd: (s) => {
+    f.setWells([]);
+    if (s.moved) f.impulse(s.x, s.y, { r: 210, power: 420 });
+    panBase = null;
+    dragId = null;
+  },
+
+  onIntent: (i) => onIntent(i),
+});
+
+function onIntent(i) {
+  if (i.target) takeOver(describe(i));
+  switch (i.kind) {
+    case 'adjust': return respondAdjust(i);
+    case 'pick':   return respondPick(i);
+    case 'tap':    return respondTap(i);
+    case 'pan':    return respondPan(i);
+    default: return null;
   }
-  f.setWells(wells);
+}
+
+/* ① 拖一个仪表 → 模型反问。拖拽永远不直接改值。 */
+function respondAdjust(i) {
+  const name = { mem: '内存', cpu: 'CPU', disk: '磁盘' }[i.target] || i.target;
+  const pct = Math.round(i.to * 100);
+  log('intent', `adjust ${i.target} ${i.from.toFixed(2)}→${i.to.toFixed(2)}`);
+  pendingAdjust = i;
+
+  /* 决策是排他的：场里只有一个"决策槽"，同一时刻只留一个问题。
+     新问题来了就把旧的换掉 —— 否则屏幕上会同时挂两个待答的问题，人一个都不会答。 */
+  setTimeout(() => {
+    scene.patch([{
+      id: 'choice',
+      label: `把${name}压到 ${pct}%？`,
+      options: [{ id: 'yes', label: `压到 ${pct}%` }, { id: 'no', label: '算了' }],
+    }]);
+    scene.pulse('arrive', { at: 'choice' });
+    log('scene_patch', `choice 换成「把${name}压到 ${pct}%？」`);
+  }, GAP.patch * 3);
+}
+
+/* ② 拖曲线 → 本地平移；撞到边界才需要模型（要更早的数据） */
+function respondPan(i) {
+  const layer = scene.layers.get(i.target);
+  const w = layer?.win || [0, 1];
+  log('intent', `pan ${i.target} dir=${i.dir}`);
+  /* 窗口变了，上一段视角的结论就不再成立 —— 淡下去。
+     注意这不是"删除"：人还看得见它，只是知道它说的是刚才那段。 */
+  if (scene.ghost('note', true)) log('scene_ghost', 'note 淡出（结论只对上一段窗口成立）');
+  if (w[0] < 0.002 || w[1] > 0.998) {
+    log('intent', `${i.target}.atEdge → 向模型请求更早的数据`, 'act');
+    setTimeout(() => {
+      /* 模型补数据：前面插 3 天，然后把窗口推到新数据的中段 */
+      const extra = Array.from({ length: 36 }, (_, k) => 0.2 + 0.12 * Math.sin(k * 0.5) + Math.random() * 0.08);
+      const merged = [...extra, ...(layer.spec.data || [])];
+      scene.patch([{ id: i.target, data: merged }]);
+      scene.resetWin(i.target, [0.55, 0.85]);
+      log('scene_patch', `${i.target}.data 补齐更早 3 天 · win=[0.55,0.85]`);
+    }, GAP.patch * 4);
+  }
+}
+
+/* ③ 点那团乱点 → 换到它的详情场（同一个对象的另一个粒度） */
+function respondTap(i) {
+  if (i.target === 'n8n') {
+    pacer.run('transition', () => scene.transition(SPEC_C));
+    log('scene_transition', 'n8n 详情 · focus=rs · layers=4');
+    return;
+  }
+  if (i.target === 'load' || i.target === 'rs') {
+    /* 双击式复位：把窗口拉回全量 —— 也是视图操作 */
+    const w = scene.resetWin(i.target, null);
+    scene.ghost('note', false);
+    log('scene_resetWin', `${i.target}.win=[${w.map((v) => v.toFixed(2)).join(',')}]`);
+  }
+}
+
+/* ④ 选一个分支 → 才真正执行 */
+function respondPick(i) {
+  log('intent', `pick ${i.target}.${i.option}`);
+  if (i.target === 'choice') {
+    if (i.option === 'yes' && pendingAdjust) {
+      const a = pendingAdjust;
+      const gb = (2.4 * (a.from - a.to) / 0.26).toFixed(1);
+      scene.patch([{ id: a.target, value: a.to }]);
+      scene.pulse('confirm', { at: a.target });
+      log('scene_patch', `${a.target}.value → ${a.to.toFixed(2)}`);
+      log('fs_free', `已压到 ${Math.round(a.to * 100)}% · 释放 ${gb} GB`, 'act');
+      /* 做完了就把同一个决策槽换成"结果 + 撤销" —— 不新建一个元素，
+         因为"我刚做的事"和"我刚被问的事"是同一个位置上的两件事。 */
+      scene.patch([{ id: 'choice', label: `已压到 ${Math.round(a.to * 100)}%`, options: [{ id: 'undo', label: '撤销' }, { id: 'close', label: '知道了' }] }]);
+      lastDone = a;
+      pendingAdjust = null;
+    } else if (i.option === 'undo' && lastDone) {
+      scene.patch([{ id: lastDone.target, value: lastDone.from }]);
+      scene.patch([{ id: 'choice', label: '已还原', options: [{ id: 'close', label: '好' }] }]);
+      log('scene_patch', `${lastDone.target}.value → ${lastDone.from.toFixed(2)}（撤销）`);
+      lastDone = null;
+    } else if (i.option === 'close') {
+      scene.patch([{ id: 'choice', label: '还有别的事吗？', options: [{ id: 'no', label: '没有' }, { id: 'no2', label: '没有' }] }]);
+      log('scene_patch', 'choice → 还有别的事吗？');
+    } else {
+      scene.patch([{ id: 'choice', label: '先不动', options: [{ id: 'yes', label: '已忽略' }, { id: 'no', label: '好' }] }]);
+      log('scene_patch', 'choice → 先不动');
+      pendingAdjust = null;
+    }
+  }
+  if (i.target === 'ask' && i.option === 'off') {
+    scene.patch([{ id: 'ask', label: '已禁用 · 重跑成功', options: [{ id: 'off', label: '已禁用' }, { id: 'keep', label: '保留' }] }]);
+    scene.patch([{ id: 'rs', data: RESTARTS.map((v) => v * 0.25) }]);
+    scene.pulse('confirm', { at: 'rs' });
+    log('scene_patch', 'ask → 已禁用 · 重跑成功');
+  }
+}
+
+gt.attach(window);
+
+/* 悬停：给可交互的东西一个更强一点的井，顺手把光标换成能看懂的样子 */
+addEventListener('pointermove', (e) => {
+  if (gt.g?.moved) return;
+  const h = scene.hit(e.clientX, e.clientY);
+  document.body.style.cursor = !h ? 'default'
+    : h.hot.gestures.includes('adjust') ? 'ns-resize'
+    : h.hot.gestures.includes('pan') ? 'ew-resize'
+    : 'pointer';
 });
-addEventListener('pointerdown', (e) => {
-  f.impulse(e.clientX, e.clientY, { r: 170, power: 520 });
-  const id = scene.hit(e.clientX, e.clientY);
-  if (id) scene.pulse('confirm', { at: id });
-});
+
 addEventListener('keydown', (e) => {
   if (e.code === 'Space') {
     e.preventDefault();
     paused = !paused;
     hintEl.classList.toggle('paused', paused);
-    hintEl.textContent = paused ? '已暂停 · 空格继续 · R 重播' : '空格 暂停 · R 重播';
+    hintEl.textContent = paused ? '已暂停 · 空格继续 · R 重播' : '拖一个仪表 · 拖曲线 · 点乱团\n空格 暂停 · R 重播';
   } else if (e.key === 'r' || e.key === 'R') {
     location.reload();
   }
 });
 
-/* ───────── 主循环 ───────── */
+/* ───────────────── 主循环 ───────────────── */
 let last = performance.now();
 function loop(now) {
   const dt = Math.min((now - last) / 1000, 0.05);
   last = now;
 
   if (!paused) {
-    clock += dt;
-    while (next < STEPS.length && clock >= STEPS[next].at) STEPS[next++].run();
-    if (STOP && clock >= STOP) { paused = true; hintEl.textContent = `停在 ${STOP}s · 空格继续`; }
+    if (scriptOn) {
+      clock += dt;
+      while (next < STEPS.length && clock >= STEPS[next].at) STEPS[next++].run();
+    }
+    if (STOP && clock >= STOP && scriptOn) {
+      scriptOn = false;
+      hintEl.textContent = `停在 ${STOP}s · 空格继续剧本`;
+    }
   }
 
   /* 暂停时把剧本的时间也冻住：transition 的时钟和流的相位都住在 scene.step 里，
@@ -301,12 +486,63 @@ function loop(now) {
 }
 requestAnimationFrame(loop);
 
-/* 截图 / 排查用 */
+/* ───────────────── 截图 / 自测钩子 ─────────────────
+   ?demo=adjust|pan|n8n|pick 会走**真实的手势通道**（gt.down/move/up），
+   不是直接调 scene 的内部方法 —— 否则演练的不是交互。 */
+
+function synthDrag(x, y, dx, dy, steps = 14) {
+  gt.down(x, y);
+  let k = 0;
+  const tick = () => {
+    k++;
+    gt.move(x + (dx * k) / steps, y + (dy * k) / steps);
+    if (k < steps) setTimeout(tick, 16);
+    else setTimeout(() => gt.up(x + dx, y + dy), 40);
+  };
+  setTimeout(tick, 30);
+}
+
+function runDemo(kind) {
+  const A = scene.layers.get('mem')?.anchor;
+  const T = scene.layers.get('load') || scene.layers.get('rs');
+  if (kind === 'adjust' && A) synthDrag(A.x, A.y, 3, 62);        // 往下拖 = 压低
+  if (kind === 'pan' && T) synthDrag(T.anchor.x, (T.box.yTop + T.box.yBase) / 2, 190, 0);
+  if (kind === 'n8n') {
+    const t = scene.layers.get('n8n')?.anchor;
+    if (t) { gt.down(t.x, t.y); setTimeout(() => gt.up(t.x, t.y), 90); }
+  }
+  if (kind === 'pick') {
+    const b = scene.layers.get('choice')?.branches?.[0];
+    if (b) {
+      const h = b.hot;
+      gt.down(h.cx, h.cy);
+      setTimeout(() => gt.up(h.cx, h.cy), 90);
+    }
+  }
+}
+
+const DEMO = q.get('demo');
+if (DEMO) setTimeout(() => runDemo(DEMO), Number(q.get('dly') || 4600));
+
 window.__scene = scene;
 window.__field = f;
 window.__a11y = a11y;
+window.__pacer = pacer;
 window.__clock = () => +clock.toFixed(2);
-window.__seek = (t) => { resetSteps(); clock = t; };
+window.__seek = (t) => { clock = t; next = 0; };
+window.__drag = synthDrag;
+window.__demo = runDemo;
+/* 节拍器自测：连发四个叙事动作，看它是不是真的把间隔拉开了 */
+window.__burst = () => {
+  const t0 = performance.now();
+  const out = [];
+  const mark = (name) => out.push(`${name}@${Math.round(performance.now() - t0)}ms`);
+  pacer.run('set', () => mark('set'));
+  pacer.run('pulse', () => mark('pulse'));
+  pacer.run('patch', () => mark('patch'));
+  pacer.run('transition', () => mark('transition'));
+  return new Promise((r) => setTimeout(() => r(out), 4200));
+};
 </script>
 </body>
 </html>

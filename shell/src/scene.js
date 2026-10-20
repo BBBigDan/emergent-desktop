@@ -24,6 +24,7 @@
 
 import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { FONT, FONT_LAT } from './draw.js';
+import { TIMING } from './timing.js';
 
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -52,6 +53,39 @@ function alongPath(n, fn) {
 
 function arcPoint(cx, cy, r, a) {
   return { x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r };
+}
+
+/**
+ * 一个可交互区域的命中代价。返回 null 表示"没打中"。
+ *
+ * 用"到中心的距离"当代价，而不是布尔命中：分叉的两个分支和它的总锚点会重叠，
+ * 谁的中心更近就是谁。这样"点在左边那股流上"不会误判成"点在分叉上"。
+ */
+function hotDist(h, x, y) {
+  if (!h) return null;
+  if (h.type === 'circle') {
+    const d = Math.hypot(x - h.cx, y - h.cy);
+    return d <= h.r ? d : null;
+  }
+  const inside = x >= h.x0 && x <= h.x1 && y >= h.y0 && y <= h.y1;
+  if (!inside) return null;
+  /* 盒子内部：靠中线越近越优先（折线和进度条都是"越靠中间越像本体"） */
+  return Math.abs(y - (h.y0 + h.y1) / 2) + Math.abs(x - (h.x0 + h.x1) / 2) * 0.02;
+}
+
+/** 窗口内数据的最小/最大值 —— 给读数用，也用来判"窗口里这段是新还是旧" */
+function rangeOf(data, w) {
+  const M = data.length;
+  if (!M) return { min: 0, max: 0 };
+  const a = Math.max(0, Math.floor(w[0] * (M - 1)));
+  const b = Math.min(M - 1, Math.ceil(w[1] * (M - 1)));
+  let min = Infinity;
+  let max = -Infinity;
+  for (let k = a; k <= b; k++) {
+    if (data[k] < min) min = data[k];
+    if (data[k] > max) max = data[k];
+  }
+  return { min, max };
 }
 
 export class FieldScene {
@@ -147,8 +181,8 @@ export class FieldScene {
       t: 0,
       from,
       /* 从当前相干度出发，时长按比例缩 —— 半途被新景打断时不会先"补满"再溶 */
-      outMs: Math.max(80, (opt.outMs ?? 380) * from),
-      inMs: opt.inMs ?? 760,
+      outMs: Math.max(80, (opt.outMs ?? TIMING.out) * from),
+      inMs: opt.inMs ?? TIMING.in,
     };
     return this;
   }
@@ -177,7 +211,24 @@ export class FieldScene {
            弹簧自己会把整条曲线滑过去（DOM 里要逐点 FLIP 才做得到）。 */
         layer.spec.data = op.data;
         this._tracePoints(layer);
-        if (layer.now) layer.now.set(`${Math.round((op.data[op.data.length - 1] ?? 0) * 100)}%`);
+        this._refreshTraceText(layer);
+      }
+      if (op.label != null && layer.spec.kind === 'fork') {
+        /* 分叉的文案可换，几何不动 —— 于是"改成另一个问题"是**零重排**的。
+           这是"决策是排他的"能成立的技术前提：场里只有一个决策槽，
+           新问题来了就地把旧的换掉，不新建、不叠两个。 */
+        layer.spec.label = op.label;
+        layer.title?.set(op.label);
+        if (Array.isArray(op.options)) {
+          layer.spec.options = op.options;
+          op.options.slice(0, 2).forEach((o, k) => {
+            const br = layer.branches[k];
+            if (!br) return;
+            br.option = { ...br.option, ...o };
+            br.hot.option = br.option.id;    // 命中测试读的是 hot 上的 option
+            br.text?.set(o.label || '');
+          });
+        }
       }
     }
     if (this.a11y) this.a11y.announce(this.spec);
@@ -315,6 +366,8 @@ export class FieldScene {
     layer.i = i;
     layer.n = count;
     layer.anchor = { x: cx, y: cy };
+    /* 纵向拖 = 调这个量。140px 走完整个量程，粗调；够用，也够稳。 */
+    layer.hot = { type: 'circle', cx, cy, r: 88, gestures: ['adjust'], range: [0, 1] };
     this.layers.set(spec.id, layer);
 
     const f = this.field;
@@ -365,6 +418,9 @@ export class FieldScene {
     layer.spec = spec;
     layer.i = i;
     layer.anchor = { x: (x0 + x1) / 2, y };
+    /* 整条带子可点，但**不可拖** —— 进度是一个事实（"跑了 62%"），
+       拖它等于让界面说谎。想改进度得由模型确认。 */
+    layer.hot = { type: 'box', x0, x1, y0: y - 30, y1: y + 28, gestures: ['tap'] };
     this.layers.set(spec.id, layer);
 
     const path = (s) => ({
@@ -449,6 +505,10 @@ export class FieldScene {
     layer.N = N;
     layer.box = { x0, x1, yTop, yBase };
     layer.anchor = { x: (x0 + x1) / 2, y: yTop - 34 };
+    /* 横向拖 = 平移观察窗口。**这是唯一一种本地就能执行的手势**：
+       它改的是"看哪一段"，不是"事实是什么"。 */
+    layer.hot = { type: 'box', x0, x1, y0: yTop - 46, y1: yBase + 26, gestures: ['pan'] };
+    if (!layer.win) layer.win = Array.isArray(spec.win) ? spec.win.slice(0, 2) : [0, 1];
     this.layers.set(spec.id, layer);
 
     if (layer.base == null) {
@@ -468,7 +528,7 @@ export class FieldScene {
 
     if (!layer.label) {
       layer.label = new ParticleText({
-        field: f, alloc: this.alloc, x: x0, y: yTop - 30, size: 17, max: 12,
+        field: f, alloc: this.alloc, x: x0, y: yTop - 30, size: 17, max: 14,
         color: '#93b8d8', font: FONT, label: `tr-${spec.id}`,
       });
       layer.now = new ParticleText({
@@ -477,8 +537,7 @@ export class FieldScene {
       });
     }
     layer.label.set(spec.label || '');
-    const d = spec.data || [];
-    layer.now.set(`${Math.round((d[d.length - 1] ?? 0) * 100)}%`);
+    this._refreshTraceText(layer);
     this.traces.push(layer);
     return layer;
   }
@@ -499,20 +558,29 @@ export class FieldScene {
       lo = Number(layer.spec.axis[0]);
       hi = Number(layer.spec.axis[1]);
     } else if (M > 1) {
-      hi = Math.max(0.3, Math.ceil(Math.max(...data) * 12) / 10);
+      /* 标度跟着窗口走：窗口内的峰值才是"这个尺度装不装得下"的答案 */
+      const w0 = layer.win ? layer.win[0] : 0;
+      const w1 = layer.win ? layer.win[1] : 1;
+      const seg = data.slice(Math.floor(w0 * (M - 1)), Math.ceil(w1 * (M - 1)) + 1);
+      hi = Math.max(0.3, Math.ceil(Math.max(...seg) * 12) / 10);
     }
     if (hi - lo < 1e-3) hi = lo + 1;
     if (!layer.xs) {
       layer.xs = new Float32Array(N);
       layer.ys = new Float32Array(N);
     }
+    /* 观察窗口（0..1 的数据域）。默认全量；横向拖动改的是它。
+       有了窗口，"看更早"就变成了本地操作 —— 不需要问模型。 */
+    const w = layer.win || [0, 1];
+    layer.range = rangeOf(data, w);
     const pts = [];
     for (let k = 0; k < N; k++) {
       const s = k / (N - 1);
+      const ss = w[0] + (w[1] - w[0]) * s;
       let v = 0.5;
       if (M === 1) v = data[0];
       else if (M > 1) {
-        const p = s * (M - 1);
+        const p = ss * (M - 1);
         const i0 = Math.floor(p);
         const i1 = Math.min(M - 1, i0 + 1);
         v = data[i0] + (data[i1] - data[i0]) * (p - i0);
@@ -534,11 +602,14 @@ export class FieldScene {
     const cy = a.y + 470;
     const opts = (spec.options || []).slice(0, 2);
     const layer = { spec, anchor: { x: cx, y: cy }, branches: [] };
+    layer.hot = { type: 'circle', cx, cy, r: 66, gestures: ['tap'] };
+    /* 分支各自可点：两个选项共用一个锚点的话，永远分不出点了哪边。
+       必须在 branches 填好之后再把它们挂上去（见函数末尾）。 */
     this.layers.set(spec.id, layer);
 
     const f = this.field;
     const title = new ParticleText({
-      field: f, alloc: this.alloc, x: cx, y: cy - 30, size: 18, max: 10,
+      field: f, alloc: this.alloc, x: cx, y: cy - 30, size: 18, max: 13,
       color: '#93b8d8', align: 'center', font: FONT, label: `f-${spec.id}`,
     });
     title.set(spec.label || '');
@@ -566,8 +637,14 @@ export class FieldScene {
         color: si === 0 ? COL.ok : '#93b8d8', align: 'center', font: FONT, label: `fo-${o.id}`,
       });
       txt.set(o.label || '');
-      layer.branches.push({ option: o, base, idx, path, text: txt, side: dir });
+      const bx = cx + dir * 240;
+      const by = cy + 96;
+      layer.branches.push({
+        option: o, base, idx, path, text: txt, side: dir,
+        hot: { type: 'circle', cx: bx, cy: by, r: 70, gestures: ['pick'], option: o.id },
+      });
     });
+    layer.hots = [layer.hot, ...layer.branches.map((b) => b.hot)];
     return layer;
   }
 
@@ -610,6 +687,8 @@ export class FieldScene {
       });
       layer.text.set(spec.label);
     }
+    /* 点这团乱点 = "这是怎么回事" —— 最自然的下钻入口 */
+    layer.hot = { type: 'circle', cx, cy, r: 74, gestures: ['tap'] };
     this.layers.set(spec.id, layer);
     return base;
   }
@@ -627,7 +706,7 @@ export class FieldScene {
     if (!txt && !layer.detailText) return;
     if (!layer.detailText) {
       layer.detailText = new ParticleText({
-        field: f, alloc: this.alloc, x: p.x, y: p.y + 40, size: 17, max: 16,
+        field: f, alloc: this.alloc, x: p.x, y: p.y + 40, size: 17, max: 14,
         color: COL.ink, align: 'center', font: FONT, label: `d-${s.id}`,
       });
     }
@@ -635,17 +714,103 @@ export class FieldScene {
   }
 
   /** 命中测试：给指针用。返回最近的 layer id（半径 90 内）。 */
+  /**
+   * 命中测试：元素自己声明 `hot`（可交互区域 + 它接受哪些手势）。
+   *
+   * 不能靠"离锚点多远"来判 —— 折线的锚点在标题处，曲线上根本点不到；
+   * 而分叉的两个分支共用一个锚点，就永远分不出用户点了哪边。
+   * 所以每个编码器在布局时就写下自己的可交互范围，这是唯一可靠的做法。
+   *
+   * @returns {{id:string, layer:object, hot:object, option?:string}|null}
+   */
   hit(x, y) {
     let best = null;
-    let bestD = 90 * 90;
+    let bestScore = Infinity;
     for (const [id, l] of this.layers) {
-      if (!l.anchor) continue;
-      const dx = x - l.anchor.x;
-      const dy = y - l.anchor.y;
-      const d = dx * dx + dy * dy;
-      if (d < bestD) { bestD = d; best = id; }
+      for (const h of (l.hots || (l.hot ? [l.hot] : []))) {
+        const score = hotDist(h, x, y);
+        if (score == null || score >= bestScore) continue;
+        bestScore = score;
+        best = { id, layer: l, hot: h, option: h.option };
+      }
     }
     return best;
+  }
+
+  /** 这个位置上有没有可交互的东西（给光标样式用） */
+  at(x, y) {
+    return this.hit(x, y);
+  }
+
+  /**
+   * 折线的观察窗口平移。**本地执行，不经过模型。**
+   *
+   * 这是整个手势体系里唯一被允许"直接生效"的一种，理由是它改的是**看哪一段**
+   * 而不是**事实是什么**。把 3 天前的数据拖到眼前，不改变任何真实状态，
+   * 也不需要谁批准 —— 但"把内存降到 40%"是另一回事（那要模型确认）。
+   *
+   * @param {string} id
+   * @param {number} dx 归一化位移：负 = 往回看（更早），正 = 往后
+   * @returns {{win:number[], atEdge:string|null, moved:boolean}|null}
+   */
+  pan(id, dx) {
+    const layer = this.layers.get(id);
+    if (!layer || layer.spec?.kind !== 'trace') return null;
+    const w = layer.win;
+    const span = w[1] - w[0];
+    let shift = dx * span;
+    let atEdge = null;
+    if (w[0] + shift < 0) { shift = -w[0]; atEdge = 'earlier'; }
+    if (w[1] + shift > 1) { shift = 1 - w[1]; atEdge = 'later'; }
+    const moved = Math.abs(shift) > 1e-4;
+    layer.win = [w[0] + shift, w[1] + shift];
+    this._tracePoints(layer);
+    this._refreshTraceText(layer);
+    return { win: layer.win.slice(), atEdge, moved };
+  }
+
+  /** 窗口复位。换数据、或用户双击时用。 */
+  resetWin(id, win) {
+    const layer = this.layers.get(id);
+    if (!layer) return null;
+    layer.win = win ? win.slice(0, 2) : [0, 1];
+    this._tracePoints(layer);
+    this._refreshTraceText(layer);
+    return layer.win.slice();
+  }
+
+  /**
+   * 把一层的文字淡下去（或恢复）。
+   *
+   * 用在哪：折线被平移之后，原来那条"周四 21:00 有一次尖峰"就**不再成立**了 ——
+   * 屏幕上已经没有周四了。这时候不能本地改写结论（那是模型的话），
+   * 也不该直接删掉（人会觉得刚才那条结论凭空消失）。
+   * 正确处理是**把它淡成"这属于上一段视角"**，等模型给出新的结论再替换。
+   */
+  ghost(id, on = true) {
+    const layer = this.layers.get(id);
+    const txt = layer?.text || layer?.detailText || layer?.num;
+    if (!txt || !layer.spec) return false;
+    const s = layer.spec.text || layer.spec.detail || '';
+    txt.set(s, { scl: on ? 0.3 : 1, force: true });
+    layer.ghosted = on;
+    return true;
+  }
+
+  /**
+   * 折线的两处文字：标题 + 窗口末端的读数。
+   *
+   * 平移之后必须重算，否则标题还写着"7 天"、其实只看了 3 天 —— 那是**界面在说谎**，
+   * 比手势没反应严重得多。
+   */
+  _refreshTraceText(layer) {
+    const spec = layer.spec || {};
+    const data = spec.data || [];
+    const w = layer.win || [0, 1];
+    const older = w[1] < 0.999;
+    layer.label?.set(`${spec.label || ''}${older ? ' ←' : ''}`);
+    const idx = Math.min(data.length - 1, Math.round(w[1] * (data.length - 1)));
+    layer.now?.set(`${Math.round((data[idx] ?? 0) * 100)}%`);
   }
 }
 
