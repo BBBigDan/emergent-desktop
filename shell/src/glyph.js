@@ -1,6 +1,6 @@
 /**
  * 图标字形库 —— 用白色墨迹在 100×100 的逻辑画布上画出「图形」，
- * 由 dockIcon.js 按格子统计覆盖率 → 排成粒子。
+ * 由 rail.js 按格子统计覆盖率 → 排成粒子（左边缘应用栏）。
  *
  * 为什么不用官方那张 PNG 直接降采样：
  *   Olares 的图标是满幅插画（橙色文件夹铺满整张 256×256），
@@ -68,11 +68,11 @@ function appstore(c) {
   c.lineTo(21, 88);
   c.closePath();
   c.fill();
-  c.lineWidth = 9;
+  c.lineWidth = 12;
   c.beginPath();
-  c.moveTo(33, 38);
-  c.quadraticCurveTo(33, 13, 50, 13);
-  c.quadraticCurveTo(67, 13, 67, 38);
+  c.moveTo(34, 40);
+  c.quadraticCurveTo(34, 12, 50, 12);
+  c.quadraticCurveTo(66, 12, 66, 40);
   c.stroke();
   /* 包扣：一个小圆洞 */
   c.globalCompositeOperation = 'destination-out';
@@ -82,27 +82,30 @@ function appstore(c) {
   c.globalCompositeOperation = 'source-over';
 }
 
-/** 设置：齿轮 —— 粗齿 + 轮辐 + 轴孔（官方是金属齿轮） */
+/** 设置：齿轮 —— 实心盘挖 6 个齿隙 + 轴孔（官方是金属齿轮） */
 function settings(c) {
   const cx = 50, cy = 50;
-  /* 轮盘：中间挖空，留一圈厚壁 */
-  c.lineWidth = 16;
+  /* 实心盘 + 挖洞：25 格的栅格下，"描边+齿"会糊成一圈雪花，
+     实心块挖缺口才能读出"齿轮"的外形 */
   c.beginPath();
-  circle(c, cx, cy, 25);
-  c.stroke();
-  /* 8 颗宽齿 */
-  c.lineWidth = 17;
-  for (let i = 0; i < 8; i++) {
-    const a = (i / 8) * TAU + Math.PI / 8;
+  circle(c, cx, cy, 32);
+  c.fill();
+
+  c.globalCompositeOperation = 'destination-out';
+  /* 轴孔 */
+  c.beginPath();
+  circle(c, cx, cy, 12);
+  c.fill();
+  /* 6 个齿隙：从外缘往里切，剩下的弧就是齿 */
+  c.lineWidth = 11;
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * TAU + Math.PI / 6;
     c.beginPath();
-    c.moveTo(cx + Math.cos(a) * 28, cy + Math.sin(a) * 28);
-    c.lineTo(cx + Math.cos(a) * 44, cy + Math.sin(a) * 44);
+    c.moveTo(cx + Math.cos(a) * 37, cy + Math.sin(a) * 37);
+    c.lineTo(cx + Math.cos(a) * 23, cy + Math.sin(a) * 23);
     c.stroke();
   }
-  /* 轴：实心圆 */
-  c.beginPath();
-  circle(c, cx, cy, 11);
-  c.fill();
+  c.globalCompositeOperation = 'source-over';
 }
 
 /** 保险库：环 + 钥匙孔（官方是黄底黑钥匙孔） */
@@ -182,10 +185,10 @@ function controlHub(c) {
   c.globalCompositeOperation = 'source-over';
   /* 内部斜线：暗示"工具"（螺丝刀），同时把大块实心打散 */
   c.globalCompositeOperation = 'destination-out';
-  c.lineWidth = 6;
+  c.lineWidth = 9;
   c.beginPath();
-  c.moveTo(30, 78);
-  c.lineTo(70, 38);
+  c.moveTo(32, 76);
+  c.lineTo(72, 40);
   c.stroke();
   c.globalCompositeOperation = 'source-over';
 }

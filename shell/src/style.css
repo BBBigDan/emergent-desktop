@@ -38,7 +38,10 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
 /* ───────────────────────── 窗口 ───────────────────────── */
 .win {
   position: absolute; border-radius: 18px; overflow: hidden;
-  --edge: 64px; --edge-y: 46px; --corner: 150px; --rev: 0;
+  /* --bar 是标题栏高度。iframe 用 padding-top 让出这一条，绝不能用"盖上去"——
+     官方桌面也是这么做的（.iframe-box .iframe-window{padding-top:40px}），
+     否则标题栏会压住应用自己的头部（应用根本不知道外面还有一层壳）。 */
+  --edge: 64px; --edge-y: 46px; --corner: 150px; --rev: 0; --bar: 40px;
   isolation: isolate;                       /* backdrop 只吃自己内部的像素 */
   /* 整窗一起淡入：这样 veil / frost 不会在粒子还没成型时先露出一个空板子 */
   opacity: var(--rev);
@@ -49,14 +52,18 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
   box-shadow: 0 0 26px rgba(88, 178, 255, 0.20), 0 0 90px rgba(44, 130, 255, 0.14);
   opacity: var(--rev);
 }
+.win.void { visibility: hidden; }   /* rev≈0：连 backdrop-filter 一起停掉，见 window.js */
 .win.minimized { display: none; }
 .win.revealed { will-change: auto; }
 .win.revealed .win-frame { pointer-events: auto; }
 
-/* iframe 只做 opacity 淡入 —— 不缩放、不裁剪，内容像素不被重新栅格化 */
+/* iframe 只做 opacity 淡入 —— 不缩放、不裁剪，内容像素不被重新栅格化。
+   padding-top 把内容整体下移 --bar：应用自己的头部（标题/搜索/按钮）完整露出来，
+   而不是被我们的标题栏压在下面。iframe 内部视口也因此少了 40px，不会出现滚动条。 */
 .win-frame {
   position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block;
-  background: #070b14;
+  padding-top: var(--bar);
+  background: transparent;                  /* 让标题栏那条露出粒子/玻璃 */
   pointer-events: none;                     /* 还没显形前不要抢点击 */
   --fm:
     linear-gradient(to right, rgba(0,0,0,.40) 0, rgba(0,0,0,.70) calc(var(--edge) * .42), #000 calc(var(--edge) * 1.20), #000 calc(100% - var(--edge) * 1.20), rgba(0,0,0,.70) calc(100% - var(--edge) * .42), rgba(0,0,0,.40) 100%),
@@ -132,14 +139,17 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
   .win-veil { background: rgba(10, 22, 44, 0.86); }
 }
 
-/* 标题栏：只在窗口显形后出现，避免"框先于页面" */
+/* 标题栏：只在窗口显形后出现，避免"框先于页面"。
+   它占的是 iframe 让出来的那一条（见 .win-frame 的 padding-top），
+   所以下面是应用自己的头部，两层不再打架。 */
 .win-bar {
-  position: absolute; left: 0; right: 0; top: 0; height: 40px; z-index: 4;
+  position: absolute; left: 0; right: 0; top: 0; height: var(--bar); z-index: 4;
   display: flex; align-items: center; gap: 8px; padding: 0 10px 0 14px;
   cursor: default;
   opacity: clamp(0, calc((var(--rev) - .55) / .45), 1);
   transform: translateY(calc((1 - var(--rev)) * -6px));
-  background: linear-gradient(180deg, rgba(8, 16, 30, 0.55), rgba(8, 16, 30, 0.12));
+  background: linear-gradient(180deg, rgba(9, 17, 32, 0.72), rgba(9, 17, 32, 0.34));
+  border-bottom: 1px solid rgba(148, 178, 255, 0.10);
   pointer-events: none;
 }
 .win.revealed .win-bar { pointer-events: auto; }
@@ -155,37 +165,81 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
 .win-btn:hover { background: rgba(255, 255, 255, .12); color: var(--text); }
 .win-close:hover { background: rgba(255, 86, 86, .28); color: #ffd9d9; }
 
-/* ───────────────────────── dock ───────────────────────── */
-#dock {
-  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
-  z-index: 6; display: flex; align-items: center; gap: 6px;
-  padding: 8px 10px; border-radius: 16px;
-  background: rgba(10, 16, 28, 0.52);
-  border: 1px solid var(--line);
-  backdrop-filter: blur(14px) saturate(1.1);
-  -webkit-backdrop-filter: blur(14px) saturate(1.1);
+/* ───────────────────────── 左边缘应用栏 ───────────────────────── */
+/* 常驻的只有左边缘一条透明触发带；图标本身是粒子（详见 rail.js / field.js），
+   这里只放命中区 + 悬停才出现的名字。
+   桌面空着时给 26px（好靠），有窗口时收到 14px（别挡住窗口左边那条边）。 */
+.rail-zone {
+  position: fixed; left: 0; top: 0; bottom: 0; width: 26px; z-index: 7;
 }
-/* 图标是粒子画的（dockicon.js）：按钮开到 56px，才有 22 格点阵的空间画清字形 */
-.dock-item {
-  width: 56px; height: 56px; border: 0; border-radius: 15px; cursor: pointer;
-  background: transparent;                 /* 图标本身是粒子，底板会挡光 */
-  color: var(--text); font-size: 17px; font-family: inherit; padding: 0;
-  display: flex; align-items: center; justify-content: center;
-  transition: transform .18s cubic-bezier(.2,.9,.3,1.2), background .18s;
-}
-.dock-item:hover { transform: translateY(-6px) scale(1.04); background: rgba(255, 255, 255, 0.06); }
-.dock-item.active { background: rgba(95, 216, 255, 0.14); box-shadow: 0 0 0 1px rgba(95,216,255,.35), 0 0 18px rgba(95,216,255,.22); }
-.dock-icon { width: 52px; height: 52px; display: block; }
-.dock-icon canvas { display: block; }
-.dock-logout { margin-left: 6px; color: var(--dim); font-size: 15px; }
-.dock-logout:hover { color: #ffb3b3; }
-
-/* ───────────────────────── HUD / 启动 ───────────────────────── */
-#hud {
-  position: fixed; left: 16px; top: 14px; z-index: 6;
-  font-size: 11px; letter-spacing: .04em; color: var(--dim2);
+body.has-win .rail-zone { width: 14px; }
+.rail {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
   pointer-events: none;
 }
+.rail-item {
+  position: absolute; padding: 0; border: 0; border-radius: 12px;
+  background: transparent; color: var(--text); font-family: inherit;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; pointer-events: none;
+}
+.rail-zone.open .rail-item { pointer-events: auto; }
+.rail-label {
+  position: absolute; left: calc(100% + 9px); top: 50%;
+  transform: translate(-5px, -50%);
+  font-size: 11.5px; letter-spacing: .05em; white-space: nowrap;
+  color: rgba(226, 240, 255, .64);
+  text-shadow: 0 0 10px rgba(20, 60, 120, .9);
+  pointer-events: none; opacity: 0;
+  transition: opacity .18s ease, transform .18s ease;
+}
+.rail-item:hover .rail-label { opacity: 1; transform: translate(0, -50%); }
+/* 已打开的应有标记，但只在悬停时才把名字带上 —— 常驻一个飘着的名字很怪 */
+.rail-item.active .rail-label { color: rgba(150, 232, 255, .92); }
+.rail-logout .rail-label { color: rgba(255, 186, 186, .66); }
+
+/* ───────────────────────── 右下角设备状态 ───────────────────────── */
+/* 和应用栏同一套分工：常驻的只有右下角一块透明触发区；
+   仪表盘本体是粒子（status.js 出点阵，field.js 负责流与绘制），
+   这里只放表名和那行设备信息，位置跟点阵里的环心严格对齐。 */
+.stat-zone {
+  position: fixed; right: 0; bottom: 0; width: 168px; height: 168px; z-index: 7;
+}
+/* 有窗口时收一圈（和左边缘应用栏一个道理）：角落里开着窗口时，
+   168px 的透明块会挡住窗口右下角的点击/拖拽 */
+body.has-win .stat-zone { width: 120px; height: 120px; }
+
+/* 展开后覆盖整块面板：指针从角落移到面板上时不能掉出触发区，
+   否则手刚放上去面板就散了 */
+.stat-zone.open { width: 430px; height: 246px; }
+.stat {
+  position: absolute; right: 20px; bottom: 22px; pointer-events: none;
+  --rev: 0; opacity: calc(var(--rev) * 1);
+  transition: opacity .1s linear;
+}
+/* rev≈0 时连字一起停绘制（照窗口 .win.void 的做法） */
+.stat.void { visibility: hidden; }
+.stat-head {
+  position: absolute; left: 18px; right: 18px; top: 12px;
+  display: flex; justify-content: flex-end; align-items: baseline;
+  font-size: 10.5px; letter-spacing: .18em; color: rgba(226, 240, 255, .52);
+  text-shadow: 0 0 12px rgba(20, 60, 120, .95);
+}
+.stat-cap { font-size: 9.5px; letter-spacing: .1em; color: rgba(150, 216, 255, .40); }
+.stat-lab {
+  position: absolute; transform: translate(-50%, -50%);
+  font-size: 9.5px; letter-spacing: .2em;
+  color: rgba(226, 240, 255, .40);
+  text-shadow: 0 0 12px rgba(20, 60, 120, .95);
+  white-space: nowrap;
+}
+.stat-lab i {
+  font-style: normal; letter-spacing: .06em; font-size: 8.5px;
+  color: rgba(226, 240, 255, .26);
+}
+body.launching .stat-zone { display: none; }
+
+/* ───────────────────────── HUD / 启动 ───────────────────────── */
 #boot {
   position: fixed; inset: 0; z-index: 9; display: flex; align-items: center; justify-content: center;
   background: var(--bg); color: var(--dim); font-size: 12px; letter-spacing: .3em;
@@ -194,3 +248,32 @@ body.grabbing, body.grabbing * { cursor: grabbing !important; }
 #boot.hide { opacity: 0; pointer-events: none; }
 .boot-err { text-align: center; letter-spacing: 0; line-height: 1.9; font-size: 13px; }
 .boot-err small { color: var(--dim2); font-size: 11px; }
+
+/* ───────────────────────── 应用列表（launchpad） ───────────────────────── */
+/* 图标本身是 WebGL 粒子（field.js 的 launch 组 + launcher.js 的采样），
+   这里只有：透明的命中区、名字、底部手势提示。 */
+.launch {
+  position: fixed; inset: 0; z-index: 8; pointer-events: none;
+}
+.lp-tile {
+  position: absolute; left: 0; top: 0; padding: 0; border: 0;
+  background: transparent; cursor: pointer; pointer-events: none;
+  opacity: 0; will-change: transform, opacity;
+}
+.lp-tile::after {
+  content: ""; position: absolute; inset: -7%; border-radius: 26%; pointer-events: none;
+  box-shadow: 0 0 0 rgba(120, 200, 255, 0);
+  transition: box-shadow .2s ease;
+}
+.lp-tile:hover::after {
+  box-shadow: 0 0 30px rgba(120, 200, 255, .18), inset 0 0 0 1px rgba(160, 214, 255, .22);
+}
+.lp-name {
+  position: absolute; left: 0; top: 0; pointer-events: none;
+  font-size: 12.5px; letter-spacing: .02em; white-space: nowrap;
+  color: rgba(226, 240, 255, .88);
+  text-shadow: 0 1px 12px rgba(4, 10, 24, .92), 0 0 22px rgba(4, 10, 24, .7);
+  opacity: 0;
+}
+body.launching .rail-zone { display: none; }
+

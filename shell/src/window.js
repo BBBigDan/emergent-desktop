@@ -20,7 +20,8 @@ export class ShellWindow {
     this.rev = 0;
 
     const el = document.createElement('div');
-    el.className = 'win';
+    /* void：还没显形（rev≈0）时 visibility:hidden，见 setReveal 的注释 */
+    el.className = 'win void';
     el.innerHTML = `
       <iframe class="win-frame" allow="clipboard-read; clipboard-write; fullscreen"></iframe>
       <div class="win-frost"></div>
@@ -119,6 +120,9 @@ export class ShellWindow {
     this.rev = rev;
     this.el.style.setProperty('--rev', rev.toFixed(3));
     this.el.classList.toggle('revealed', rev > 0.995);
+    /* rev≈0 时彻底停止绘制。opacity:0 不够：Chrome 的 backdrop-filter 不跟
+       祖先 opacity 走，窗口"淡到 0"之后屏幕上还会留一块模糊的板（关窗时实测可见）。 */
+    this.el.classList.toggle('void', rev < 0.002);
   }
 
   requestClose() {

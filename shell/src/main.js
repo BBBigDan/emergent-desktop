@@ -1,22 +1,74 @@
 /**
- * 壳层入口：拿应用列表 → 画 dock → 点击时从粒子里长出一个窗口。
+ * 壳层入口：拿应用列表 → 左侧边缘的应用栏 → 点击时从粒子里长出一个窗口。
+ *
+ * 应用栏不常驻：鼠标贴到屏幕左边，粒子才聚成图标；移开就散。
+ * 图标是 WebGL 粒子画的（field.js 的 rail 组），DOM 那层是透明的命中区。
  */
 import { Field } from './field.js';
 import { ShellWindow } from './window.js';
-import { createDockIcon } from './dockicon.js';
+import { createRail } from './rail.js';
+import { createLauncher } from './launcher.js';
+import { createStatus } from './status.js';
 import { myApps, gotoLogin, logout, terminusBase } from './api.js';
 
 const field = new Field(document.getElementById('scene'));
 const wins = new Map();          // group -> ShellWindow
 const freeGroups = [2, 1, 0];    // 后进先出，避免和已有窗口抢同一组粒子
 const boot = document.getElementById('boot');
-const dockEl = document.getElementById('dock');
-const hudEl = document.getElementById('hud');
+
+let rail = null;
+let launch = null;
+let status = null;
 
 window.addEventListener('resize', () => {
   field.resize();
+  if (rail) field.setRailCenters(rail.layout());
+  status?.layout();
   for (const w of wins.values()) field.setRect(w.g, w.rect);
 });
+
+/* ------------------------- 应用列表（launchpad） -------------------------
+ * 手势：**按住鼠标来回快速甩**。桌面 → 3D 圆环画廊 → 2D 平铺 → 桌面（循环）。
+ *   - 每一"甩"由 field.detectFlick 在拖动过程中判（不要求松手）；
+ *   - 这里只负责数"两下"：1.1s 内凑够两次才算一组。
+ * 为什么用甩动而不是按钮：桌面平时没有任何 UI，甩动是唯一不打断沉浸的手势。 */
+let flicks = [];
+let flickLock = 0;
+
+function cycleLaunch() {
+  const next = field.launchMode === 2 ? 0 : field.launchMode + 1;
+  if (!next) {
+    launch?.close();
+    field.setLaunchMode(0);
+    return;
+  }
+  rail?.close();
+  launch?.open(next);
+  field.setLaunchMode(next);
+}
+
+/* 点应用栏里的「启动台」：直接进平铺 —— 官方的 launchpad 本来就是网格那种 */
+function openLaunchpad() {
+  if (!launch || field.launchMode === 2) return;
+  rail?.close();
+  launch.open(2);
+  field.setLaunchMode(2);
+}
+
+function onFlick() {
+  const now = performance.now();
+  /* 刚切完视图，手还在按着往回收，惯性里很容易再蹭出一下。
+     冷却期内不收 —— 不然"甩两下进列表"会连着变成"甩四下进平铺"。 */
+  if (now < flickLock) return;
+  flicks = flicks.filter((t) => now - t < 1100);
+  flicks.push(now);
+  if (flicks.length >= 2) {
+    flicks = [];
+    flickLock = now + 850;
+    cycleLaunch();
+    return;
+  }
+}
 
 /* ------------------------------- 主循环 ------------------------------- */
 let last = performance.now();
@@ -25,14 +77,22 @@ function loop(now) {
   last = now;
   field.step(dt);
   for (const [g, w] of wins) w.setReveal(field.revealOf(g));
+  /* 图标是粒子画的，DOM 那层只负责名字/命中区，位置每帧跟着投影走 */
+  if (launch?.isOpen()) launch.sync((i) => field.lpScreen[i] || null);
+  /* 面板的文字跟着粒子走：粒子流到位，字才浮出来（同窗口的 --rev） */
+  status?.sync(field.statReveal());
   field.render();
 
   // 散开结束后才真正移除 DOM，避免粒子还在飞但窗口已经消失
   for (const [g, w] of wins) {
     if (w.dying && !field.groups[g].active) {
+      const id = w.app.id;
       w.destroy();
       wins.delete(g);
       freeGroups.unshift(g);
+      /* 那个应用没有别的窗口了，就把应用栏里的"已打开"标记清掉 */
+      if (![...wins.values()].some((x) => x.app.id === id)) rail?.setActive('');
+      if (!wins.size) document.body.classList.remove('has-win');
     }
   }
   requestAnimationFrame(loop);
@@ -40,7 +100,12 @@ function loop(now) {
 requestAnimationFrame(loop);
 
 /* ------------------------------- 窗口管理 ------------------------------- */
-function openApp(app) {
+function openApp(app, at) {
+  /* 从应用列表里点开：先退出列表（图标散开），再把窗口从粒子里长出来 */
+  if (field.launchMode) {
+    launch?.close();
+    field.setLaunchMode(0);
+  }
   // 已经开着就置前
   for (const [, w] of wins) {
     if (w.app.id === app.id) {
@@ -71,8 +136,8 @@ function openApp(app) {
     field.close(g);
   };
   stage(w, app);
-  dockIcons.get(app.id)?.burst();
-  field.open(g, w.rect);
+  field.open(g, w.rect, at);
+  document.body.classList.add('has-win');
 }
 
 let zTop = 10;
@@ -80,45 +145,7 @@ let zTop = 10;
 function stage(w, app) {
   // 同标题栏重叠时点一下能置前
   w.el.addEventListener('pointerdown', () => { w.el.style.zIndex = String(++zTop); });
-  dockEl.querySelectorAll('.dock-item').forEach((d) =>
-    d.classList.toggle('active', d.dataset.id === app.id && !w.dying));
-}
-
-/* ------------------------------- dock ------------------------------- */
-/* 图标不是 <img>，是粒子画的：glyph.js 出字形 → dockicon.js 采样成点阵 */
-const ICON = 52;
-const dockIcons = new Map();     // app.id -> icon
-
-function dockButton(cls, label) {
-  const b = document.createElement('button');
-  b.className = 'dock-item' + (cls ? ' ' + cls : '');
-  b.title = label;
-  const slot = document.createElement('span');
-  slot.className = 'dock-icon';
-  b.appendChild(slot);
-  b.addEventListener('pointerenter', () => iconOf(b)?.setHover(true));
-  b.addEventListener('pointerleave', () => iconOf(b)?.setHover(false));
-  return { b, slot };
-}
-const iconOf = (b) => b.__icon;
-
-function renderDock(apps) {
-  dockEl.innerHTML = '';
-  dockIcons.clear();
-  for (const app of apps) {
-    const { b, slot } = dockButton('', app.title);
-    b.dataset.id = app.id;
-    const ic = createDockIcon(slot, { name: app.name, title: app.title, size: ICON });
-    b.__icon = ic;
-    dockIcons.set(app.id, ic);
-    b.addEventListener('click', () => { ic.burst(); openApp(app); });
-    dockEl.appendChild(b);
-  }
-  // 登出放在最右
-  const { b: out, slot: oslot } = dockButton('dock-logout', '登出');
-  out.__icon = createDockIcon(oslot, { glyph: 'power', title: '登出', size: ICON });
-  out.addEventListener('click', logout);
-  dockEl.appendChild(out);
+  rail?.setActive(app.id);
 }
 
 function escapeHtml(s) {
@@ -129,10 +156,58 @@ function escapeHtml(s) {
 (async function start() {
   try {
     const apps = await myApps();
-    renderDock(apps);
-    hudEl.textContent = `${terminusBase()} · ${apps.length} 个应用`;
+
+    rail = createRail({
+      apps,
+      onPick: (app, at) => openApp(app, at),
+      onLaunchpad: openLaunchpad,
+      onLogout: logout,
+      onOpen: (ptr) => field.openRail(ptr),
+      onClose: () => field.closeRail(),
+      onHover: (i, v) => field.setRailHover(i, v),
+      onBurst: (i) => field.closeRail(i),
+      onActive: (i) => field.setRailActive(i),
+      /* 官方图标是异步换上的，到了就重建一次槽位（sig 带 rev，能识别出换过） */
+      onIcons: () => { if (rail) field.setRail(rail.items, rail.layout()); },
+    });
+    // 先给点阵，再给屏幕坐标：field 两侧都齐了才开始有目标可拉
+    field.setRail(rail.items, rail.layout());
+
+    /* 应用列表用同一批应用（和左边缘应用栏同一个数据源），
+       但图标采样更细：132px 的方框配 44 格 */
+    launch = createLauncher({
+      apps,
+      onPick: (app, at) => openApp(app, at),
+      onHover: (i, v) => field.setLaunchHover(v ? i : -1),
+      onDots: (items) => field.setLaunch(items),
+    });
+    field.setLaunch(launch.items);
+
+    /* 右下角设备状态：走的是和应用栏同一条"流"，只是目标换成了仪表盘点阵 */
+    status = createStatus({
+      onOpen: () => field.openStat(),
+      onClose: () => field.closeStat(),
+      onDots: (dots, panel) => field.setStat(dots, panel),
+    });
+    status.layout();
+    field.setStat(status.dots, status.panel);
+
+    field.onFlick = onFlick;
+    /* 图标上的"按下-抬起"（几乎没位移）当成点击：位置判定在 field 里做 */
+    field.onIcon = (i) => launch?.pick(i);
+
+    /* ?debug=1 时把内部对象挂出去，便于用 CDP 量粒子状态 */
+    if (new URLSearchParams(location.search).has('debug')) {
+      window.__em = { field, rail, launch, status, wins, cycleLaunch };
+    }
+
     boot.classList.add('hide');
     setTimeout(() => boot.remove(), 700);
+
+    /* ?stat=1 直接展开设备状态面板：调参时不用把鼠标挪到角落 */
+    if (new URLSearchParams(location.search).has('stat')) {
+      setTimeout(() => status.open(), 700);
+    }
 
     // ?open=<id|title 关键字> 直接开一个，便于反复调参
     const want = new URLSearchParams(location.search).get('open');
@@ -146,13 +221,28 @@ function escapeHtml(s) {
   }
 })();
 
-// Esc 关闭最上层窗口
+/* ------------------------------- 全屏 -------------------------------
+ * F 键切全屏。不加任何提示文案 —— 桌面平时一个字都没有，全靠手势/按键，
+ * 看过仓库的人知道有这回事。iframe 里的按键不会冒泡到本文档，所以不影响应用内部。 */
+function toggleFullscreen() {
+  const d = document;
+  if (d.fullscreenElement) { d.exitFullscreen?.().catch(() => {}); return; }
+  d.documentElement.requestFullscreen?.({ navigationUI: 'hide' }).catch(() => {});
+}
+
+// Esc：先退出应用列表，再收应用栏，都没有就关最上层窗口
 const _esc = () => {
+  if (field.launchMode) { launch?.close(); field.setLaunchMode(0); return; }
+  if (rail?.isOpen()) { rail.close(); return; }
   let top = null;
   for (const w of wins.values()) if (!w.dying && (!top || +w.el.style.zIndex > +top.el.style.zIndex)) top = w;
   top?.requestClose();
 };
 window.addEventListener('keydown', (e) => {
+  if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    toggleFullscreen();
+    return;
+  }
   if (e.key === 'Escape') {
     if (document.activeElement?.tagName === 'IFRAME') return;  // iframe 里的 Esc 不算
     _esc();

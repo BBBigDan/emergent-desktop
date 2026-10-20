@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>launchpad only</title>
+<link rel="stylesheet" href="./src/style.css">
+</head>
+<body>
+  <div id="bg"></div>
+  <canvas id="scene"></canvas>
+  <div id="hud"></div>
+
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+  <script type="module">
+    import { Field } from './src/field.js';
+    import { createLauncher } from './src/launcher.js';
+
+    const CDN = 'https://app.cdn.olares.com/appstore/';
+    const APPS = [
+      ['files', 'Files'], ['vault', 'Vault'], ['appstore', 'Market'],
+      ['settings', 'Settings'], ['profile', 'Profile'], ['dashboard', 'Dashboard'],
+      ['control-hub', 'Control Hub'], ['files', 'Files 2'],
+    ];
+    const apps = APPS.map(([name, title], i) => ({
+      id: 'x:' + name + i, name, title, icon: CDN + name + '/icon.png',
+    }));
+
+    const field = new Field(document.getElementById('scene'));
+    const launch = createLauncher({
+      apps,
+      onPick: (a) => console.info('[pick]', a.id),
+      onHover: (i, v) => field.setLaunchHover(v ? i : -1),
+      onDots: (items) => field.setLaunch(items),
+    });
+    field.setLaunch(launch.items);
+
+    function cycle() {
+      const next = field.launchMode === 2 ? 0 : field.launchMode + 1;
+      if (!next) { launch.close(); field.setLaunchMode(0); return; }
+      launch.open(next);
+      field.setLaunchMode(next);
+    }
+    field.onFlick = cycle;
+
+    window.addEventListener('resize', () => field.resize());
+
+    let last = performance.now();
+    (function loop(now) {
+      const dt = Math.min((now - last) / 1000, 1 / 20);
+      last = now;
+      field.step(dt);
+      if (launch.isOpen()) launch.sync((i) => field.lpScreen[i] || null);
+      field.render();
+      requestAnimationFrame(loop);
+    })(last);
+
+    window.__field = field;
+    window.__launch = launch;
+    window.__cycle = cycle;
+  </script>
+</body>
+</html>

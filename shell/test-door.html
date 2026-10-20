@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>particle door</title>
+<link rel="stylesheet" href="./src/style.css">
+<style>
+  /* 只用一个半透明的框代替真窗口：验收的是"门"的粒子，不是 iframe */
+  #fake {
+    position: fixed; border: 1px solid rgba(120,190,255,.35);
+    border-radius: 18px; background: rgba(40,90,160,.10);
+    opacity: var(--rev, 0); transition: opacity .2s linear;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="bg"></div>
+  <canvas id="scene"></canvas>
+  <div id="hud"></div>
+  <div id="fake"></div>
+
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+  <script type="module">
+    import { Field } from './src/field.js';
+
+    const field = new Field(document.getElementById('scene'));
+    const fake = document.getElementById('fake');
+
+    const w = Math.round(Math.min(window.innerWidth * 0.78, 1440));
+    const h = Math.round(Math.min(window.innerHeight * 0.76, 920));
+    const rect = {
+      x: Math.round((window.innerWidth - w) / 2),
+      y: Math.round((window.innerHeight - h) / 2),
+      w, h,
+    };
+    Object.assign(fake.style, {
+      left: rect.x + 'px', top: rect.y + 'px', width: w + 'px', height: h + 'px',
+    });
+
+    const G = 0;
+    function open() { field.open(G, rect); }
+    function close() { field.close(G); }
+    window.__open = open;
+    window.__close = close;
+
+    /* ?open=200&close=3600：按时刻表跑，方便用 CDP 在不同时间点截图 */
+    const q = new URLSearchParams(location.search);
+    if (q.has('open')) setTimeout(open, +q.get('open'));
+    if (q.has('close')) setTimeout(close, +q.get('close'));
+
+    let last = performance.now();
+    (function loop(now) {
+      const dt = Math.min((now - last) / 1000, 1 / 20);
+      last = now;
+      field.step(dt);
+      fake.style.setProperty('--rev', field.revealOf(G).toFixed(3));
+      field.render();
+      requestAnimationFrame(loop);
+    })(last);
+
+    window.__field = field;
+  </script>
+</body>
+</html>

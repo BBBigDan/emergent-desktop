@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>rail only</title>
+<link rel="stylesheet" href="./src/style.css">
+</head>
+<body>
+  <div id="bg"></div>
+  <canvas id="scene"></canvas>
+  <div id="hud"></div>
+
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+  <script type="module">
+    import { Field } from './src/field.js';
+    import { createRail } from './src/rail.js';
+
+    const CDN = 'https://app.cdn.olares.com/appstore/';
+    const APPS = [
+      ['files', 'Files'], ['vault', 'Vault'], ['market', 'Market'],
+      ['settings', 'Settings'], ['profile', 'Profile'], ['dashboard', 'Dashboard'],
+      ['control-hub', 'Control Hub'],
+    ];
+    const apps = APPS.map(([name, title]) => ({
+      id: 'x:' + name, name, title,
+      icon: CDN + (name === 'market' ? 'appstore' : name) + '/icon.png',
+    }));
+
+    const field = new Field(document.getElementById('scene'));
+    const rail = createRail({
+      apps,
+      onOpen: (p) => field.openRail(p),
+      onClose: () => field.closeRail(),
+      onHover: (i, v) => field.setRailHover(i, v),
+      onBurst: (i) => field.closeRail(i),
+      onActive: (i) => field.setRailActive(i),
+      onPick: (a) => console.info('[pick]', a.id),
+      onIcons: () => field.setRail(rail.items, rail.layout()),
+    });
+    field.setRail(rail.items, rail.layout());
+
+    window.addEventListener('resize', () => {
+      field.resize();
+      field.setRailCenters(rail.layout());
+    });
+
+    let last = performance.now();
+    (function loop(now) {
+      const dt = Math.min((now - last) / 1000, 1 / 20);
+      last = now;
+      field.step(dt);
+      field.render();
+      requestAnimationFrame(loop);
+    })(last);
+
+    window.__field = field;
+    window.__rail = rail;
+  </script>
+</body>
+</html>
