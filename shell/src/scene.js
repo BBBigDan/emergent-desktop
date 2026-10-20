@@ -63,7 +63,10 @@ export class FieldScene {
   constructor(o) {
     this.field = o.field;
     this.area = o.area;
-    this.alloc = new SlotAllocator(6400);
+    /* slotStart：场之外的常驻元素（比如演示页的提问字幕）先占住 0..N，
+       场景从 N 往后分配。槽位是一条直线，两个分配器各开一个必然互相覆盖。 */
+    this.slotStart = o.slotStart || 0;
+    this.alloc = new SlotAllocator(6400, this.slotStart);
     this.layers = new Map();     // id -> { spec, nodes }
     this.texts = [];             // ParticleText
     this.flows = [];             // { idx:Uint16Array, path, speed, span, s0 }
@@ -82,7 +85,7 @@ export class FieldScene {
   set(spec) {
     const f = this.field;
     const a = this.area;
-    this.alloc = new SlotAllocator(6400);
+    this.alloc = new SlotAllocator(6400, this.slotStart);
     this.layers.clear();
     this.texts.length = 0;
     this.flows.length = 0;
@@ -162,12 +165,12 @@ export class FieldScene {
       if (op.progress != null && layer.spec.kind === 'stream') {
         layer.spec.progress = clamp(op.progress, 0, 1);
         this._stream(layer.spec, layer.i, this.area, layer);
-        if (layer.detail) this._detail(layer.spec, this.area, layer);
+        if (layer.detail) this._detail(layer, this.area);
       }
       if (op.value != null && layer.spec.kind === 'gauge') {
         layer.spec.value = clamp(op.value, 0, 1);
         this._gauge(layer.spec, layer.i, layer.n, this.area, layer);
-        if (layer.detail) this._detail(layer.spec, this.area, layer);
+        if (layer.detail) this._detail(layer, this.area);
       }
       if (op.data != null && layer.spec.kind === 'trace') {
         /* 换一批数据 = 每条曲线的目标高度变了。**不重画**，只改目标：
@@ -341,8 +344,8 @@ export class FieldScene {
         color: COL.ink, align: 'center', font: FONT_LAT, label: `gn-${spec.id}`,
       });
       layer.cap = new ParticleText({
-        field: f, alloc: this.alloc, x: cx, y: cy + 32, size: 15, max: 4,
-        color: COL.dim, align: 'center', font: FONT, label: `gc-${spec.id}`,
+        field: f, alloc: this.alloc, x: cx, y: cy + 33, size: 16, max: 4,
+        color: '#93b8d8', align: 'center', font: FONT, label: `gc-${spec.id}`,
       });
     }
     layer.num.set(`${Math.round(v * 100)}%`);
@@ -597,7 +600,17 @@ export class FieldScene {
     this.field.slotPut(base, pts, rgb(COL.warn), 0.9);
     const idx = Uint16Array.from(pts, (_, k) => ((base + k) * 7919 + 13) % 6400);
     this.flows.push({ id: spec.id, idx, s0: 0, speed: 0, jitter: 2.4 * lv, path: (s) => ({ x: cx, y: cy }) });
-    this.layers.set(spec.id, { spec, anchor: { x: cx, y: cy } });
+    /* 一团乱点没有标签就没有意义 —— 看的人只会觉得"画面脏了"。
+       标签挂在下方 46px，和乱团的抖动区域分开，不会跟着一起抖。 */
+    const layer = { spec, anchor: { x: cx, y: cy } };
+    if (spec.label && !layer.text) {
+      layer.text = new ParticleText({
+        field: this.field, alloc: this.alloc, x: cx, y: cy + 46, size: 16, max: 7,
+        color: COL.warn, align: 'center', font: FONT, label: `tb-${spec.id}`,
+      });
+      layer.text.set(spec.label);
+    }
+    this.layers.set(spec.id, layer);
     return base;
   }
 
@@ -606,9 +619,10 @@ export class FieldScene {
     const f = this.field;
     const p = layer.anchor || { x: a.x + a.w / 2, y: a.y + 200 };
     const s = layer.spec;
-    const txt = s.detail || (s.kind === 'stream'
-      ? `${Math.round((s.progress ?? 0) * 100)}% · ${s.rate || ''}`
-      : '');
+    const live = s.kind === 'stream' && s.progress != null;
+    const txt = live
+      ? `${Math.round(s.progress * 100)}%${s.rate ? ` · ${s.rate}` : ''}`
+      : (s.detail || '');
     /* 没东西可写就别占槽位：一行 16 字的预算够写三个仪表盘的标签 */
     if (!txt && !layer.detailText) return;
     if (!layer.detailText) {

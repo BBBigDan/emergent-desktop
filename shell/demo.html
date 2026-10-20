@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>涌现式桌面 · 一段交互</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+  body { color: #93b8d8; font: 13px/1.6 ui-sans-serif, system-ui, "PingFang SC", sans-serif; }
+  #scene { display: block; width: 100%; height: 100%; }
+
+  /* 进度条：这是剧本，不是真在等 */
+  #bar {
+    position: fixed; left: 0; top: 0; height: 2px; width: 0;
+    background: linear-gradient(90deg, rgba(127, 196, 255, 0.1), rgba(127, 196, 255, 0.75));
+    transition: width 0.2s linear;
+  }
+
+  /* 工具调用记录：把"模型发了什么"打出来，这比粒子本身更能说明接口 */
+  #log {
+    position: fixed; left: 26px; bottom: 22px;
+    font: 11px/1.85 ui-monospace, Menlo, "Cascadia Mono", monospace;
+    pointer-events: none; white-space: pre;
+  }
+  #log .ln {
+    opacity: 0; transform: translateY(5px);
+    transition: opacity 0.32s, transform 0.32s;
+  }
+  #log .ln.in { opacity: 1; transform: none; }
+  #log .ln b {
+    display: inline-block; width: 116px;
+    color: rgba(127, 196, 255, 0.92); font-weight: 400;
+  }
+  #log .ln b.you { color: rgba(232, 240, 250, 0.95); }
+  #log .ln span { color: rgba(147, 184, 216, 0.55); }
+  #log .ln.dim { opacity: 0.34; }
+
+  /* 读屏镜像层的可见版：证明"同一份语义也在无障碍树里" */
+  #caption {
+    position: fixed; left: 50%; bottom: 7px; transform: translateX(-50%);
+    max-width: 720px; text-align: center;
+    font-size: 11px; color: rgba(147, 184, 216, 0.42);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  #caption::before { content: "aria · "; color: rgba(127, 196, 255, 0.35); }
+
+  #hint {
+    position: fixed; right: 24px; bottom: 22px;
+    font: 11px/1.6 ui-monospace, Menlo, monospace;
+    color: rgba(147, 184, 216, 0.34); pointer-events: none;
+  }
+  #hint.paused { color: rgba(255, 178, 87, 0.8); }
+
+  #a11y {
+    position: fixed; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div id="bar"></div>
+<div id="log"></div>
+<div id="caption"></div>
+<div id="hint">空格 暂停 · R 重播</div>
+<div id="a11y"></div>
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module">
+import { Field } from './src/field.js';
+import { FieldScene } from './src/scene.js';
+import { ParticleText, SlotAllocator } from './src/pui.js';
+import { FONT, FONT_LAT } from './src/draw.js';
+import { FieldA11y } from './src/aria.js';
+
+const q = new URLSearchParams(location.search);
+const f = new Field(document.getElementById('scene'));
+const a11y = new FieldA11y(document.getElementById('a11y'));
+const logEl = document.getElementById('log');
+const capEl = document.getElementById('caption');
+const barEl = document.getElementById('bar');
+const hintEl = document.getElementById('hint');
+
+const W = innerWidth;
+const H = innerHeight;
+const AREA = {
+  w: Math.min(820, Math.max(620, W - 100)),
+  h: 560,
+  x: 0, y: 0,
+};
+AREA.x = Math.round((W - AREA.w) / 2);
+AREA.y = Math.round(Math.max(70, (H - AREA.h) / 2 - 26));
+
+/* 场之外还要住一行"提问"。槽位是一条直线，所以先把它占住，场景从后面开始分。 */
+const head = new SlotAllocator(6400, 0);
+const question = new ParticleText({
+  field: f, alloc: head, x: Math.round(W / 2), y: 100, size: 22, max: 14,
+  color: '#eaf3ff', align: 'center', font: FONT, label: 'question',
+});
+const scene = new FieldScene({ field: f, area: AREA, a11y, slotStart: head.used });
+
+/* 开场还没有场景，但"要画东西"这件事得先声明一次：
+   drawMix 从 0 涨到 1，同时把环境那团压到 62%（提问要作为焦点，但不能把球灭掉）。 */
+f.slotBegin({ dim: 0.8, dot: 0.95 });
+
+/* ───────────────── 剧本 ─────────────────
+   每一行就是一个工具调用。演示的同时把 JSON 打在左下角 —— 这是接口，不是魔法。 */
+
+const SPEC_A = {
+  rev: 1, title: '服务器状态', focus: 'job', mood: 'working',
+  layers: [
+    { id: 'cpu',  kind: 'gauge', label: 'CPU',  value: 0.71 },
+    { id: 'mem',  kind: 'gauge', label: '内存', value: 0.60 },
+    { id: 'disk', kind: 'gauge', label: '磁盘', value: 0.48, color: '#b9a6ff' },
+    { id: 'job',  kind: 'stream', label: '追剧 S03', progress: 0.62, rate: '2.1 MB/s' },
+    { id: 'choice', kind: 'fork', label: '要处理 n8n 重启吗',
+      options: [{ id: 'yes', label: '重启 n8n' }, { id: 'no', label: '先看着' }] },
+    { id: 'n8n', kind: 'turbulence', label: 'n8n 重启', level: 0.4 },
+  ],
+};
+
+function series(n = 84) {
+  const out = [];
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let k = 0; k < n; k++) {
+    const day = Math.floor(k / 12);
+    const hour = (k % 12) * 2;
+    let v = 0.24 + 0.12 * Math.sin((hour / 24) * Math.PI * 2 - 1) + rnd() * 0.07;
+    if (day === 3) v += 0.40 * Math.exp(-((hour - 20) ** 2) / 9);
+    out.push(Math.min(1, Math.max(0.03, v)));
+  }
+  return out;
+}
+const SERIES = series();
+const SPEC_B = {
+  rev: 2, title: '过去 7 天的负载', focus: 'load', mood: 'calm',
+  layers: [
+    { id: 'load', kind: 'trace', label: 'CPU · 7 天', data: SERIES.slice() },
+    { id: 'mem',  kind: 'gauge', label: '内存', value: 0.60 },
+    { id: 'disk', kind: 'gauge', label: '磁盘', value: 0.48, color: '#b9a6ff' },
+    { id: 'note', kind: 'condense', text: '周四 21:00 有一次尖峰' },
+  ],
+};
+
+function log(kind, detail, cls = '') {
+  const d = document.createElement('div');
+  d.className = 'ln';
+  d.innerHTML = `<b class="${cls}">${kind}</b><span>${detail}</span>`;
+  logEl.appendChild(d);
+  requestAnimationFrame(() => d.classList.add('in'));
+  while (logEl.children.length > 7) logEl.removeChild(logEl.firstChild);
+  [...logEl.children].forEach((n, i, all) => {
+    n.classList.toggle('dim', i < all.length - 3);
+  });
+}
+
+/* 提问要能"留在场上"：scene.set() 会清空 drawUse（它认为整块场都换了），
+   所以每次布景后要把提问按原样重写一遍 —— 同一帧内重写，位置没变，看不见任何动静。
+   不补这一步的症状：场景一出现，问题就原地消失。 */
+let qText = '';
+function say(txt, opt = {}) {
+  qText = txt;
+  question.set(txt, opt);
+}
+function reassertQuestion() {
+  if (qText) question.set(qText, { force: true });
+}
+
+/* 字幕淡出：亮度就是透明度，不需要另一套机制 */
+function fadeQuestion(txt, ms = 340) {
+  const t0 = performance.now();
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / ms);
+    question.set(txt, { scl: 1 - k, force: true });
+    if (k < 1) requestAnimationFrame(step);
+    else { question.set(''); qText = ''; }
+  };
+  requestAnimationFrame(step);
+}
+
+const cx = Math.round(W / 2);
+let prog = 0.62;
+
+const STEPS = [
+  { at: 0.9, run: () => {
+    say('服务器现在怎么样', { spawn: true });
+    log('› 用户', '服务器现在怎么样', 'you');
+  } },
+  { at: 3.0, run: () => {
+    scene.set(SPEC_A);
+    reassertQuestion();
+    log('scene_set', 'focus=job · layers=6 · mood=working');
+  } },
+  { at: 3.5, run: () => {
+    f.impulse(cx, 100, { r: 240, power: 300 });
+    fadeQuestion(qText);
+  } },
+  { at: 5.4, run: () => {
+    prog = 0.74;
+    scene.patch([{ id: 'job', progress: prog }]);
+    log('scene_patch', 'job.progress 0.62 → 0.74');
+  } },
+  { at: 6.6, run: () => {
+    prog = 0.83;
+    scene.patch([{ id: 'job', progress: prog }]);
+    log('scene_patch', 'job.progress 0.74 → 0.83');
+  } },
+  { at: 8.0, run: () => {
+    scene.pulse('error', { at: 'n8n' });
+    log('scene_pulse', 'error · at=n8n');
+  } },
+  { at: 9.8, run: () => {
+    /* 这一下是"人点了分叉的左边"，不是一个 markdown 按钮 */
+    const br = scene.layers.get('choice')?.branches?.[0];
+    if (br) f.impulse(br.path(0.55).x, br.path(0.55).y, { r: 200, power: 460 });
+    scene.pulse('confirm', { at: 'choice' });
+    log('scene_pulse', 'confirm · at=choice  ← 用户点了「重启 n8n」');
+  } },
+  { at: 11.0, run: () => {
+    scene.transition(SPEC_B, { outMs: 380, inMs: 760 });
+    log('scene_transition', 'focus=load · layers=4');
+  } },
+  { at: 14.2, run: () => {
+    SERIES.push(0.30); SERIES.shift();
+    scene.patch([{ id: 'load', data: SERIES.slice() }]);
+    log('scene_patch', 'load.data 追加 1 个采样');
+  } },
+  { at: 15.6, run: () => {
+    SERIES.push(0.35); SERIES.shift();
+    scene.patch([{ id: 'load', data: SERIES.slice() }]);
+    log('scene_patch', 'load.data 追加 1 个采样');
+  } },
+  { at: 18.2, run: () => {
+    scene.pulse('arrive', { at: 'load' });
+    log('scene_pulse', 'arrive · at=load');
+  } },
+];
+
+const END = 20.5;
+let clock = 0;
+let paused = q.get('paused') === '1';
+let next = 0;
+const STOP = Number(q.get('stop') || 0);   // 到剧本第 N 秒自动停下（截图用）
+
+function resetSteps() {
+  clock = 0; next = 0; logEl.innerHTML = '';
+}
+
+/* ───────── 交互：光标是势阱，点击是冲量。任何时候都能打断剧本摸一下 ───────── */
+addEventListener('pointermove', (e) => {
+  const x = e.clientX;
+  const y = e.clientY;
+  const id = scene.hit(x, y);
+  const wells = [{ x, y, r: 150, k: 380, swirl: 0.22 }];
+  if (id) {
+    const l = scene.layers.get(id);
+    if (l?.anchor) wells.push({ x: l.anchor.x, y: l.anchor.y, r: 110, k: 900, swirl: 0.4 });
+  }
+  f.setWells(wells);
+});
+addEventListener('pointerdown', (e) => {
+  f.impulse(e.clientX, e.clientY, { r: 170, power: 520 });
+  const id = scene.hit(e.clientX, e.clientY);
+  if (id) scene.pulse('confirm', { at: id });
+});
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    paused = !paused;
+    hintEl.classList.toggle('paused', paused);
+    hintEl.textContent = paused ? '已暂停 · 空格继续 · R 重播' : '空格 暂停 · R 重播';
+  } else if (e.key === 'r' || e.key === 'R') {
+    location.reload();
+  }
+});
+
+/* ───────── 主循环 ───────── */
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (!paused) {
+    clock += dt;
+    while (next < STEPS.length && clock >= STEPS[next].at) STEPS[next++].run();
+    if (STOP && clock >= STOP) { paused = true; hintEl.textContent = `停在 ${STOP}s · 空格继续`; }
+  }
+
+  /* 暂停时把剧本的时间也冻住：transition 的时钟和流的相位都住在 scene.step 里，
+     只停 clock 的话，画面上的相变会自己走完 —— "暂停"就名不副实了。
+     场的弹簧仍然跑（悬停还能拨动它），停的只是"剧本"。 */
+  f.step(dt);
+  scene.step(paused ? 0 : dt);
+  f.render();
+
+  barEl.style.width = `${Math.min(100, (clock / END) * 100).toFixed(1)}%`;
+  capEl.textContent = a11y.text;
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* 截图 / 排查用 */
+window.__scene = scene;
+window.__field = f;
+window.__a11y = a11y;
+window.__clock = () => +clock.toFixed(2);
+window.__seek = (t) => { resetSteps(); clock = t; };
+</script>
+</body>
+</html>

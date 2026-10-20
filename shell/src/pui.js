@@ -153,8 +153,14 @@ export function glyph(ch, size, opt = {}) {
 const toParticle = (slot) => (slot * SLOT_MUL + SLOT_ADD) % TOTAL;
 
 export class SlotAllocator {
-  constructor(total = TOTAL) {
-    this.next = 0;
+  /**
+   * @param {number} [total]
+   * @param {number} [start] 起始槽号。给"场之外的常驻元素"留出前面一段
+   *   （演示页的提问字幕就住在 0..N，场景从 N 往后分配 —— 槽位是一条直线，
+   *   两个分配器会互相覆盖，所以只能让它们首尾相接，不能各开一个）。
+   */
+  constructor(total = TOTAL, start = 0) {
+    this.next = start;
     this.total = total;
   }
 

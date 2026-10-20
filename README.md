@@ -232,6 +232,24 @@ node tools/dev/mock-shell.mjs 8778
 
 纯静态起服务也可以（`cd shell && python -m http.server 8778`），只是 `myApps` 拿不到、会被踢去登录页。
 
+### 先看一眼场界面：`shell/demo.html`
+
+想看"agent 把界面当作输出通道"是什么样子，不用起集群、不用模型 key：
+
+```bash
+node tools/dev/serve-dir.mjs shell 8766
+# → http://127.0.0.1:8766/demo.html     一段 20 秒的交互，左下角同步打出每一步工具调用
+```
+
+它演的是：提问从一粒粒点里凝结出来 → `scene_set` 之后服务器状态从提问下面长出来 →
+`scene_patch` 推进度 → `scene_pulse(error)` 让 n8n 那团乱起来 → 人点分叉的一侧（`pulse confirm`）→
+`scene_transition` 溶解成"过去 7 天"，曲线随 `patch` 带着惯性滑过去。
+
+空格暂停（暂停时剧本停下、场的弹簧还在，所以还能用鼠标拨它），`R` 重播。
+`?stop=11.4` 停在某一秒（截图用）。
+
+![demo](docs/images/demo-scene.png)
+
 README 里的截图全部由脚本生成，不是手截的：`node tools/dev/shots.mjs` 会在一条会话里依次
 摆出桌面 / 应用栏 / 圆环 / 平铺 / 粒子门 / 开窗 / 状态盘七个状态并逐张截图（走 CDP 的真实鼠标事件）。
 
