@@ -1,0 +1,595 @@
+# 涌现式桌面内嵌 Agent · 可行性与方案（v3）
+
+> 目标：在这个粒子桌面里放一个全能 agent，能操作这台 Olares 服务器，能生成自己的界面，
+> 能长期记住你和它之间发生过什么，还能**用粒子作画**。
+>
+> - **v2 变更**：砍掉「操控 iframe 里的应用」（见 §3），重心移到生成能力。
+> - **v3 变更**：接入 axolotl / lobster-memory / golem 三件套（§6），新增粒子绘画通道（§7）。
+
+---
+
+## 0. 本版结论
+
+**可以做，规模比 v1 小，能力比 v1 强。**
+
+- 不做：浏览器操控、多租户、本地大模型、图片/视频生成
+- 做：系统工具、文件工具、桌面工具、生成式界面、自造工具、长期图记忆、人格漂移层、粒子绘画
+- 新增两个"自己的东西"：
+  - **记忆**（复用已验证的 lobster-memory，图数据库留在原地）
+  - **粒子绘画**（把桌面本身的材质变成模型的画笔）
+
+一句话概括产品：
+
+> 它不是"能点开应用的助手"，而是"能自己画出界面、自己记住你、自己长出新工具的操作者"。
+
+---
+
+## 1. 现场勘察（本机实测）
+
+| 项 | 实测结果 | 对方案的影响 |
+|---|---|---|
+| 节点算力 | 7.6 核 / 15G 内存（可用 9G） | agent + 记忆侧车 + 备用浏览器都够；v3 不再需要浏览器 |
+| 磁盘 | 148G，已用 46G，剩 97G | 充裕 |
+| GPU | 无 | 本地大模型不可行；图算法走 CPU 完全够 |
+| 出网 | `api.deepseek.com` 401 / 0.95s；`api.openai.com` 401 | 远程模型可用 |
+| 集群权限 | `root` 上 `kubectl auth can-i "*" "*"` = yes | 系统工具可以做得很深 |
+| 已有约束 | `appns-validating-webhook` 只拦 deployments/statefulsets/daemonsets 的 CREATE | 继续用裸 Pod |
+| 用户文件 | `…/pvc-userspace-bbbigdan-…/Home`，含 Code / Documents / Downloads / Movies / Music / Pictures | 直接挂给 agent，与 Files 应用同一份数据 |
+| 已装应用 | Files / Vault / Market / Settings / Profile / Dashboard + qBittorrent / Navidrome / n8n | 后三个有 REST API |
+| 本地模型 | 全集群无 `ollama / vllm / litellm` | 确认无可复用推理服务 |
+
+---
+
+## 2. 能力总表
+
+| 能力 | 判定 | 说明 |
+|---|---|---|
+| 流式对话、工具循环、多轮 | 能做 | 一个 Node 服务 |
+| 操作 Olares 系统 | 能做，比点 UI 可靠 | k8s API + Market 接口 |
+| 读写用户 Files | 能做 | hostPath 同一份数据 |
+| 操作壳层自身 | 能做，零成本 | 同源事件直通 |
+| 生成界面（表格/图表/表单/小应用） | 能做 | 声明式渲染树，§4 |
+| 自造工具与技能 | 能做 | §5 |
+| **长期图记忆** | **能做，代码已有** | lobster-memory + axolotl，§6 |
+| **人格漂移（环境态渗漏）** | 能做，需移植 | golem 的机制，§6.5 |
+| **粒子绘画** | **能做，本版新增** | §7 |
+| 生成文档（docx/xlsx/pptx） | 能做 | pod 里装 python 库，产物落 `~/Documents` |
+| 生成图片 / 视频 | 不做 | 无 GPU；外挂 API 收益不值 |
+| 操控第三方应用的界面 | 不做 | §3 |
+| 多用户 / 多租户 | 不做 | 工作量翻倍 |
+
+---
+
+## 3. 决策记录：为什么不做浏览器操控
+
+**三条关键事实：**
+
+1. **同源策略限制的不是 agent，是网页。** iframe 跨域后父文档拿不到 DOM、收不到事件；但 agent 在浏览器外面，用服务端无头 Chromium + CDP 可以完整地读（`ariaSnapshot`）和写（`Input.dispatchMouseEvent` 走浏览器进程的原始输入管线，能穿过跨域 iframe，`isTrusted = true`）。技术上完全可行。
+2. **代价不在"能不能"，在"要不要维护两个浏览器"。** CDP 的浏览器和你的浏览器是两份 profile：cookie 只能桥根域 SSO（`authelia_session` 确实是根域共享，已实测），localStorage 桥不了。于是出现双份状态、单向接管、画面流、虚拟光标一整套补偿机制。
+3. **搬到本地也没解决。** 本地专用浏览器 = 再做一个 WorkBuddy / Codex，没有差异化，还要承担分发、签名、多设备。
+
+**判断**：这三件事换来的能力是"在别人的界面上点按钮"。它有两个硬缺陷 —— 追不上应用更新（UI 一改路径全变，API 相对稳定），而且是最低价值的那一层（真正值得自动化的操作都有接口）。
+
+**后路**：真遇到只有界面没有 API 的应用，正确顺序是 `k8s exec` 直接读写它的配置/数据 → 社区 CLI → 最后才是浏览器。届时按插件式后端接回 CDP 即可，`page_*` 不影响主架构。
+
+---
+
+## 4. 重心一：生成式界面
+
+### 4.1 论点
+
+> **不要"操作别人的界面"，要"自己生成界面"。**
+
+前者把人机界面当 API 用，永远追不上应用的更新速度；后者把桌面变成 agent 的输出通道，而这恰好是这套粒子桌面最擅长的事（平时没有 UI，一切靠召唤）。
+
+| 你说 | agent 做什么 | 输出 |
+|---|---|---|
+| "Downloads 里什么东西占地方" | `fs_*` 扫目录 | 按大小排序的表，每行带"归档"动作 |
+| "最近三个月服务器哪里紧张" | `/bfl/monitor` + k8s metrics | 一张折线图 + 三句结论 |
+| "帮我建个下载任务，追这部剧" | 搜资源 → qBittorrent API | 进度卡片，跑完变成已完成列表 |
+
+### 4.2 渲染契约：声明式渲染树
+
+agent 输出的是**数据描述**，不是 HTML。三个理由：安全（渲染在我们自己的 origin，能带 `<script>` 等于把 cookie 交出去）、一致（自动继承粒子桌面的排版，模型不可能产出 1998 年的页面）、成本（比 HTML 便宜一个量级）。
+
+| 类型 | 用途 | 关键字段 |
+|---|---|---|
+| `text` | Markdown 子集 | `md` |
+| `code` | 代码块 | `lang`, `code`, `runnable` |
+| `table` | 数据表 + 行内动作 | `columns`, `rows`, `actions` |
+| `list` | 简单列表 / 文件列表 | `items`, `icon` |
+| `chart` | 折线 / 柱 / 饼 / 热力 | `kind`, `series`, `x`, `y` |
+| `form` | 结构化提问 | `fields[]`, `submitLabel` |
+| `progress` | 长任务进度 | `label`, `value`, `steps` |
+| `image` / `file` | 本地资源预览 | `blobId` / `path` |
+| `approval` | 授权确认 | `title`, `detail`, `diff` |
+| `actions` | 按钮组 | `label` + 工具或新指令 |
+| `section` / `tabs` | 布局容器 | `title`, `children` |
+| `html` | 逃生舱：沙箱内自由 HTML | `srcdoc`，见 §4.4 |
+
+```jsonc
+{
+  "title": "Downloads 里最占地方的 10 个文件",
+  "root": { "type": "section", "children": [
+    { "type": "text", "md": "扫了 `~/Downloads`：**2.4 GB / 1832 个文件**。" },
+    { "type": "table",
+      "columns": [{ "key": "name", "label": "文件" },
+                  { "key": "size", "label": "大小", "align": "right" }],
+      "rows": [{ "name": "ubuntu-24.04.iso", "size": "5.2 GB",
+                 "actions": [{ "label": "归档", "tool": "fs_move",
+                   "args": { "from": "~/Downloads/ubuntu-24.04.iso", "to": "~/Agent/archive/" } }] }] },
+    { "type": "actions", "items": [{ "label": "只保留最近 90 天",
+        "prompt": "把 Downloads 里 90 天前的文件移到 ~/Agent/archive" }] }
+  ] }
+}
+```
+
+三条硬规则：
+
+1. **动作只能指向已注册工具，或发一条新指令** —— 不允许任意 URL，否则模型生成的一行"点击这里"就能把你带到钓鱼站
+2. **数据必须内联** —— 不做"界面自己再去查"，避免界面与事实脱节、无法审计
+3. **节点数 ≤ 200** —— 超了让模型自己分页
+
+### 4.3 双向
+
+`form` 提交、`actions` 点击、表格行内动作，都作为工具结果或新指令回到对话。于是 agent 不必用自然语言反复问"要删哪个、确认吗"，它直接给一个可操作的界面。审批卡片就是这个机制的第一个用例，v1 只是把它写死了。
+
+### 4.4 逃生舱
+
+`html` 节点跑在**独立 origin 的沙箱 iframe**：`sandbox="allow-scripts allow-forms"`（不给 `allow-same-origin`），配 CSP，禁外链。里面随便写，拿不到壳层任何东西。
+
+这不是妥协，是产品能力：**agent 可以现场给你造一个小应用摆在桌面上**。"帮我做个番茄钟"、"给我个 CSV 清洗工具" —— 生成单文件 HTML，跑在沙箱里，关窗即弃。
+
+---
+
+## 5. 重心二：自造工具与技能
+
+我们不可能给每个应用写适配器。但 agent 可以：读一下 API 文档（或 `k8s exec` 进容器看一眼），写 30 行脚本，注册成工具，之后一直能用。
+
+```jsonc
+// ~/Agent/tools/navidrome/manifest.json
+{
+  "name": "navidrome_playlist_add",
+  "description": "把专辑加进 Navidrome 的某个歌单",
+  "params": { "album": { "type": "string" }, "playlist": { "type": "string" } },
+  "entry": "run.mjs",
+  "runtime": "node",
+  "level": "confirm",
+  "needs": { "net": ["navidrome.bbigdan.olares.com"], "fs": [] }
+}
+```
+
+流程：写脚本 → 沙箱自测 → 给你看代码 → 批准 → 注册，下一轮可用。
+
+**技能**（`~/Agent/skills/*.md`）是"该怎么做"：今天教它一遍清理磁盘，它记下来，下次照做。技能是你能在 Files 里打开、修改、删掉的普通文件。
+
+**护栏**：默认 `confirm`；首次运行必须看代码；`needs` 声明的域名与路径**由运行时强制**（不靠脚本自觉）；每个工具带 `version` 可回滚；所有调用进审计。
+
+---
+
+## 6. 重心三：记忆与人格（axolotl / lobster-memory / golem）
+
+### 6.1 三个仓库各解决什么
+
+| 仓库 | 是什么 | 在我们这里的位置 |
+|---|---|---|
+| **axolotl** | Rust 图数据库。EdgeBlock 数据结构（32 边/块，为 GPU warp 合并访问设计）、CPU+GPU 协同、增量算法（BFS 1580×、连通分量 4920×）、`.axeb` 持久化 + WAL + MVCC + 哈希索引 + 流式查询 Builder + REST server + PyO3 绑定 | **存储引擎**。不改，编译目标换 Linux |
+| **lobster-memory** | 图记忆的上层逻辑：LLM 抽取实体/关系/情绪 valence、按需主动回忆、五信号驱动遗忘（valence/frequency/recency/access/centrality）、社群合并塌缩为摘要节点、软删除回收站 | **记忆层**。整体复用，只换存储适配 |
+| **golem** | 人格层：L0 个体潜意识（真实发生的事）、L0.5 知识轨迹（每天学一个新知识）、L1 用户处境；三通道分离（漂移 / 处境 / 图检索），漂移通道要求 Ω ⟂ goal（环境态必须与当前目标正交，否则退化成检索） | **声音层**。移植机制，不搬代码 |
+
+三者是同一套图记忆的纵向三层：**引擎 → 记忆 → 人格**。这也是为什么它们必须一起接 —— lobster 的"因果边 + 情绪 valence + 可观察遗忘"正是 golem 的图检索通道赖以工作的前提。
+
+### 6.2 axolotl 能不能在 Linux 上跑：能，代价很小
+
+用户担心"针对统一内存优化，可能需要通用替代品"。读代码后的结论：**不需要换，只需要一个两行的补丁。**
+
+依据：
+
+- `Cargo.toml` 里 `metal` / `dispatch` 只出现在 `[target.'cfg(target_os = "macos")'.dependencies]` —— Linux 根本不引入
+- `lib.rs` 里只有 `#[cfg(target_os = "macos")] pub mod gpu;` 是平台门控的
+- **`gpu_edge_block.rs` 名字带 GPU，但全身没有一个 Metal 调用** —— 它是纯 Rust 的扁平数组布局（`blocks[i]=owner`、`blocks[i+1]=count`、后 32 槽位存目标顶点）。所谓"统一内存优化"本质是一个**内存布局优化**，在 CPU 上同样吃缓存行
+- 其余模块（`edge_block` CPU 版、`csr_graph`、`algorithms`、`louvain`、`scc`、`betweenness`、`pagerank_correct`、`incremental_*`、`transaction`+WAL、`mvcc`、`index`、`mmap_graph`、`query`、`server`、`py_bindings`）全是纯 Rust
+- `graph_db.rs` 只引用 `gpu_edge_block::GPUEdgeBlockGraph`（纯 Rust），所以**已有的 `.axeb` 文件在 Linux 上可以直接打开**，不需要迁移数据
+
+**移植只需要三处改动**（已在 Linux x86_64 上实测通过）：
+
+| # | 位置 | 问题 | 改动 |
+|---|---|---|---|
+| 1 | `src/incremental_bfs.rs` `incremental_pagerank.rs` `incremental_sssp.rs` `incremental_sssp_edgeblock.rs` | `use crate::gpu::GPUAccelerator;` 没有门控，而这 4 个模块只在 macOS 编译 | `lib.rs` 里给 4 个 `pub mod` 和 4 个 `pub use` 各加一行 `#[cfg(target_os = "macos")]` |
+| 2 | `Cargo.toml` | `memmap2` 被写在 `[target.'cfg(target_os = "macos")'.dependencies]` 段里（少了缩进边界），Linux 上 `mmap_graph.rs` 找不到它 | 移回 `[dependencies]` |
+| 3 | `Cargo.toml` | `pyo3` 同样被裹进 macOS 段，导致 `--features python-bindings` 找不到它 | 同上 |
+
+第 1 条丢掉的是 4 个**实验性的增量类型**（BFS / PageRank / SSSP），它们在 `py_bindings.rs` 里没有任何调用 —— Python 侧的 `pagerank()` / `bfs()` 是 `graph_db` 里另外的纯 CPU 实现（BFS 就是 `VecDeque`，PageRank 是标准迭代）。所以 **Python API 一个不少**。
+
+### 实测结果（2026-10-20，Linux x86_64 / 无 GPU）
+
+```
+cargo build --release                    1m24s，只有 warning
+maturin build --features python-bindings 30s
+  → axolotl_rs-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl  457 KB
+```
+
+冒烟测试（2000 节点 / 2285 边，按"个人记忆用几年"的量级设）：
+
+| 操作 | 耗时 |
+|---|---|
+| 建 2000 节点 + 2285 边（含属性） | 15 ms |
+| `pagerank(50, 0.85)` | 1.1 ms |
+| `bfs(1)` | 1.4 ms |
+| `louvain()` | 9.6 ms |
+| `tarjan_scc()` | 0.3 ms |
+| `betweenness(32)` | 1.9 ms |
+| `save()` → 750 KB / `open()` 回读 | 计数与属性完全一致 |
+
+**结论：不需要换图数据库。** 这些数字说明在这个规模上 CPU 版本是"毫秒级"，GPU 那 1580× 的加速没有对手可打 —— 它是相对"全量重算"的倍数，而我们每次只需要重算几千个节点的子图。
+
+**仍然失去的**：4 个增量类型在 Linux 上不可用。如果将来真需要（比如记忆涨到几十万节点、要频繁做增量 BFS），给这 4 个文件补一条 CPU 回退分支即可（`pagerank_correct.rs`、`incremental_ssspv2` 已经是现成的 CPU 参考实现）。
+
+### 6.3 存储适配层（无论用哪个引擎都要有）
+
+`engine/memory_graph.py` 是 lobster-memory 里**唯一**碰 axolotl 的文件。把它定成一个接口，引擎可换：
+
+```python
+class GraphStore(Protocol):
+    def upsert_node(self, nid, label, props) -> None: ...
+    def upsert_edge(self, src, dst, etype, props) -> None: ...
+    def neighbors(self, nid, etype=None, direction="out") -> list[Edge]: ...
+    def khop(self, nid, k, etype=None) -> list[Node]: ...     # 定向遍历，别 dump 全库
+    def pagerank(self, top=50) -> list[tuple[NodeId, float]]: ...
+    def communities(self) -> list[list[NodeId]]: ...           # Louvain
+    def soft_delete(self, nids) -> None: ...
+    def stats(self) -> dict: ...
+    def snapshot(self) -> None: ...
+```
+
+两个实现：
+
+| 实现 | 状态 | 说明 |
+|---|---|---|
+| `AxolotlStore` | 主线 | PyO3 绑定，`.axeb`，WAL + MVCC + 索引，能力最全 |
+| `SqliteStore` | 备胎 | `nodes` / `edges` 两张表 + `(src,type)` `(dst,type)` 索引；k-hop 用递归 CTE；PageRank / Louvain 把子图导入 `igraph` 算。单文件、WAL、`sqlite3` 直接可查 |
+
+**为什么备胎够用**：个人记忆的量级是 5 万节点 / 15 万边。递归 CTE 深度 5 是毫秒级，Louvain 在 1 万节点上是毫秒级。**在这个规模上，任何实现都是毫秒级，"用哪个图库"不是性能问题，而是数据模型与运维问题。** 专门上 Kuzu / Neo4j 只会换来一个需要维护的服务。
+
+什么时候才值得换专门的图库：跨会话要跑复杂 Cypher、或多进程并发写、或节点数上百万。这三条我们都不满足。
+
+### 6.4 进程形态
+
+```
+emergent-agent (Node)  ──HTTP(localhost)──▶  emergent-memory (Python 侧车)
+   主循环 / 工具调度                           lobster-memory
+   LLM 调用（抽取也用它）                       ├─ extractor  校验/去重
+                                              ├─ recall     关键词 / valence
+                                              ├─ consolidator 五信号 + 社群合并
+                                              └─ AxolotlStore (.axeb)
+```
+
+- **为什么是侧车而不是重写进 Node**：lobster-memory 是已经验证过的 Python 实现，重写一遍没有收益，只会引入新 bug。同 pod 共享 localhost，一个容器崩了不带走另一个
+- **抽取仍由 agent 的模型做**：符合 lobster 的原设计（"你就是抽取器，不需要第二个模型"），侧车只做校验、去重、写图
+- **接口只有五个**：`start()` / `after_turn(json)` / `recall(q)` / `recall_feedback(valence)` / `consolidate()`
+- 记忆服务崩掉时 agent 降级为"无记忆模式"，不能连带主循环一起挂
+
+### 6.5 golem：移植机制，不搬代码
+
+golem 是 dsh 插件，而 dsh 还是 dev-preview（有 breaking change 警告）。**不引入这个底座。**
+
+要搬的是三件事，都是策略而非代码：
+
+| 机制 | golem 的做法 | 我们的来源 |
+|---|---|---|
+| **L0 个体潜意识** | agent 真实发生过的事（对话、决策、动作后果） | 我们有一个**更强的种子源**：审计日志里每一次工具调用与结果、文件变更、k8s 事件。这些都是"真实发生过、有后果"的事 |
+| **L0.5 知识轨迹** | 每天按真实排名学 1 个新知识 | 出网可用；做成开关，默认关（成本 + 噪声） |
+| **漂移注入** | 每轮按泄漏率注入 1~2 条与当前目标**正交**的环境态 | 一个采样器 + 提示词纪律：`Ω ⟂ goal`，绝不为"相关"而漏 |
+| **漂移面板** | 独立的 DriftDashboard | 直接变成一张 `surface_render` 页面（复用 §4） |
+
+**红线保留**：L0 种子必须可溯源到真实事件，禁止编造；每条种子带来源引用，能在审计里指回去。
+
+**位置**：它依赖图检索通道，所以必须排在记忆之后。而且它是"风味层"不是核心层，**必须有总开关，默认可以关**。
+
+### 6.6 落盘与可观察
+
+```
+~/Agent/memory/
+├── memory.axeb        # 图（单一数据源，可用 sqlite3/axolotl 工具直查）
+├── snapshots/         # 定期快照，可回滚
+├── persona.md         # 人格设定（人可读可改）
+└── drift/YYYY-MM.jsonl # 环境态种子 + 注入记录，可审计
+```
+
+放 Home 而不是藏私有目录，理由是 lobster 的核心卖点就是"全明文可观察、反黑盒" —— 这条在部署上也必须成立。
+
+---
+
+## 7. 重心四：粒子绘画
+
+### 7.1 为什么这是杀手级
+
+现在所有 agent 输出文字和图片，只有这一个能用**界面本身的材质**说话。
+
+- **它是这套桌面独有的**。别处没有 6400 颗会呼吸、会心跳、会花屏的粒子可以当画笔
+- **token 极省**。一段绘画 spec 是一两百 token，比生成一张图便宜两个数量级，而且能立刻改
+- **天生适合解释**。讲微积分就画坐标系和切线，讲数据流就画箭头，讲历史就画时间轴 —— 比一段文字快得多
+- **动效是免费的**。呼吸、心跳、流线拉伸、花屏撕裂全都已经在跑，画出来的东西**本身就活着**
+- **表情是最讨巧的入口**。`face(mood)` 一个参数，桌面上的粒子就对你笑了
+
+### 7.2 三级表达（按 token 成本递增）
+
+**语义层（首选）** —— 模型给语义，我们算几何：
+
+```jsonc
+{ "op": "draw",
+  "layers": [
+    { "type": "face",  "mood": "happy", "at": [560, 180], "size": 150 },
+    { "type": "chart", "kind": "bars", "data": [3, 8, 5, 12],
+      "at": [120, 320], "size": [240, 120], "color": "#FAC775" },
+    { "type": "text",  "text": "你好", "at": [360, 210], "size": 96, "color": "#9FE1CB" },
+    { "type": "arrow", "from": [300, 240], "to": [420, 160] }
+  ],
+  "motion": { "in": "drawOn", "hold": 8000, "out": "dissolve" } }
+```
+
+`face(mood)` 是内置的参数化表情库（眼/眉/嘴按 mood 取不同曲率），`chart` 由我们算坐标轴与比例 —— **绝不让模型算像素坐标**，它算不准，也没必要。
+
+**矢量层** —— 自由涂鸦与示意图，SVG path 子集 + 基本图元：
+
+```jsonc
+{ "type": "path", "d": "M200,300 C200,180 380,180 380,300", "width": 7, "color": "#fff" }
+{ "type": "circle", "c": [300, 200], "r": 60 }
+{ "type": "polyline", "points": [[10,10],[80,40],[150,20]] }
+```
+
+**位图层** —— 只在"画这张图"时用：单色 ≤96×96，RLE hex 编码，约 1.5~6k tokens。**默认不建议**，因为点阵只有 6400 颗，照片级内容必然糊。
+
+**动效**（每层可带）：
+
+| 动效 | 效果 |
+|---|---|
+| `drawOn` | 沿路径逐段出现，像一支笔在写 |
+| `pulse` | 该层整体呼吸，与桌面呼吸错相 |
+| `orbit` | 沿自身轮廓流动（复用流线的 `aDir`/`aStr`） |
+| `beat` | 跟随心跳猛跳一下 |
+| `dissolve` | 散回 ambient |
+
+`drawOn` 和 `beat` 直接复用现有实现（`FLOURISH_S` 的收拢、`beat` 的撕裂帧），不需要新代码。
+
+### 7.3 采样管线与预算
+
+```
+spec → 离屏 canvas 2D（逻辑尺寸 = 绘制区）
+     → 逐层绘制（stroke / fill / fillText / 图表图元），白墨 + 层色
+     → 读 ImageData
+     → 抖动网格采样：网格边长 = 目标点距；每格取**墨迹的加权质心**（不是随机像素）
+     → 点云（x, y, color, size, alpha）写入 field
+     → stepShape 的 draw 分支：**直接用屏幕坐标，绕过 ry/tilt**（否则画会被拖斜）
+```
+
+三条硬约束，都来自之前踩过的坑：
+
+1. **点距要按"可见芯径"反推**，不是按世界单位。`gl_PointSize` 不含 fov 修正，点阵实际芯径约为推算值的一半，乘以贴图芯比例（约 0.43），标称值往往只有设计的 1/4
+2. **点距 / 芯径 落在 1.0~1.5**：>1.5 显"断"，<0.8 叠加过曝显"糊"
+3. **采样只做一次，结果存成静态缓冲** —— 每帧重采样会让每颗点的落点微微变化，整幅画永远处于噪点状态（这一点在点阵图标上踩过；这里用"质心 + 只算一次"解决）
+
+### 7.3.1 实测（2026-10-20，1440×900，真实截图验收）
+
+第一版实现跑出来的数字，直接推翻了"先算墨长再定点数"的直觉：
+
+| 场景 | 层 | 预算 | 实际用点 | 点距 |
+|---|---|---|---|---|
+| 表情（300px 脸） | face | 3200 | 2698 | 2.2px |
+| 文字「你好」190px | text | 3000 | 2619 | 3.5px |
+| 柱状图 + 标题 | chart + text | 3600 | 3424 | 3.2px |
+| 复合（表情+折线图+字+箭头） | 4 层 | 6200 | 5068 | 2.2px |
+| 涂鸦（贝塞尔+圆+折线+箭头） | 4 层 | 4200 | 2583 | 2.2px |
+
+三条结论：
+
+1. **点数由预算决定，画质由点距下限决定。** 墨迹少的时候（一张脸）原始点距算出来是 3.2px，笔画是一串珠子；把算法改成"没用到 85% 预算就继续收密"，点距降到 2.2px，轮廓立刻连成一条线。所以真正要调的是**点距下限（2.2）**，不是点数。
+2. **6400 点够画一到两个"有细节的东西"**，不是一个场景。复合场景几乎吃满（5068），此时背景粒子被压暗到 22%，画面是"浮在粒子海上的画"。
+3. **点距 2.2 / 点径约 2.4 时最舒服**：略大于芯径，既不叠成一片，也看不出缝隙。再密就糊，再疏就断 —— 和之前点阵图标得出的 1.0~1.5 比例一致。
+
+### 7.3.2 两个踩过的坑（写进实现，别再犯）
+
+- **场的 y 轴朝上，canvas 的 y 轴朝下。** 第一版忘取反，整幅画上下颠倒：字是翻的，柱状图从顶边往下挂。`drawY = cy - (p.y + oy)`。
+- **出场动画不能只淡入。** 全部点同时飞 + 按顺序淡入，看起来是"一团云亮起来"。改成**按顺序换目标**（`drawD[i] <= drawProg` 才把目标切成画布坐标），才是一道波沿着笔迹推过去 —— 实测 1600ms 的 `drawOn` 是"从上往下写"的观感，太快（700ms）就退化成云。
+
+**和窗口的关系**：粒子永远在 DOM 下面，所以绘制天然被窗口遮住，不需要额外的区域计算。窗口开着时画，就是"在窗外露出一角的画"。
+
+### 7.4 工具契约
+
+| 工具 | 等级 | 说明 |
+|---|---|---|
+| `draw(spec)` | safe | 下发绘画 spec，返回实际用掉的点数与是否降级 |
+| `draw_update(layerId, patch)` | safe | 局部改（比如柱状图数据变了） |
+| `draw_stop()` | safe | 立刻散回 ambient |
+| `face(mood)` | safe | `draw` 的语法糖，最常用的那个 |
+
+**必须带 `hold`**：绘制是"占用桌面"的行为，默认 8 秒后自动 dissolve。用户随时可以挥手打断（复用甩动手势）。
+
+### 7.5 边界（写进提示词纪律）
+
+- **不做照片级**。点阵只有 6400 颗，够画线稿、图表、字、表情，不够画照片
+- **用户没要求就别画**。默认只在"解释类"回答里主动用一次，其余场景用文字或渲染树
+- **不遮挡内容**。粒子在窗口之下，天然不打架，但也别指望用户能隔着窗口看见
+- **别用它代替文字**。画是补充，不是主体
+
+---
+
+## 8. 工具契约
+
+### 8.1 通用约定
+
+返回 JSON 带 `ok`；错误返回 `{ok:false, error, hint}`，让模型自己修；大返回值带 `truncated` / `total`；等级 `safe` / `confirm` / `blocked`；写类带 `idempotencyKey`；返回值统一脱敏（JWT 形状、`Bearer`、私钥块、常见 token 前缀）。
+
+### 8.2 系统
+
+`sys_status` `app_list` `k8s_list` `k8s_get` `k8s_describe` `k8s_logs`（safe）；`k8s_exec` `k8s_scale` `k8s_restart` `k8s_apply` `app_install` `app_uninstall` `cron_create`（confirm）；`http_request`（内网 safe / 外网 confirm）。
+
+结果做裁剪：去掉 `managedFields`，`status` 只留关键字段；`k8s_logs` 尾部 120 行 + 总行数。
+**不提供**：`secrets` 读取、裸 `shell`。
+
+### 8.3 文件
+
+`fs_list` `fs_tree` `fs_read` `fs_search`（safe）；`fs_write`（`~/Agent/` 内 safe，其余 confirm）；`fs_move` `fs_delete`（confirm，删除进 `~/Agent/trash/`）。
+路径守卫：`realpath` 后必须仍在 Home 下；拒绝 `..`；软链先解析再校验。
+
+### 8.4 桌面
+
+`win_open` `win_close` `win_focus` `win_move` `rail_show` `launchpad`。
+
+### 8.5 生成
+
+`surface_render` `surface_update` `surface_close` `ask_form`（safe）；`artifact_write`（confirm）。
+
+### 8.6 记忆
+
+| 工具 | 等级 | 说明 |
+|---|---|---|
+| `memory_recall(query, k)` | safe | 定向图检索，**不是全量 dump** |
+| `memory_write(nodes, edges)` | safe | 一般由抽取流程自动调用，不直接暴露给模型 |
+| `memory_feedback(valence)` | safe | 查"我在哪类事上被表扬/批评过" |
+| `memory_stats()` | safe | 节点数、社群数、最近巩固结果 |
+| `persona_get` / `persona_set` | safe / confirm | 人格设定 |
+
+### 8.7 绘画
+
+见 §7.4。
+
+---
+
+## 9. 循环与上下文
+
+- 状态机：`idle → thinking → acting → awaiting_approval → thinking → done`
+- 事件流：单条 WS，带 `seq`，断线重连 replay 最近 200 条
+- 并行：读类最多 4 路，写类串行
+- 步数上限 40；token 预算可配；到顶让模型总结进展而不是硬断
+- 错误回灌：工具失败原样回模型（含 stderr 尾部）；同一工具同一参数连续 3 次失败中止
+
+**记忆在上下文的三个位置**：
+
+1. `session.start()` 的统计摘要 → system prompt 尾部（"你已有 812 条记忆，最近在忙家庭网络"）
+2. 模型主动 `memory_recall` 时 → 作为工具结果注入
+3. 巩固报告 → 每 K 轮一次，简短告知"剪掉了什么、合并了什么"
+
+**成本结构**：没有页面快照之后，主要开销是生成渲染树与绘画 spec 的输出 token（几百），以及 k8s/fs 的返回（可裁剪）。记忆检索按 k-hop 定向取，不 dump。
+
+---
+
+## 10. 安全模型
+
+| 威胁 | 场景 | 缓解 |
+|---|---|---|
+| 生成界面钓鱼 | 渲染树里放假按钮指向外部站点 | 动作只能指向已注册工具或新指令；禁任意 URL；禁外链图片（否则泄露"你打开了这条消息"） |
+| 自造工具藏后门 | agent 写的脚本偷偷外传文件 | `needs` 声明的域名/路径由**运行时**强制；首次运行看代码；默认 confirm；审计 |
+| 提示注入 | 文件内容、日志、网页里藏"忽略上面的指令" | 外部文本包 `<untrusted>`；权限不随内容升级；审批只认用户点击 |
+| 记忆投毒 | 恶意内容被抽成记忆节点，长期影响判断 | 抽取时保留来源引用；`memory_recall` 结果标注来源；低 valence + 低 access 的节点优先被剪 |
+| 人格漂移过度 | 环境态注入太多，答非所问 | 泄漏率可调 + 正交性检查（Ω ⟂ goal）+ 总开关 |
+
+三层防线：RBAC（读全集群，写只到 `user-space-*`，`secrets` 不给 `get`）→ 审批门（只拦破坏性的，卡片显示完整参数，`apply` 显示 diff）→ 审计（`~/Agent/audit/*.jsonl`）。
+
+模型 key 只在服务端，前端永远拿不到。
+
+---
+
+## 11. 部署
+
+| 容器 | 说明 |
+|---|---|
+| `agent` | Node 22；带 kubectl / git / curl / jq / ripgrep / python3 + `python-docx` `python-pptx` `openpyxl` |
+| `memory` | Python 3.12 + `axolotl_rs`（Linux CPU 构建，见下）+ lobster-memory；uvicorn 监听 127.0.0.1:7801 |
+
+**memory 镜像怎么构建**：多阶段 —— 第一阶段用 `rust:1-bookworm` 装 `python3-dev` + `maturin`，对打过 §6.2 三处补丁的源码跑 `maturin build --release --features python-bindings`；第二阶段 `python:3.12-slim` 只装 wheel 和 lobster-memory。这样镜像里不带 Rust 工具链（省 ~1.2GB），重建记忆服务也不用重编 Rust。
+
+实测产物：`axolotl_rs-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl`，457KB。注意 `manylinux_2_34` 意味着基础镜像的 glibc ≥ 2.34（bookworm / noble 都满足）。
+
+| 项 | 值 |
+|---|---|
+| 资源 | agent request 200m/512Mi，limit 1500m/1.5Gi；memory request 100m/256Mi，limit 1000m/1Gi |
+| 卷 | Home → `/home/olares`（rw）；`~/Agent/{workspace,tools,skills,memory,audit,trash,drawings}` |
+| 网络 | nginx `location ^~ /agent/` → agent:8080；WS 不缓冲 |
+| 鉴权 | `/agent/` 用"转发 cookie 打官方 `/server/myApps`"做认证 oracle，之后发签名 HttpOnly cookie，缓存 60s |
+| 工作负载 | 裸 Pod（webhook 限制），长期注册成 Olares 应用 |
+
+记忆服务单独容器的副作用是好的：`maturin build` 只在构建期影响它，agent 不受牵连。
+
+---
+
+## 12. 体验
+
+| 状态 | 粒子表现 |
+|---|---|
+| 呼出入口 | 底部中央收拢成环形输入口（复用 `stepRimOpen`） |
+| 思考中 | 全局降速、亮度下沉，窗口外缘日冕收窄 |
+| 工具执行 | 屏幕边缘划过一道粒子弧（一次工具 = 一道） |
+| 生成界面 | 窗口从粒子中长出，内容随 `--rev` 逐块浮现 |
+| **作画** | 粒子从当前形态汇成笔迹，`drawOn` 逐段写出；画完保持在那边轻轻呼吸 |
+| 等待审批 | 顶部垂下一道粒子幕，浮出授权文案 |
+| 出错 | 复用现有心跳的撕裂帧，短暂花屏 |
+
+---
+
+## 13. 风险
+
+| # | 风险 | 概率 | 影响 | 缓解 |
+|---|---|---|---|---|
+| 1 | axolotl 在 Linux 编不过（pyo3 / ndarray 版本坑） | 中 | 中 | 换 `SqliteStore` 备胎，接口不变；半天可验 |
+| 2 | 抽取质量差，记忆越积越脏 | 中 | 高 | 抽取后校验 + 去重；五信号本就会剪掉低质节点；先跑 500 轮观察再放开 |
+| 3 | 粒子画可读性不够，模型画出来一团 | 中 | 中 | 语义层优先（face/chart 由我们算几何）；线稿级表达力写进提示词 |
+| 4 | 人格漂移变成答非所问 | 中 | 中 | 正交性检查 + 泄漏率 + 总开关 |
+| 5 | 生成界面质量不稳 | 高 | 中 | 节点词汇小、组件库兜底；先做 3 个真实场景打磨 |
+| 6 | 自造工具跑坏东西 | 中 | 高 | `needs` 强制 + 首次看代码 + 默认 confirm |
+| 7 | 记忆服务与 agent 版本漂移 | 低 | 中 | 接口只有五个方法，加版本号握手 |
+
+---
+
+## 14. 分期
+
+| 阶段 | 范围 | 验收 |
+|---|---|---|
+| **M0 基座** | agent pod + nginx 反代 + 模型配置 + WS 流式 + `sys_status` + 鉴权 | 桌面里问"机器现在什么情况"，流式回出真实数据 |
+| **M1 系统与文件** | k8s + 文件工具组 + 审批卡片 + 审计 | "qbittorrent 为什么没起来" 自己出结论；"把 x 挪到 Documents" 执行后 Files 里可见 |
+| **M2 记忆** | axolotl Linux 构建 + memory 侧车 + 抽取/回忆/巩固 | 关掉再开，它记得昨天做过什么；`memory_stats` 里能看到社群在合并 |
+| **M3 输出通道** | 渲染树 + 10 个组件；`draw` + 语义层 + `drawOn` | "Downloads 什么占地方" 直接给可操作的表；"画个开心的表情" 桌面粒子聚成笑脸 |
+| **M4 自造工具** | 工具注册 + `needs` 强制 + 技能加载 | "给 Navidrome 加个歌单" 自己查 API、写脚本、自测、等你批准 |
+| **M5 人格层** | L0 种子 + 漂移注入 + 面板 | 它会说"我今天看到…"，且能指出那条信息是哪来的 |
+| **M6 产品化** | 打成 Olares 应用 | 市场里能装能卸 |
+
+M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么样。
+
+---
+
+## 15. 明确不做
+
+- 操控第三方应用的界面（§3）
+- 本地专用浏览器客户端
+- 多用户 / 多租户
+- 本地大模型部署
+- 生成图片 / 视频（无 GPU）
+- 移动端适配
+- 自建通用图数据库、或引入需要单独运维的图服务
+
+---
+
+## 16. 待验证
+
+**已验完（2026-10-20）**
+
+1. ~~**axolotl Linux 构建**~~ ✅ 三处改动，`cargo build` 1m24s / `maturin` 出 wheel 457KB，冒烟测试全过（§6.2）
+2. ~~**粒子画可读性**~~ ✅ 五个场景截图验收：表情 2698 点 @2.2px、文字 2619 @3.5px、图表 3424 @3.2px、复合 5068 @2.2px、涂鸦 2583 @2.2px（§7.3.1）
+
+**还没验**
+
+3. **`.axeb` 跨平台**：macOS 上生成的旧库在 Linux 上 `open()` 能否直接读（代码路径上看只会走纯 Rust 的 `GPUEdgeBlockGraph`，但没拿真实文件试过）
+4. **抽取质量**：用真实对话跑 200~500 轮，看节点/边的信噪比，以及五信号剪枝是否真的在剪对东西
+5. **渲染树表现力**：三个真实场景写死渲染树，看静态效果
+6. **认证 oracle**：cookie 转发给 `/server/myApps`，未登录时确认为 302 / 非 JSON
+7. **`drawOn` 的实际观感**：截图只能证明静态构图，1600ms 的"逐点换目标"在真实帧率下的手感还要人眼确认
+
+---
+
+## 附：几个实现取舍
+
+- **为什么不用 LangChain 一类框架**：核心循环约 300 行（工具解析、并发、审批挂起、事件流），自己写比适配框架的抽象更省
+- **为什么记忆不重写进 Node**：lobster-memory 是已验证的 Python 实现，重写只会引入新 bug
+- **为什么把 golem 拆成"机制"**：它依赖的 dsh 还是 dev-preview，把底座引进来等于把 breaking change 引进来
+- **为什么绘画语义层优先**：模型算像素坐标算不准，但说"happy"很准
+- **为什么前端 UI 放壳层而不是 agent 服务**：同源才能让粒子层直接驱动 UI 状态（审批幕、窗口、笔迹）

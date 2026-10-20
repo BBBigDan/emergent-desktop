@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>draw test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+  #scene { display: block; width: 100%; height: 100%; }
+  #hud {
+    position: fixed; left: 12px; top: 10px; color: #7c7a72;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hud"></div>
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module">
+import { Field } from './src/field.js';
+import { compileDraw, SCENES } from './src/draw.js';
+
+const f = new Field(document.getElementById('scene'));
+const hud = document.getElementById('hud');
+window.__field = f;
+
+/* 绘制区固定 720×420，居中 —— 场景里的坐标都是按这个尺寸写的 */
+const AREA = { w: 720, h: 420 };
+function area() {
+  return {
+    w: AREA.w,
+    h: AREA.h,
+    x: Math.round((innerWidth - AREA.w) / 2),
+    y: Math.round((innerHeight - AREA.h) / 2),
+  };
+}
+
+/* 供 CDP 调用：__draw('face') / __draw('chart') / __clear() */
+window.__draw = (name, opts = {}) => {
+  const spec = { ...SCENES[name], ...opts };
+  const pack = compileDraw(spec, area());
+  const a = area();
+  const r = f.setDraw(pack, { ...a, drawOnMs: opts.drawOnMs ?? 1600 });
+  hud.textContent = [
+    `scene   ${name}`,
+    `points  ${r.used}`,
+    `spacing ${pack.spacing.toFixed(2)}px`,
+    `layers  ${pack.layers}`,
+    `over    ${pack.over || 0}`,
+  ].join('\n');
+  return { ...r, spacing: pack.spacing, w: pack.w, h: pack.h, raw: pack.points.length };
+};
+window.__clear = () => { f.clearDraw(); return true; };
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  f.step(dt);
+  f.render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+const q = new URLSearchParams(location.search).get('scene');
+if (q && SCENES[q]) setTimeout(() => window.__draw(q, { drawOnMs: 1600 }), 300);
+</script>
+</body>
+</html>

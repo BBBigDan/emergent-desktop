@@ -234,6 +234,28 @@ export class Field {
     this.baseS = new Float32Array(n);
     this.phase = new Float32Array(n);
 
+    /* --- 绘画层 ---
+     * 把「画布上采出来的点云」当成 ambience 的**另一组目标位置**：
+     *   drawX/Y 屏幕坐标（stepShape 里直接减视口中心，绕过 ry/tilt 的旋转）
+     *   drawA/S 亮度与尺寸（墨越厚越亮）
+     *   drawCol 每点颜色（画是彩色的，而 ambient 只有 5 条纬度色带）
+     *   drawMix 0→1 的混合量，负责"散→聚成画→散回去"，不靠瞬切
+     * 点云只编译一次，之后每帧只是读缓冲 —— 每帧重采样会变成噪点。 */
+    this.drawN = 0;
+    this.drawX = new Float32Array(n);
+    this.drawY = new Float32Array(n);
+    this.drawA = new Float32Array(n);
+    this.drawS = new Float32Array(n);
+    this.drawD = new Float32Array(n);       // 逐点出场延迟（0..1，drawOn 用）
+    this.drawUse = new Uint8Array(n);       // 哪几颗点被这幅画借走了
+    this.drawCol = new Float32Array(n * 3);
+    this.drawMix = 0;                        // 当前混合量
+    this.drawOn = 0;                         // 目标混合量
+    this.drawSeen = false;                   // 画过一次就一直要做颜色还原
+    this.drawStart = 0;                      // drawOn 起始时间（秒）
+    this.drawOnMs = 0;                       // drawOn 总时长（ms），0 = 立刻
+    this.col0 = null;                        // ambient 原色快照（退出绘画时还原）
+
     /* --- rail（左边缘应用栏）---
      * 每颗点记着自己属于哪个图标、在图标里的局部偏移、是不是"增援"余量。
      * 目标位置每帧由「图标中心 + 局部偏移 × 悬停缩放 + 微环/漂移」算出，
@@ -1678,10 +1700,86 @@ export class Field {
   }
 
   /** 每帧：投影 + 弹簧。正交相机没有透视，深度得手工换成大小/亮度 */
+  /* ------------------------------- 绘画 -------------------------------
+   * 输入是 draw.js 编译出来的点云（画布坐标）。这里只做三件事：
+   *   1. 映射到场的屏幕坐标系（视口中心为原点）
+   *   2. 决定每颗点用哪个粒子 —— 打散分配，否则会出现"从左上角开始填"
+   *   3. 打开混合量，让弹簧把粒子拉过去（飞的过程本身就是动画，不用额外做过渡）
+   *
+   * 为什么点云要"编译一次、之后只读"：每帧重采样会让每颗点的落点微微变化，
+   * 整幅画会一直处于噪点状态（这个坑在点阵图标上踩过）。
+   */
+  setDraw(pack, geo = {}) {
+    const pts = pack.points || [];
+    const n = AMBIENT_N;
+    const cnt = Math.min(pts.length, n);
+    if (!cnt) { this.clearDraw(); return { used: 0, spacing: pack.spacing || 0 }; }
+
+    if (!this.col0) this.col0 = this.col.slice();
+
+    /* 画布坐标 → 场坐标。场是正交投影、原点在视口中心，所以减一半即可。 */
+    const ox = geo.x ?? 0;
+    const oy = geo.y ?? 0;
+    const cx = this.W * 0.5;
+    const cy = this.H * 0.5;
+
+    this.drawUse.fill(0);
+
+    /* 打散分配：点云按"层 + 纵坐标"排序，粒子按球面黄金角分布。
+       若 i→i 直配，粒子球上某一侧会整片跑去做画的同一块，导致局部挤、局部空。 */
+    const stride = pts.length / cnt;
+    for (let k = 0; k < cnt; k++) {
+      const p = pts[Math.floor(k * stride)];
+      const i = Math.floor((k * n) / cnt);
+      const ink = p.ink || 0.6;
+      this.drawUse[i] = 1;
+      this.drawX[i] = p.x + ox - cx;
+      /* canvas 的 y 向下、场（正交投影）的 y 向上 —— 这里必须取反，
+         否则整幅画上下颠倒（字会翻过来、柱状图会从顶边往下挂）。 */
+      this.drawY[i] = cy - (p.y + oy);
+      this.drawA[i] = 0.55 + 0.45 * ink;      // 墨越厚越亮
+      this.drawS[i] = 1.9 + 0.8 * ink;
+      this.drawD[i] = k / cnt;
+      this.drawCol[i * 3] = p.c[0];
+      this.drawCol[i * 3 + 1] = p.c[1];
+      this.drawCol[i * 3 + 2] = p.c[2];
+    }
+    this.drawN = cnt;
+    this.drawSeen = true;
+    this.drawOn = 1;
+    this.drawStart = this.time;
+    this.drawOnMs = geo.drawOnMs ?? 0;
+    return { used: cnt, spacing: pack.spacing || 0 };
+  }
+
+  /** 散回环境形态。给 1.6s 的回落，比聚上去慢 —— 散开太快会像"闪没了"。 */
+  clearDraw() {
+    this.drawOn = 0;
+  }
+
   stepShape(dt) {
     const t = this.time;
     const n = AMBIENT_N;
     const T = this.ta, P = this.pos, V = this.vel;
+
+    /* 绘画混合量：聚上去 0.9s，散回来 1.6s。
+       指数逼近而不是线性 —— 快到目标时自然减速，不会有"啪一下到位"的硬边。 */
+    {
+      const rate = dt / (this.drawOn > this.drawMix ? 0.9 : 1.6);
+      this.drawMix += (this.drawOn - this.drawMix) * Math.min(1, rate * 2.4);
+      if (this.drawMix < 0.0015) this.drawMix = 0;
+    }
+    const drawMix = this.drawMix;
+    const drawLive = drawMix > 0.002 && this.drawN > 0;
+    /* 作画进度：drawOnMs 内，点云按自己在画上的顺序依次"轮到"。
+       轮到的点才把目标换成画布位置，所以看起来是一道波沿着笔迹推过去，
+       不是整幅图同时从球里塌下来。 */
+    const drawProg = this.drawOnMs > 0
+      ? clamp(((t - this.drawStart) * 1000) / this.drawOnMs, 0, 1)
+      : 1;
+    /* 作画期间按住形态轮换：画到一半背景突然重组成星系，画会被撕开 */
+    if (drawLive) this.shapeT = Math.min(this.shapeT, SHAPE_MS * 0.45);
+
     /* 三种"背景粒子"的用法，同一批点切换：
      *   ring（launchMode 1）—— 绕着 3D 展示环流动的尘埃带，把图标整圈包住
      *   grid（launchMode 2）—— **每个图标外面一圈**粒子流（沿椭圆环绕 + 三道亮波）
@@ -1857,6 +1955,20 @@ export class Field {
         em = lerp(em, emA, auraW);
       }
 
+      /* ---- 绘画：轮到自己的点改用画布点云当目标 ----
+         `drawD[i] <= drawProg` 就是"这支笔写到这里了"。没轮到的点仍在环境形态里，
+         等轮到才飞过去 —— 所以看到的是一道波沿着笔迹推过去，而不是整幅图一起塌下来。
+         坐标已是屏幕系，必须绕开上面的 ry/tilt，否则画会被球体拖着转。 */
+      const isDraw = drawLive && this.drawUse[i] === 1 && this.drawD[i] <= drawProg + 0.001;
+      if (isDraw) {
+        tx = this.drawX[i];
+        ty = this.drawY[i];
+        z2 = 0;
+        strK = 0;
+        dirX = 0;
+        dirY = 0;
+      }
+
       V[i2] = (V[i2] + (tx - P[i3]) * k * dt) / (1 + c * dt);
       V[i2 + 1] = (V[i2 + 1] + (ty - P[i3 + 1]) * k * dt) / (1 + c * dt);
       P[i3] += V[i2] * dt;
@@ -1867,14 +1979,46 @@ export class Field {
          深处的点更小更暗：球面投影在轮廓处会挤成一道亮弧（看着像盘子边），
          用"前大后小"把这个堆积压掉，球体感也更明确。 */
       const dzk = grid ? 1 : clamp(0.52 + z2 * 0.50, 0.22, 1.18);
-      /* occ：有窗口时压暗 —— 但改道到日冕之后（auraW→1）就不压了，
-         否则窗口外面那圈会灰得看不见 */
-      const sa = this.baseA[i] * dzk * 2.9 * dim * em
-        * (1 - 0.62 * this.occ * (1 - auraW))
-        * (1 + 0.45 * beat);
-      const ss = this.baseS[i] * (0.45 + 1.5 * dzk) * szm;
+      let sa;
+      let ss;
+      if (isDraw) {
+        /* 画上的点：亮度按墨厚，尺寸固定。
+           不能走下面的 dzk —— 那是"前大后小"，用在笔画上会让粗细不匀。 */
+        /* 淡入比飞行慢一点（450ms）：太快就成了"瞬间出现"，看不到粒子流过去；
+           太慢又像蒙了一层雾。450ms 时能看见一串半透明的点从球里飞向笔迹。 */
+        let rev = 1;
+        if (this.drawOnMs > 0) {
+          const el = (t - this.drawStart) * 1000 - this.drawD[i] * this.drawOnMs;
+          rev = clamp(el / 450, 0, 1);
+        }
+        sa = this.drawA[i] * drawMix * rev;
+        ss = this.drawS[i];
+      } else {
+        /* occ：有窗口时压暗 —— 但改道到日冕之后（auraW→1）就不压了，
+           否则窗口外面那圈会灰得看不见 */
+        sa = this.baseA[i] * dzk * 2.9 * dim * em
+          * (1 - 0.62 * this.occ * (1 - auraW))
+          * (1 + 0.45 * beat);
+        ss = this.baseS[i] * (0.45 + 1.5 * dzk) * szm;
+        /* 作画时其余粒子压到很暗 —— 留着是"画长在粒子海里"的层次，
+           但亮度必须低到不跟画面抢注意力（0.22 时只剩一层若有若无的底噪） */
+        if (drawMix > 0.002) sa *= 1 - 0.78 * drawMix;
+      }
       this.alpha[i] += (sa - this.alpha[i]) * f;
       this.size[i] += (ss - this.size[i]) * f;
+
+      /* 颜色：画是彩色的，ambient 只有 5 条纬度色带。
+         退出作画后再缓慢褪回原色（用 col0 快照，不要重算调色板）。 */
+      if (this.drawSeen) {
+        const t3 = i * 3;
+        const mr = (isDraw ? this.drawCol[t3] : this.col0[t3]) - this.col[t3];
+        const mg = (isDraw ? this.drawCol[t3 + 1] : this.col0[t3 + 1]) - this.col[t3 + 1];
+        const mb = (isDraw ? this.drawCol[t3 + 2] : this.col0[t3 + 2]) - this.col[t3 + 2];
+        const km = Math.min(1, f * 1.6);
+        this.col[t3] += mr * km;
+        this.col[t3 + 1] += mg * km;
+        this.col[t3 + 2] += mb * km;
+      }
 
       /* 精灵的 y 轴向下，所以方向要取反（和窗口门一样） */
       this.aStr[i] = strK;
@@ -2228,6 +2372,8 @@ export class Field {
     this.geo.attributes.position.needsUpdate = true;
     this.geo.attributes.aSize.needsUpdate = true;
     this.geo.attributes.aAlpha.needsUpdate = true;
+    /* 颜色平时是静态的（只按纬度带分过色），只有作过画、正在混色时才需要每帧上传 */
+    if (this.drawSeen) this.geo.attributes.aColor.needsUpdate = true;
   }
 
   render() {

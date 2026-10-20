@@ -1,0 +1,68 @@
+diff --git a/prototype-rust/Cargo.toml b/prototype-rust/Cargo.toml
+index 0e5a62f..b2958a7 100644
+--- a/prototype-rust/Cargo.toml
++++ b/prototype-rust/Cargo.toml
+@@ -35,16 +35,17 @@ num-traits = "0.2"
+ # 随机数（用于近似算法）
+ rand = "0.8"
+ 
++# 内存映射（用于大于内存的图）—— 跨平台，不要放进 macOS 块
++memmap2 = "0.9"
++
++# Python 绑定
++pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
++
+ # GPU 支持（Metal on macOS）
+ [target.'cfg(target_os = "macos")'.dependencies]
+ metal = "0.29"
+ dispatch = "0.2"
+ 
+-# 内存映射（用于大于内存的图）
+-memmap2 = "0.9"
+-
+-# Python 绑定
+-pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+ 
+ [features]
+ default = []
+@@ -60,6 +61,7 @@ proptest = "1.4"
+ # 随机图生成（用于基准测试）
+ rand = "0.8"
+ 
++
+ [[bench]]
+ name = "graph_benchmark"
+ harness = false
+diff --git a/prototype-rust/src/lib.rs b/prototype-rust/src/lib.rs
+index 13a33eb..da386db 100644
+--- a/prototype-rust/src/lib.rs
++++ b/prototype-rust/src/lib.rs
+@@ -21,10 +21,14 @@ pub mod mmap_graph; // mmap 友好格式（支持大于内存的图）
+ pub mod edge_block; // EdgeBlock 数据结构（CPU 版本，优化缓存利用率）
+ pub mod csr_graph; // CSR 格式图（用于 GPU 加速）
+ pub mod gpu_edge_block; // GPU EdgeBlock 格式（扁平化数组，适配 GPU）
++#[cfg(target_os = "macos")]
+ pub mod incremental_pagerank; // CPU/GPU 协同的增量 PageRank
++#[cfg(target_os = "macos")]
+ pub mod incremental_bfs; // CPU/GPU 协同的增量 BFS
++#[cfg(target_os = "macos")]
+ pub mod incremental_sssp; // CPU/GPU 协同的增量 SSSP
+ pub mod incremental_ssspv2; // 增量 SSSP v2（差分 BFS，纯 CPU）
++#[cfg(target_os = "macos")]
+ pub mod incremental_sssp_edgeblock; // CPU/GPU 协同的增量 SSSP（使用 EdgeBlock 格式）
+ pub mod pagerank_correct; // PageRank CPU 正确实现
+ pub mod incremental_cc; // 增量 Connected Components（使用 Union-Find）
+@@ -48,9 +52,13 @@ pub use persistence::*;
+ // pub use visualization::*;
+ pub use edge_block::*; // 导出 EdgeBlock
+ pub use csr_graph::*; // 导出 CSRGraph
++#[cfg(target_os = "macos")]
+ pub use incremental_pagerank::IncrementalPageRankEdgeBlock; // 导出增量 PageRank (EdgeBlock)
++#[cfg(target_os = "macos")]
+ pub use incremental_bfs::IncrementalBFS; // 导出增量 BFS
++#[cfg(target_os = "macos")]
+ pub use incremental_sssp::IncrementalSSSP; // 导出增量 SSSP
++#[cfg(target_os = "macos")]
+ pub use incremental_sssp_edgeblock::IncrementalSsspEdgeBlock; // 导出增量 SSSP (EdgeBlock)
+ pub use incremental_cc::IncrementalCC; // 导出增量 Connected ComponentsP
+ 
