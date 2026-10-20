@@ -262,6 +262,34 @@ node tools/dev/serve-dir.mjs shell 8766
 
 ![demo](docs/images/demo-scene.png)
 
+### agent 基座（M0，mock 模型）
+
+上一步的场是"演示"，这一步把它接到一条真的链路上 —— 还是不用模型 key：
+
+```bash
+node agent/server.mjs            # → http://127.0.0.1:8788/shell/agent.html
+SYS=mock node agent/server.mjs   # 工具返回固定数据，截图/自测可复现
+```
+
+它跑通了四段：**模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌**，
+外加一道**审批门**。协议和取舍写在 [`agent/README.md`](agent/README.md)，这里只说三件值得看的事：
+
+1. **一句话就是一句话。** 底部那行字有 20 字硬预算。场的字数不是排版问题，是槽位算术 ——
+   所以模型必须学会"结论一句话，细节交给场上的分叉去问"。
+2. **模型自己拿的主意才走审批。** 你拖内存、点了"压到 34%"，那就直接做 —— 再问一遍是确认你没读过自己刚点的东西。
+   你只说"内存有点高"，它自己决定压 —— 这才弹审批，并且告诉你代价（会重启 n8n）。
+3. **"在想"不是转圈，是相干度下降。** 同一批粒子从"成形"退到"还没成形"，答案回来再凝聚。
+   复用 §4.6 的语法，没有为新状态发明新控件。
+
+| 问一句 | 拖一下 | 点一下 |
+|---|---|---|
+| ![](docs/images/agent-overview.png) | ![](docs/images/agent-adjust.png) | ![](docs/images/agent-detail.png) |
+| 审批门 | 批准之后 | 磁盘（只给结论，明细不进场）|
+| ![](docs/images/agent-gate.png) | ![](docs/images/agent-done.png) | ![](docs/images/agent-disk.png) |
+
+现在是 mock：模型是脚本，工具返回假数据。M1 换 `model.openai.mjs` + 真的 k8s 调用，
+**协议一个字不用改** —— 这就是这一步的全部目的。
+
 README 里的截图全部由脚本生成，不是手截的：`node tools/dev/shots.mjs` 会在一条会话里依次
 摆出桌面 / 应用栏 / 圆环 / 平铺 / 粒子门 / 开窗 / 状态盘七个状态并逐张截图（走 CDP 的真实鼠标事件）。
 

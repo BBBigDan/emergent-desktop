@@ -39,6 +39,23 @@ const COL = {
   accent: '#7fc4ff',
 };
 
+/**
+ * 把一段标签压进 n 个字。
+ *
+ * 场的字按"字数 × 预算"占槽位，超了就会被硬截断 —— 而硬截断会把数字切成
+ * "换 34"这种没有意义的碎片。所以优先在空格/句读处断，实在没有才硬切，
+ * 并且补一个省略号：**宁可少几个字，也不要留一个看着像算错了的半截数字**。
+ */
+function fit(text, n) {
+  const ch = Array.from(String(text ?? ''));
+  if (ch.length <= n) return ch.join('');
+  const cut = ch.slice(0, n);
+  for (let i = cut.length - 1; i > Math.floor(n * 0.45); i--) {
+    if (' ·、，。；：'.includes(cut[i])) return `${cut.slice(0, i).join('')}…`;
+  }
+  return `${cut.slice(0, n - 1).join('')}…`;
+}
+
 function rgb(hex) {
   const s = hex.replace('#', '');
   return [0, 2, 4].map((i) => parseInt(s.slice(i, i + 2), 16) / 255);
@@ -218,7 +235,7 @@ export class FieldScene {
            这是"决策是排他的"能成立的技术前提：场里只有一个决策槽，
            新问题来了就地把旧的换掉，不新建、不叠两个。 */
         layer.spec.label = op.label;
-        layer.title?.set(op.label);
+        layer.title?.set(fit(op.label, 14));
         if (Array.isArray(op.options)) {
           layer.spec.options = op.options;
           op.options.slice(0, 2).forEach((o, k) => {
@@ -226,7 +243,7 @@ export class FieldScene {
             if (!br) return;
             br.option = { ...br.option, ...o };
             br.hot.option = br.option.id;    // 命中测试读的是 hot 上的 option
-            br.text?.set(o.label || '');
+            br.text?.set(fit(o.label, 8));
           });
         }
       }
@@ -609,10 +626,10 @@ export class FieldScene {
 
     const f = this.field;
     const title = new ParticleText({
-      field: f, alloc: this.alloc, x: cx, y: cy - 30, size: 18, max: 13,
+      field: f, alloc: this.alloc, x: cx, y: cy - 30, size: 18, max: 14,
       color: '#93b8d8', align: 'center', font: FONT, label: `f-${spec.id}`,
     });
-    title.set(spec.label || '');
+    title.set(fit(spec.label, 14));
     layer.title = title;
 
     opts.forEach((o, si) => {
@@ -636,7 +653,7 @@ export class FieldScene {
         field: f, alloc: this.alloc, x: cx + dir * 240, y: cy + 96, size: 16, max: 7,
         color: si === 0 ? COL.ok : '#93b8d8', align: 'center', font: FONT, label: `fo-${o.id}`,
       });
-      txt.set(o.label || '');
+      txt.set(fit(o.label, 8));
       const bx = cx + dir * 240;
       const by = cy + 96;
       layer.branches.push({
@@ -651,13 +668,18 @@ export class FieldScene {
   /** 纯粹的一行读数（凝聚成字） */
   _condense(spec, i, a) {
     const f = this.field;
+    /* 场上有分叉时，结论要躲到分叉上方去。
+       不然它会正好压在两个选项中间 —— "Downloads 有 11 GB" 和 "归档 / 先不动"
+       叠在一起，看着像写错行。分叉占了 a.y+470..+700 那一条带。 */
+    const hasFork = [...this.layers.values()].some((l) => l.spec?.kind === 'fork');
+    const y = hasFork ? a.y + 372 : a.y + 588 + i * 26;
     const t = new ParticleText({
-      field: f, alloc: this.alloc, x: a.x + a.w / 2, y: a.y + 588 + i * 26, size: 17, max: 20,
-      color: COL.dim, align: 'center', font: FONT, label: `c-${spec.id}`,
+      field: f, alloc: this.alloc, x: a.x + a.w / 2, y, size: 17, max: 20,
+      color: hasFork ? '#93b8d8' : COL.dim, align: 'center', font: FONT, label: `c-${spec.id}`,
     });
     t.set(spec.text || '');
     this.texts.push(t);
-    this.layers.set(spec.id, { spec, anchor: { x: a.x + a.w / 2, y: a.y + 560 }, text: t });
+    this.layers.set(spec.id, { spec, anchor: { x: a.x + a.w / 2, y: y - 28 }, text: t });
     return t;
   }
 
@@ -685,7 +707,7 @@ export class FieldScene {
         field: this.field, alloc: this.alloc, x: cx, y: cy + 46, size: 16, max: 7,
         color: COL.warn, align: 'center', font: FONT, label: `tb-${spec.id}`,
       });
-      layer.text.set(spec.label);
+      layer.text.set(fit(spec.label, 8));
     }
     /* 点这团乱点 = "这是怎么回事" —— 最自然的下钻入口 */
     layer.hot = { type: 'circle', cx, cy, r: 74, gestures: ['tap'] };
@@ -808,7 +830,7 @@ export class FieldScene {
     const data = spec.data || [];
     const w = layer.win || [0, 1];
     const older = w[1] < 0.999;
-    layer.label?.set(`${spec.label || ''}${older ? ' ←' : ''}`);
+    layer.label?.set(fit(`${spec.label || ''}${older ? ' ←' : ''}`, 14));
     const idx = Math.min(data.length - 1, Math.round(w[1] * (data.length - 1)));
     layer.now?.set(`${Math.round((data[idx] ?? 0) * 100)}%`);
   }

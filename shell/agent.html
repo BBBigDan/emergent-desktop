@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>emergent agent</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+  body { color: #93b8d8; font: 13px/1.6 ui-sans-serif, system-ui, "PingFang SC", sans-serif; }
+  #scene { display: block; width: 100%; height: 100%; }
+
+  /* 输入行：看得见的字是粒子，摸得着的框是透明的 —— 中文输入法的候选框要真实 caret */
+  #type {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    width: 620px; height: 34px; padding: 0;
+    background: transparent; border: 0; outline: 0;
+    color: transparent; caret-color: rgba(190, 225, 255, 0.9);
+    font-family: "DengXian Light", "Microsoft YaHei Light", "PingFang SC", "Microsoft YaHei", ui-sans-serif, sans-serif;
+    font-size: 19px; font-weight: 300; letter-spacing: 0;
+    text-align: center; z-index: 3;
+  }
+  #type::selection { background: rgba(127, 196, 255, 0.22); }
+
+  /* 观察窗（inspector）：这是给开发/排查看的，不属于 agent 的表达。
+     agent 的表达只有两处 —— 场，和那一行字。 */
+  #insp {
+    position: fixed; left: 24px; bottom: 20px;
+    font: 10.5px/1.75 ui-monospace, Menlo, "Cascadia Mono", monospace;
+    white-space: pre; pointer-events: none; max-width: 46vw;
+  }
+  #insp .ln { opacity: 0; transform: translateY(4px); transition: opacity 0.26s, transform 0.26s; }
+  #insp .ln.in { opacity: 1; transform: none; }
+  #insp b { display: inline-block; width: 86px; color: rgba(127, 196, 255, 0.85); font-weight: 400; }
+  #insp b.tool { color: rgba(255, 178, 87, 0.85); }
+  #insp b.say { color: rgba(127, 227, 207, 0.8); }
+  #insp span { color: rgba(147, 184, 216, 0.5); }
+  #insp i { color: rgba(147, 184, 216, 0.28); font-style: normal; }
+  #insp .ln.dim { opacity: 0.3; }
+
+  #stat {
+    position: fixed; right: 24px; top: 20px; text-align: right;
+    font: 10.5px/1.7 ui-monospace, Menlo, monospace;
+    color: rgba(147, 184, 216, 0.4); pointer-events: none;
+  }
+  #stat b { color: rgba(127, 211, 176, 0.9); font-weight: 400; }
+  #stat .dot { display: inline-block; width: 5px; height: 5px; border-radius: 3px; background: #7fd3b0; margin-right: 6px; vertical-align: 1px; }
+  #stat.off .dot { background: #ff7c93; }
+
+  #hint {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    font: 10.5px/1.6 ui-monospace, Menlo, monospace;
+    color: rgba(147, 184, 216, 0.3); pointer-events: none; text-align: center;
+  }
+
+  /* 审批的兜底：当场里没有分叉可借用时，用一条 DOM 带子。
+     审批是**系统的 affordance**，不受模型表达自由支配 —— 所以它允许不是粒子。 */
+  #gate {
+    position: fixed; left: 50%; bottom: 56px; transform: translateX(-50%);
+    display: none; align-items: center; gap: 12px;
+    padding: 9px 14px; border-radius: 10px;
+    background: rgba(30, 20, 14, 0.86); border: 1px solid rgba(255, 178, 87, 0.32);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    font-size: 12px; color: #ffcf9a; z-index: 4;
+  }
+  #gate.on { display: flex; }
+  #gate button {
+    font: 11.5px/1 inherit; padding: 6px 11px; border-radius: 7px; cursor: pointer;
+    background: rgba(255, 178, 87, 0.14); border: 1px solid rgba(255, 178, 87, 0.45); color: #ffcf9a;
+  }
+  #gate button.no { background: transparent; border-color: rgba(147, 184, 216, 0.3); color: #93b8d8; }
+
+  #a11y { position: fixed; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<input id="type" autocomplete="off" spellcheck="false" aria-label="对 agent 说一句话">
+<div id="insp"></div>
+<div id="stat"><span class="dot"></span><b id="stat-txt">connecting</b></div>
+<div id="hint">回车发送 · 拖仪表 / 拖曲线 / 点元素</div>
+<div id="gate"></div>
+<div id="a11y"></div>
+
+<script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+<script type="module">
+import { Field } from './src/field.js';
+import { FieldScene } from './src/scene.js';
+import { ParticleText, SlotAllocator } from './src/pui.js';
+import { FONT } from './src/draw.js';
+import { FieldA11y } from './src/aria.js';
+import { GestureTracker, describe } from './src/gesture.js';
+import { Pacer } from './src/timing.js';
+
+const q = new URLSearchParams(location.search);
+const f = new Field(document.getElementById('scene'));
+const a11y = new FieldA11y(document.getElementById('a11y'));
+const inspEl = document.getElementById('insp');
+const statEl = document.getElementById('stat');
+const statTxt = document.getElementById('stat-txt');
+const typeEl = document.getElementById('type');
+const gateEl = document.getElementById('gate');
+const pacer = new Pacer();
+
+const W = innerWidth;
+const H = innerHeight;
+const AREA = { w: Math.min(820, Math.max(620, W - 120)), h: 560, x: 0, y: 0 };
+AREA.x = Math.round((W - AREA.w) / 2);
+AREA.y = Math.max(56, Math.round((H - AREA.h) / 2 - 46));
+
+/* 一句话的位置：用户说的话和 agent 说的话共用这一行。
+   共用的理由不是省槽位（虽然也省了 456 个），而是"对话就是轮流占用同一处注意力"。 */
+const LINE_Y = H - 118;
+const head = new SlotAllocator(6400, 0);
+const line = new ParticleText({
+  field: f, alloc: head, x: Math.round(W / 2), y: LINE_Y, size: 19, max: 20,
+  color: '#eaf3ff', align: 'center', font: FONT, label: 'line',
+});
+const scene = new FieldScene({ field: f, area: AREA, a11y, slotStart: head.used });
+
+typeEl.style.top = `${LINE_Y - 17}px`;
+f.slotBegin({ dim: 0.94, dot: 0.95 });
+
+/* ───────────────── 观察窗 ───────────────── */
+
+let t0 = performance.now();
+function insp(kind, detail, cls = '') {
+  const d = document.createElement('div');
+  d.className = 'ln';
+  d.innerHTML = `<b class="${cls}">${kind}</b><span>${detail}</span><i>${((performance.now() - t0) / 1000).toFixed(1)}s</i>`;
+  inspEl.appendChild(d);
+  requestAnimationFrame(() => d.classList.add('in'));
+  while (inspEl.children.length > 9) inspEl.removeChild(inspEl.firstChild);
+  [...inspEl.children].forEach((n, i, all) => n.classList.toggle('dim', i < all.length - 4));
+}
+
+let lineText = '';
+function say(txt, opt = {}) {
+  /* 场的字按"字数 × 预算"占槽位，18 字是这一行能住下的上限。
+     超了就截在最后一个句读处 —— 截断总比让半句话消失好。 */
+  let s2 = String(txt ?? '');
+  const ch = Array.from(s2);
+  if (ch.length > 20) {
+    /* 多取一个字符再找句读：句读常常正好落在第 20 位，少取一个就找不到 */
+    const cut = ch.slice(0, 21);
+    const at = cut.findLastIndex((c) => '，。、；：·'.includes(c));
+    s2 = at > 6 ? cut.slice(0, at).join('') : ch.slice(0, 20).join('');
+  }
+  lineText = s2;
+  line.set(s2, opt);
+}
+function reassertLine() {
+  if (lineText) line.set(lineText, { force: true });
+}
+
+/* ───────────────── 与服务端 ───────────────── */
+
+const sid = sessionStorage.getItem('sid') || (crypto.randomUUID?.() ?? String(Math.random()).slice(2));
+sessionStorage.setItem('sid', sid);
+
+function send(msg) {
+  return fetch('/api/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sid, ...msg }),
+  }).catch((e) => insp('net', String(e.message || e)));
+}
+
+let thinking = 0;
+let pendingApproval = null;
+let busy = false;
+
+function setThink(on) {
+  thinking += on ? 1 : -1;
+  if (thinking < 0) thinking = 0;
+  /* 「在想」= 相干度下降。这不是加载动画，是同一批粒子在"还没成形"的状态 ——
+     复用 §4.6 的语法，不需要再发明一个转圈。 */
+  if (!scene.tr) f.setCoherence(thinking > 0 ? 0.58 : 1);
+  statEl.classList.toggle('off', thinking > 0);
+  statTxt.textContent = thinking > 0 ? 'thinking' : busy ? 'running' : 'ready';
+}
+
+const es = new EventSource(`/api/events?sid=${sid}`);
+es.onmessage = (e) => {
+  let m;
+  try { m = JSON.parse(e.data); } catch { return; }
+  onEvent(m);
+};
+es.onerror = () => { statEl.classList.add('off'); statTxt.textContent = 'disconnected'; };
+
+function onEvent(m) {
+  switch (m.t) {
+    case 'hello':
+      t0 = performance.now();
+      statEl.classList.remove('off');
+      statTxt.textContent = 'ready';
+      insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
+      say('服务器现在怎么样？', { silent: true });
+      typeEl.value = '';
+      break;
+
+    case 'turn':
+      busy = true;
+      insp(m.kind === 'intent' ? '→ 手势' : '→ 你问', m.kind === 'intent'
+        ? describe(m.intent)
+        : lineText);
+      break;
+
+    case 'think': setThink(m.on); break;
+
+    case 'say':
+      say(m.text);
+      insp('say', m.text, 'say');
+      break;
+
+    case 'tool':
+      if (m.state === 'run') insp('tool', `${m.name} ${JSON.stringify(m.args).slice(0, 72)}`, 'tool');
+      else insp('·', `${m.name} → ${m.note || m.state}${m.ms != null ? ` (${m.ms}ms)` : ''}`, 'tool');
+      if (m.state === 'run') statTxt.textContent = m.name;
+      break;
+
+    case 'scene':
+      /* 服务端的动作也走节拍器：mock 模型一秒钟能把四条指令全吐出来，
+         但界面上必须有先后 —— 这就是"时序由前端强制"的意义。 */
+      if (m.op === 'set') pacer.run('set', () => { scene.set(m.spec); reassertLine(); });
+      else if (m.op === 'transition') pacer.run('transition', () => { scene.transition(m.spec); reassertLine(); });
+      else if (m.op === 'patch') pacer.run('patch', () => { scene.patch(m.ops); reassertLine(); });
+      else if (m.op === 'pulse') pacer.run('pulse', () => scene.pulse(m.kind, { at: m.at }));
+      break;
+
+    case 'approval':
+      pendingApproval = m.id;
+      /* 场里正好有一个分叉 → 就地改成审批；没有 → 退回 DOM 带子。
+         前者才是这套界面该有的样子，后者只是兜底。 */
+      if (scene.layers.get('ask')) {
+        scene.patch([{
+          id: 'ask', label: m.label,
+          options: [{ id: 'ok', label: '允许' }, { id: 'no', label: '拒绝' }],
+        }]);
+        scene.pulse('arrive', { at: 'ask' });
+      } else {
+        gateEl.classList.add('on');
+        gateEl.innerHTML = `<span>${m.danger}</span>`;
+        const ok = document.createElement('button');
+        ok.textContent = '允许';
+        const no = document.createElement('button');
+        no.className = 'no';
+        no.textContent = '拒绝';
+        ok.onclick = () => { gateEl.classList.remove('on'); send({ t: 'approve', ok: true }); };
+        no.onclick = () => { gateEl.classList.remove('on'); send({ t: 'approve', ok: false }); };
+        gateEl.append(ok, no);
+      }
+      insp('gate', `需要批准：${m.tool} — ${m.danger}`);
+      break;
+
+    case 'approval_done':
+      pendingApproval = null;
+      gateEl.classList.remove('on');
+      insp('gate', m.ok ? '已允许' : '已拒绝');
+      break;
+
+    case 'idle':
+      busy = false;
+      statTxt.textContent = 'ready';
+      break;
+
+    case 'note':
+      insp('note', m.message);
+      break;
+
+    case 'busy':
+      insp('busy', '上一轮还没结束，这一步先排队');
+      break;
+
+    case 'error':
+      insp('error', m.message);
+      busy = false;
+      statTxt.textContent = 'ready';
+      break;
+
+    default:
+      insp(m.t, JSON.stringify(m).slice(0, 90));
+  }
+}
+
+/* ───────────────── 输入 ───────────────── */
+
+function submit() {
+  const text = typeEl.value.trim();
+  if (!text) return;
+  say(text);
+  insp('你', text);
+  send({ t: 'ask', text });
+  typeEl.value = '';
+}
+
+typeEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
+});
+typeEl.addEventListener('input', () => {
+  say(typeEl.value || '');
+});
+
+/* ───────────────── 手势 → 意图 ───────────────── */
+
+let panBase = null;
+let dragId = null;
+
+const gt = new GestureTracker({
+  pick: (x, y) => scene.hit(x, y),
+
+  onStart: (s) => {
+    f.setWells([{ x: s.x, y: s.y, r: 180, k: 1200, swirl: 0.3 }]);
+    if (s.id) f.impulse(s.x, s.y, { r: 120, power: 200 });
+    if (s.hot?.gestures?.includes('pan') && s.layer?.win) {
+      panBase = s.layer.win.slice();
+      dragId = s.id;
+    }
+  },
+
+  onMove: (s) => {
+    f.setWells([{ x: s.x, y: s.y, r: 195, k: 1500, swirl: 0.34 }]);
+    if (s.trail) f.impulse(s.x, s.y, { r: 76, power: 78 });
+    if (s.id && panBase && dragId === s.id) {
+      const span = panBase[1] - panBase[0];
+      const frac = -s.dx / 780;
+      const w0 = Math.min(1 - span, Math.max(0, panBase[0] + frac * span));
+      scene.resetWin(s.id, [w0, w0 + span]);
+    }
+  },
+
+  onEnd: (s) => {
+    f.setWells([]);
+    if (s.moved) f.impulse(s.x, s.y, { r: 210, power: 420 });
+    panBase = null;
+    dragId = null;
+  },
+
+  onIntent: (i) => {
+    /* 分叉上的"允许/拒绝"是**审批**，不是普通选择 —— 但走的是同一条手势通道。
+       审批不是特权通道，它只是"服务端此刻在等一个 pick"。 */
+    if (pendingApproval && i.kind === 'pick' && i.target === 'ask') {
+      const ok = i.option === 'ok';
+      send({ t: 'approve', ok });
+      insp('gate', ok ? '你点：允许' : '你点：拒绝');
+      return;
+    }
+    if (i.target) insp('hand', describe(i));
+    send({ t: 'intent', intent: i });
+  },
+});
+gt.attach(window);
+
+addEventListener('pointermove', (e) => {
+  if (gt.g?.moved) return;
+  const h = scene.hit(e.clientX, e.clientY);
+  document.body.style.cursor = !h ? 'default'
+    : h.hot.gestures.includes('adjust') ? 'ns-resize'
+    : h.hot.gestures.includes('pan') ? 'ew-resize'
+    : 'pointer';
+});
+
+/* ───────────────── 主循环 ───────────────── */
+
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  f.step(dt);
+  scene.step(dt);
+  f.render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* 自测钩子 */
+window.__agent = {
+  scene, field: f, pacer, send, gt,
+  ask: (t) => { typeEl.value = t; submit(); },
+  /* 自测用：走**真实的手势通道**（和用户按下去完全同一条路），不是直接调 scene */
+  tap: (id, branch = 0) => {
+    const l = scene.layers.get(id);
+    const h = (l?.branches?.[branch]?.hot) || l?.hot;
+    if (!h) return false;
+    const { cx, cy } = h.type === 'circle' ? h : { cx: (h.x0 + h.x1) / 2, cy: (h.y0 + h.y1) / 2 };
+    gt.down(cx, cy);
+    setTimeout(() => gt.up(cx, cy), 110);
+    return true;
+  },
+  drag: (id, dx, dy) => {
+    const h = scene.layers.get(id)?.hot;
+    if (!h) return false;
+    const cx = h.cx ?? (h.x0 + h.x1) / 2;
+    const cy = h.cy ?? (h.y0 + h.y1) / 2;
+    gt.down(cx, cy);
+    let k = 0;
+    const step = () => {
+      k++;
+      gt.move(cx + (dx * k) / 12, cy + (dy * k) / 12);
+      if (k < 12) setTimeout(step, 16);
+      else setTimeout(() => gt.up(cx + dx, cy + dy), 40);
+    };
+    setTimeout(step, 30);
+    return true;
+  },
+};
+window.__state = () => ({ thinking, busy, pendingApproval, slots: scene.alloc.used, line: lineText });
+</script>
+</body>
+</html>

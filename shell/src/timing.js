@@ -165,9 +165,17 @@ export class Pacer {
     return Math.max(0, this.lastAt + need * this.speed - this.now());
   }
 
-  /** 排进队列。同一个 kind 已经在排队的会合并（只保留最后一个）。 */
+  /**
+   * 排进队列。
+   *
+   * 只对 `set` / `transition` 合并（同一个 kind 在排队时只保留最后一个）——
+   * 它们是"整屏替换"，连发三个只有最后一个有意义，中间那两次的溶解纯属浪费。
+   * `patch` / `pulse` **必须保序、不许合并**：一次改的是 mem，一次改的是 fork，
+   * 合并会丢掉前一个，界面上就是"我明明让它改两处，只改了一处"。
+   */
   run(kind, fn) {
-    const at = this.queue.findIndex((q) => q.kind === kind);
+    const idempotent = kind === 'set' || kind === 'transition';
+    const at = idempotent ? this.queue.findIndex((q) => q.kind === kind) : -1;
     if (at >= 0) this.queue[at] = { kind, fn };
     else this.queue.push({ kind, fn });
     this._drain();
