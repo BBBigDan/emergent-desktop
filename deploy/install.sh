@@ -110,6 +110,21 @@ say "  $HOME_PATH"
 
 [ -f "$REPO/agent/.env" ] || say "没有 agent/.env —— 没有模型 key 时它会答不上话（其余功能正常）"
 
+# ── 1.5 迁一次 hostPath 时代的数据 ──────────────────────
+# 会话存档（最后一屏，重连要 resume）和 token 日账本以前躺在代码目录里
+# /olares/emergent-desktop/app/agent/{sessions,usage}。现在代码在镜像里只读，
+# 这两个目录改成挂 $STATE_DIR。不搬的话：token 账本清零，看起来像"用量丢了"。
+# 只在目标为空时搬 —— 不能覆盖新版已经写出来的东西。
+say "迁移会话/用量（如果还有旧的 hostPath 数据）"
+"${SSH[@]}" "mkdir -p '$STATE_DIR'
+  for D in sessions usage; do
+    SRC=/olares/emergent-desktop/app/agent/\$D
+    if [ -d \"\$SRC\" ] && [ -z \"\$(ls -A '$STATE_DIR'/\$D 2>/dev/null)\" ]; then
+      mkdir -p '$STATE_DIR'/\$D && cp -a \"\$SRC\"/. '$STATE_DIR'/\$D/ 2>/dev/null || true
+      echo \"  \$D: \$(ls -A '$STATE_DIR'/\$D | wc -l) 个文件\"
+    fi
+  done; true"
+
 # ── 2. 模型 key ─────────────────────────────────────────
 if [ -f "$REPO/agent/.env" ]; then
   say "写 Secret emergent-desktop-env"
@@ -180,7 +195,7 @@ cat <<EOF
   ./deploy/install.sh # 拉 latest 并重建 pod
 
 回滚到某个提交：./deploy/install.sh --tag sha-1a2b3c4
-  标签列表：Hub 仓库的 Tags 页，或 Actions 日志里那行 sha-xxxxxxxx
+  标签列表：Hub 仓库的 Tags 页，或 Actions 里那一步输出的 sha-1a2b3c4
 
 桌面回官方：./deploy/install.sh --revert
 连工作负载一起删：./deploy/install.sh --uninstall      （数据保留）
