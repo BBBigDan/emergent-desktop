@@ -133,6 +133,7 @@ function insp(kind, detail, cls = '') {
 }
 
 let lineText = '';
+let typer = 0;
 function say(txt, opt = {}) {
   /* 场的字按"字数 × 预算"占槽位，18 字是这一行能住下的上限。
      超了就截在最后一个句读处 —— 截断总比让半句话消失好。 */
@@ -145,7 +146,19 @@ function say(txt, opt = {}) {
     s2 = at > 6 ? cut.slice(0, at).join('') : ch.slice(0, 20).join('');
   }
   lineText = s2;
-  line.set(s2, opt);
+  /* 逐字生长。这不是"假装在流式输出 token" —— 它就是场自己的编码方式：
+     一行字由粒子凝成，一颗一颗落位，比整句闪现更像"它刚想好"。
+     每加一个字只重写那一个字的槽位（ParticleText.set 逐字比对），代价可以忽略。 */
+  clearInterval(typer);
+  if (opt.instant || opt.silent || !s2) { line.set(s2, opt); return; }
+  const chars = Array.from(s2);
+  let n = 0;
+  line.set('', { force: true });
+  typer = setInterval(() => {
+    n++;
+    line.set(chars.slice(0, n).join(''), { force: true });
+    if (n >= chars.length) clearInterval(typer);
+  }, 42);
 }
 function reassertLine() {
   if (lineText) line.set(lineText, { force: true });
@@ -162,8 +175,10 @@ function friendly(msg = '') {
 
 /* ───────────────── 与服务端 ───────────────── */
 
-const sid = sessionStorage.getItem('sid') || (crypto.randomUUID?.() ?? String(Math.random()).slice(2));
-sessionStorage.setItem('sid', sid);
+/* sid 用 localStorage：刷新、开新标签页都还是同一段会话。
+   服务端会把它落盘，于是"刷新一下，刚才那屏还在" —— 这是完成度里最便宜的一笔。 */
+const sid = localStorage.getItem('sid') || (crypto.randomUUID?.() ?? String(Math.random()).slice(2));
+localStorage.setItem('sid', sid);
 
 function send(msg) {
   return fetch('/api/send', {
@@ -211,6 +226,20 @@ function onEvent(m) {
       insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
       say('服务器现在怎么样？', { silent: true });
       typeEl.value = '';
+      break;
+
+    case 'resume':
+      /* 不是"重新长一遍"：用户没有发起任何事，画面应该已经在那儿 */
+      if (m.scene) {
+        clearInterval(typer);
+        scene.set(m.scene);
+        if (m.ops) scene.patch(m.ops);
+        /* 先清再写：新的一行比原来短时，旧字的残余点会留在原地，
+           看起来就是两句话叠在一起。 */
+        line.set('', { force: true });
+        if (m.line) { lineText = m.line; line.set(m.line, { force: true }); reassertLine(); }
+        insp('resume', `恢复上一屏（${m.scene.layers?.length ?? 0} 层）`);
+      }
       break;
 
     case 'turn':
@@ -324,7 +353,8 @@ typeEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
 });
 typeEl.addEventListener('input', () => {
-  say(typeEl.value || '');
+  /* 输入回显必须是瞬时的：逐字生长是"它刚想好"的语法，用在打字回显上就成了卡顿 */
+  say(typeEl.value || '', { instant: true });
 });
 
 /* ───────────────── 手势 → 意图 ───────────────── */
@@ -430,7 +460,14 @@ window.__agent = {
     return true;
   },
 };
-window.__state = () => ({ thinking, busy, pendingApproval, slots: scene.alloc.used, line: lineText });
+window.__state = () => ({
+  thinking, busy, pendingApproval,
+  slots: scene.alloc.used,
+  line: lineText,
+  lineChars: line._last,
+  layers: [...scene.layers.keys()],
+  spec: scene.spec?.layers?.map((l) => l.kind + ':' + l.id).join(' ') || '',
+});
 </script>
 </body>
 </html>

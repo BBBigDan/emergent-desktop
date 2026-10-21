@@ -25,3 +25,6 @@ Thumbs.db
 # agent/.env 里有模型的 API key，只能留在本机
 agent/.env
 .env
+
+# ---- 会话存档（本地跑出来的对话与最后一屏）----
+agent/sessions/

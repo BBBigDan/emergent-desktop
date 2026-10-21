@@ -63,6 +63,44 @@ const APPROVAL_MS = 90_000;
 /** @type {Map<string, any>} */
 const sessions = new Map();
 
+/* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
+   反代重启一次，用户看到的就是一片空粒子，刚才那屏和那行结论全没了。
+   而这一屏往往是他正在看的东西，不是可以随手丢掉的过程。
+   存三样就够：对话（模型的上下文）、最后一屏（眼睛看到的）、最后的读数（兜底要用）。 */
+const SESS_DIR = path.join(HERE, 'sessions');
+const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;   // sid 会变成文件名，先卡死形状
+
+async function loadSession(sid) {
+  try {
+    const raw = await fs.readFile(path.join(SESS_DIR, `${sid}.json`), 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+let saveTimer = null;
+function scheduleSave(s) {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveNow(s).catch(() => {}); }, 800);
+}
+
+async function saveNow(s) {
+  try {
+    await fs.mkdir(SESS_DIR, { recursive: true });
+    const data = {
+      sid: s.sid,
+      updatedAt: Date.now(),
+      /* 只留最近 40 条：文件要小，模型上下文也不该无限长（8B 的窗口撑不住） */
+      messages: s.messages.slice(-40),
+      scene: s.lastSceneSpec || null,
+      ops: s.postOps || null,
+      line: s.lastLine || '',
+      status: s.lastStatus || null,
+      apps: s.lastApps || null,
+    };
+    await fs.writeFile(path.join(SESS_DIR, `${s.sid}.json`), JSON.stringify(data));
+  } catch { /* 落盘失败不该影响对话 */ }
+}
+
 function makeModel() {
   if (MODEL_ID === 'mock') return createMockModel();
   try {
@@ -74,21 +112,28 @@ function makeModel() {
   }
 }
 
-function getSession(sid) {
+async function getSession(sid) {
   let s = sessions.get(sid);
   if (!s) {
+    const saved = SID_RE.test(sid) ? await loadSession(sid) : null;
     s = {
       sid,
       /* 系统提示词是会话的第一条消息，进历史。这样 /api/debug 能直接看到
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
-      messages: [{ role: 'system', content: buildSystemPrompt() }],
-      res: null,
+      messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: buildSystemPrompt() }],
+      reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
       tools: makeTools({ source: SYS }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
       busy: false,
       turn: 0,
       lastAdjustTo: null,
+      lastSceneSpec: saved?.scene || null,
+      postOps: saved?.ops || null,
+      lastLine: saved?.line || '',
+      lastStatus: saved?.status || null,
+      lastApps: saved?.apps || null,
+      resumed: !!saved?.scene,
     };
     s.model = makeModel();
     sessions.set(sid, s);
@@ -97,8 +142,12 @@ function getSession(sid) {
 }
 
 function emit(s, ev) {
-  if (!s.res || s.res.writableEnded) return;
-  s.res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  if (!s.reses?.size) return;
+  const line = `data: ${JSON.stringify(ev)}\n\n`;
+  for (const res of s.reses) {
+    if (res.writableEnded) { s.reses.delete(res); continue; }
+    res.write(line);
+  }
 }
 
 /* ───────────────────────── 审批门 ───────────────────────── */
@@ -191,6 +240,7 @@ async function runTurn(s, goal) {
   s.sets = 0;
   s.lastSpecSig = null;
   s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
+  s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
      所以它必须是会话的一部分，不能是旁路通道。 */
@@ -299,6 +349,11 @@ async function runTurn(s, goal) {
               error: '拖动只是意图，不是命令。用 scene_ask 把问题问出来就停手，等用户点选项 —— '
                 + '这一回合不要再执行任何动作。',
             };
+          } else if (name === 'scene_ask' && s.goal?.kind !== 'intent') {
+            /* scene_ask 是给手势回合用的（"你拖了，要不要真压下去？"）。
+               普通问答里模型会照抄示例、在没有拖动的场面上换一个问题 ——
+               用户会看到一句跟他刚才说的话无关的质问。问答回合的问题走 scene_show 的 ask 字段。 */
+            result = { error: 'scene_ask 只用于手势回合。要问问题，用 scene_show 的 ask/yes/no 字段重新铺一屏。' };
           } else if (needsGate(s, name)) {
             const ok = await requestApproval(s, { id, name, args });
             result = ok ? await s.tools.exec(name, args) : { denied: true, reason: 'user refused' };
@@ -330,10 +385,20 @@ async function runTurn(s, goal) {
           if (!result.duplicate && result.say) {
             s.spoke = true;
             s.lastVoice = String(result.say).slice(0, 40);
+            s.lastLine = s.lastVoice;
             emit(s, { t: 'say', text: String(result.say).slice(0, 40) });
           }
           if (!result.duplicate) {
             s.drew = true;
+            /* 记住"眼睛现在看到的东西"，供刷新/重连时原样还原。
+               patch 不带完整 spec，所以要把它叠在上一屏之后记着 ——
+               否则恢复出来的是"换问题之前"的那一屏，比空白更让人困惑。 */
+            if (result.op === 'set' || result.op === 'transition') {
+              s.lastSceneSpec = result.spec;
+              s.postOps = [];
+            } else if (result.op === 'patch' && Array.isArray(result.ops)) {
+              s.postOps = [...(s.postOps || []), ...result.ops].slice(-8);
+            }
             emit(s, { t: 'scene', op: result.op, spec: result.spec, ops: result.ops, kind: result.kind, at: result.at });
           } else {
             emit(s, { t: 'note', message: `重复的整屏已忽略：${result.hint}` });
@@ -347,6 +412,26 @@ async function runTurn(s, goal) {
            模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */
         if (name === 'sys_status' && result?.cpu != null) s.lastStatus = result;
         if (name === 'app_list' && Array.isArray(result?.apps)) s.lastApps = result.apps;
+
+        /* ── 渐进首屏 ──
+           数据到手（1~2 秒）就先按真实读数铺开，不等模型想完整屏（4~9 秒）。
+           用户看到的是"屏在长"，而不是"盯着一片抖动的粒子等它想"。
+           模型后面自己铺的那一屏会盖掉它 —— 那才是最终形态。 */
+        if (!s.painted && !s.drew && s.goal?.kind === 'ask' && s.lastStatus && s.lastApps) {
+          const line = `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`;
+          const built = defaultOverview(s.lastStatus, s.lastApps, line);
+          if (built) {
+            s.painted = true;
+            s.drew = true;
+            s.sets = 1;
+            s.lastSceneSpec = built.spec;
+            s.lastSpecSig = JSON.stringify(built.spec.layers);
+            s.postOps = [];
+            if (!s.spoke) { s.lastLine = line; emit(s, { t: 'say', text: line }); }
+            emit(s, { t: 'scene', op: 'set', spec: built.spec });
+            emit(s, { t: 'note', message: '数据到手，先铺一屏；模型随后补充' });
+          }
+        }
       }
 
       /* 手势回合里，只要把问题问出去了就停 —— 球在用户那边。
@@ -403,6 +488,7 @@ async function runTurn(s, goal) {
 
   s.busy = false;
   emit(s, { t: 'idle' });
+  scheduleSave(s);           // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
 }
 
 const safeJSON = (v) => {
@@ -454,7 +540,7 @@ const server = http.createServer(async (req, res) => {
     const sid = u.searchParams.get('sid') || crypto.randomUUID();
     let s;
     try {
-      s = getSession(sid);
+      s = await getSession(sid);
     } catch (e) {
       /* 模型配错（缺 key、模型名拼错）时，错误必须回到界面上，
          而不是只在服务端控制台留一行 —— 否则前端只会一直"正在连接"。 */
@@ -469,14 +555,24 @@ const server = http.createServer(async (req, res) => {
       'X-Accel-Buffering': 'no',        // nginx 不缓冲，否则事件会攒着一起发
     });
     res.write('retry: 1500\n\n');
-    if (s.res) { try { s.res.end(); } catch { /* 旧连接已断 */ } }
-    s.res = res;
+    /* 一个会话可以有多个连接：刷新的一瞬间旧连接还没断、新连接已经建好；
+       开第二个标签页也是同一段会话。**不能"新连接踢掉旧连接"** ——
+       两个页面会互相把对方踢成 disconnected，然后各自重连，永远在打架。 */
+    s.reses = s.reses || new Set();
+    s.reses.add(res);
     emit(s, { t: 'hello', sid, model: s.model.name, sys: SYS, tools: Object.keys(s.tools.all) });
+    /* 重连/刷新：把上一屏原样还回去。它必须是"已经在那儿"的状态，
+       不是重新长一遍 —— 用户没有发起任何事，不该看到一场动画。
+       判据不是"是不是刚从磁盘读出来的"：服务还活着、会话还在内存里时刷新，
+       同样要恢复（第一版只在 resuming 时发，于是刷新后一片空白）。 */
+    if (s.lastSceneSpec) {
+      emit(s, { t: 'resume', scene: s.lastSceneSpec, ops: s.postOps || null, line: s.lastLine || '' });
+    }
 
     const ping = setInterval(() => {
       if (!res.writableEnded) res.write(': ping\n\n');
     }, 15000);
-    req.on('close', () => { clearInterval(ping); if (s.res === res) s.res = null; });
+    req.on('close', () => { clearInterval(ping); s.reses?.delete(res); });
     return;
   }
 
@@ -485,7 +581,7 @@ const server = http.createServer(async (req, res) => {
     let body;
     try { body = JSON.parse(await readBody(req) || '{}'); } catch { body = null; }
     if (!body || !body.sid) { res.writeHead(400).end('{"error":"sid required"}'); return; }
-    const s = getSession(body.sid);
+    const s = await getSession(body.sid);
     res.writeHead(202, { 'Content-Type': 'application/json' }).end('{"ok":true}');
 
     if (body.t === 'ask' && body.text) {
