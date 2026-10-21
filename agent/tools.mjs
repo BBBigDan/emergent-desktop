@@ -19,6 +19,7 @@ import {
   normalizeSpec, normalizeOps, normalizePulse,
 } from './scene.schema.mjs';
 import { createK8s } from './sources/k8s.mjs';
+import { createFs } from './sources/fs.mjs';
 
 const GB = 1024 ** 3;
 
@@ -207,6 +208,22 @@ export function makeTools(o = {}) {
     }
   }
 
+  /* 用户文件。挂的是宿主机的 /olares/rootfs/userspace —— 也就是 Files 应用
+     自己用的那个目录，所以 ~/Documents 和用户在 Files 里看到的是同一批文件，
+     不是模拟。没挂上就诚实说看不到，绝不拿假列表糊弄：用户会照着删。 */
+  let files = null;
+  if (process.env.FS_ROOT) {
+    try {
+      files = createFs({ root: process.env.FS_ROOT });
+      console.log('[source] 用户目录已挂载：' + process.env.FS_ROOT);
+    } catch (e) {
+      console.warn('[source] 用户目录不可用：' + e.message);
+    }
+  }
+  const noFs = () => ({
+    error: '这台机器上还没挂用户目录，看不到文件。别猜文件名，直接告诉用户这一块还没接。',
+  });
+
   add('sys_status', {
     level: 'safe',
     describe: '读一次系统状态：CPU、内存、磁盘的真实占用，以及谁在吃内存。'
@@ -249,7 +266,8 @@ export function makeTools(o = {}) {
   add('app_list', {
     level: 'safe',
     describe: '列出用户装了的应用，以及各自的状态、占用时长、吃多少内存。'
-      + '不含 Olares 自己的系统组件。',
+      + '不含 Olares 自己的系统组件。注意：这是**内存/CPU**，不是磁盘；'
+      + '问"什么占地方"要用 fs_scan。',
     schema: {
       type: 'object',
       properties: {
@@ -276,29 +294,151 @@ export function makeTools(o = {}) {
     },
   });
 
+  /* ── 文件：读 ──
+   *
+   * 这一组是"操作者"成立的地方。之前 fs_scan 在真集群上直接回"还没接"，
+   * 因为文件在 PVC 里；现在把 userspace 挂进来了，看到的就是真文件。
+   *
+   * 路径一律先归一化：~ / 裸名字（当 Home 下找）/ 绝对路径都收，
+   * 但解析完必须还在用户空间里 —— 越界直接拒，不"尽力而为"。 */
   add('fs_scan', {
     level: 'safe',
-    describe: '按体积列出某个目录下最占地方的文件。用来回答"什么东西在吃我的盘"。',
+    describe: '按体积看某个目录里什么最占地方。回答"什么在吃我的盘"用它。',
     schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: '目录，例如 ~/Downloads' },
-        limit: { type: 'integer', description: '最多返回几条，缺省 6' },
+        path: { type: 'string', description: '目录，例如 ~/Downloads。缺省 ~' },
+        limit: { type: 'integer', description: '最多几条，缺省 8' },
+      },
+      additionalProperties: false,
+    },
+    run: async ({ path = '~', limit = 8 } = {}) => {
+      if (!files) return noFs();
+      try { return await files.du(path, { limit: Math.min(20, limit), depth: 2 }); } catch (e) {
+        return { error: String(e.message || e) };
+      }
+    },
+  });
+
+  add('fs_list', {
+    level: 'safe',
+    describe: '看一个目录里有什么（名字、大小、日期）。'
+      + '用户说"我下载了什么"、"Documents 里有什么"时用它。',
+    schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '目录，例如 ~/Downloads。缺省 ~' },
+        limit: { type: 'integer', description: '最多几条，缺省 40' },
+        sort: { type: 'string', enum: ['size', 'time'], description: 'size 大的在前 / time 新的在前' },
+      },
+      additionalProperties: false,
+    },
+    run: async ({ path = '~', limit = 40, sort = 'size' } = {}) => {
+      if (!files) return noFs();
+      try { return await files.list(path, { limit: Math.min(200, limit), sort }); } catch (e) {
+        return { error: String(e.message || e) };
+      }
+    },
+  });
+
+  add('fs_read', {
+    level: 'safe',
+    describe: '读一个文本文件的内容（默认前 64KB）。日志、配置、md 都能读；二进制会如实拒绝。',
+    schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径，例如 ~/Documents/notes.md' },
+        maxBytes: { type: 'integer', description: '最多读多少字节，缺省 65536' },
+        lines: { type: 'integer', description: '只看前 N 行（可选）' },
       },
       required: ['path'],
       additionalProperties: false,
     },
-    run: async ({ path }) => {
-      /* 真实集群上没有做目录级扫描：文件都在 PVC 里，要读得进 pod 或走 Files 的 API。
-         这里如实报，不要拿假文件列表糊弄 —— 用户会照着去删。 */
-      if (cluster) {
-        return { error: '还没接目录扫描：真集群上文件在 PVC 里，需要走 Files 应用或进 pod 执行 du' };
+    run: async ({ path, maxBytes, lines }) => {
+      if (!files) return noFs();
+      try {
+        return await files.read(path, {
+          maxBytes: Math.min(256 * 1024, maxBytes || 64 * 1024),
+          lines: lines || 0,
+        });
+      } catch (e) { return { error: String(e.message || e) }; }
+    },
+  });
+
+  add('fs_search', {
+    level: 'safe',
+    describe: '按文件名找东西（不搜内容）。用户说"那个 pdf 在哪"用它。',
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '名字片段，例如 账单 或 .pdf' },
+        path: { type: 'string', description: '从哪个目录开始找，缺省 ~' },
+        limit: { type: 'integer', description: '最多几条，缺省 20' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    run: async ({ query, path = '~', limit = 20 }) => {
+      if (!files) return noFs();
+      try { return await files.search(query, { path, limit: Math.min(50, limit) }); } catch (e) {
+        return { error: String(e.message || e) };
       }
-      return {
-        path,
-        files: MOCK_DISK.filter((f) => f.path.startsWith(path) || path === '~')
-          .sort((a, b) => b.size - a.size),
-      };
+    },
+  });
+
+  /* ── 文件：写（都过审批门） ── */
+
+  add('fs_write', {
+    level: 'danger',
+    describe: '写一个文本文件（会新建，默认覆盖）。要用户先同意 —— 审批门会问他。',
+    schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径，例如 ~/Documents/todo.md' },
+        content: { type: 'string', description: '文件内容' },
+        overwrite: { type: 'boolean', description: '已存在时是否覆盖，缺省 true' },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    },
+    run: async ({ path, content, overwrite }) => {
+      if (!files) return noFs();
+      try { return await files.write(path, content, { overwrite: overwrite !== false }); } catch (e) {
+        return { error: String(e.message || e) };
+      }
+    },
+  });
+
+  add('fs_move', {
+    level: 'danger',
+    describe: '把文件或目录移到另一个位置。to 是已有目录时放进去（和 mv 一样）。要用户先同意。',
+    schema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: '源路径' },
+        to: { type: 'string', description: '目标路径或目录' },
+      },
+      required: ['from', 'to'],
+      additionalProperties: false,
+    },
+    run: async ({ from, to }) => {
+      if (!files) return noFs();
+      try { return await files.move(from, to); } catch (e) { return { error: String(e.message || e) }; }
+    },
+  });
+
+  add('fs_delete', {
+    level: 'danger',
+    describe: '把一个文件或目录挪进 ~/.trash（删得回来）。要用户先同意。',
+    schema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: '要删的路径' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    run: async ({ path }) => {
+      if (!files) return noFs();
+      try { return await files.trash(path); } catch (e) { return { error: String(e.message || e) }; }
     },
   });
 
@@ -314,6 +454,38 @@ export function makeTools(o = {}) {
     run: async ({ app, lines }) => {
       if (!cluster) return { app, lines: MOCK_LOGS[app] || ['(no logs)'] };
       return cluster.logs(app, { lines: Math.min(120, lines || 40) });
+    },
+  });
+
+  add('k8s_get', {
+    level: 'safe',
+    describe: '查一个应用**为什么没起来**：pod 阶段、容器 waiting/terminated 原因、'
+      + 'conditions、最近事件。日志给的是结果，这个给的才是原因 —— '
+      + '回答"xx 起不来"之前先调它，再决定要不要看日志。',
+    schema: {
+      type: 'object',
+      properties: { app: { type: 'string', description: '应用名，例如 qbittorrent' } },
+      required: ['app'],
+      additionalProperties: false,
+    },
+    run: async ({ app }) => {
+      if (!cluster) return { error: '没有集群数据源（SYS 不是 k8s）' };
+      try { return await cluster.diagnose(app); } catch (e) { return { error: String(e.message || e) }; }
+    },
+  });
+
+  add('k8s_restart', {
+    level: 'danger',
+    describe: '重启一个应用（删掉它的 pod，控制器会重新拉起）。会中断它正在做的事，要用户先同意。',
+    schema: {
+      type: 'object',
+      properties: { app: { type: 'string', description: '应用名' } },
+      required: ['app'],
+      additionalProperties: false,
+    },
+    run: async ({ app }) => {
+      if (!cluster) return { error: '没有集群数据源（SYS 不是 k8s）' };
+      try { return await cluster.restart(app); } catch (e) { return { error: String(e.message || e) }; }
     },
   });
 

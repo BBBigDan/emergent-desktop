@@ -35,7 +35,16 @@ const PROM_PATH = `/api/v1/namespaces/${PROM_NS}/services/${PROM_SVC}/proxy`;
    再退化到"找后缀出现次数最多的那个" —— 这台机器上装的应用都在自己名下，
    统计一下就知道用户名，不用让用户去填。 */
 function detectUserSuffix(namespaces) {
-  if (process.env.OLARES_USER) return process.env.OLARES_USER;
+  /* 环境变量**必须验证**再用。踩过的坑：yaml 里写成 bbigdan（两个 b），
+     真实用户名是 bbbigdan（三个 b）—— 于是 isMine() 对每个命名空间都返回 false，
+     应用列表永远是空的，而且不报错。用户问"装了什么"，屏幕上就是"没有应用在运行"。
+     对不上就退回统计：这台机器上装的应用都在自己名下，数一下就知道是谁。 */
+  const env = process.env.OLARES_USER;
+  if (env) {
+    /* 只认"真的存在这个后缀"，不认声明 */
+    if (namespaces.some((ns) => ns.endsWith(`-${env}`))) return env;
+    console.warn(`[k8s] OLARES_USER=${env} 与命名空间对不上，改用统计推断`);
+  }
   const tally = new Map();
   for (const ns of namespaces) {
     const m = ns.match(/^[a-z0-9-]+?-([a-z][a-z0-9]{3,})$/);
@@ -118,13 +127,13 @@ function loadCreds() {
 function makeClient(creds) {
   const keepAlive = new https.Agent({ keepAlive: true, maxSockets: 8 });
 
-  return function request(pathname, { timeout = 6000 } = {}) {
+  return function request(pathname, { timeout = 6000, method = 'GET' } = {}) {
     return new Promise((resolve, reject) => {
       const opt = {
         host: creds.host,
         port: creds.port,
         path: pathname,
-        method: 'GET',
+        method,
         agent: keepAlive,
         timeout,
         ca: creds.ca || undefined,
@@ -344,6 +353,84 @@ export function createK8s(o = {}) {
     return list.items.find((p) => podBelongsTo(p, name))?.metadata.name || null;
   }
 
+  /* ── 诊断：回答"它为什么没起来" ──
+   *
+   * 日志是**结果**，不是原因。ImagePullBackOff 的 pod 根本没有日志，
+   * 起不来的原因写在 containerStatus 的 waiting.reason 和 events 里。
+   * 所以这个工具把四样东西一起拿出来：状态、容器状态、conditions、最近事件。
+   * 只给模型其中一样，它就会开始猜（"可能是内存不足"）—— 那是幻觉，不是诊断。 */
+  async function diagnose(appName) {
+    const { apps: list } = await apps({ includeSystem: true });
+    const a = list.find((x) => sameName(x.name, appName)) || list.find((x) => sameName(x.pod, appName));
+    if (!a) return { error: `没找到应用「${appName}」`, have: list.map((x) => x.name).slice(0, 12) };
+
+    const ns = a.ns;
+    const podName = a.pod || (await findPod(ns, a.name));
+    const out = {
+      app: a.name, ns, pod: podName, state: a.state, ready: a.ready,
+      restarts: a.restarts, memMB: a.memMB, upH: a.upH,
+    };
+    if (!podName) {
+      out.note = '当前没有 pod —— deployment 可能被缩到 0，或者压根没建起来';
+      return out;
+    }
+
+    const pod = await json(req, `/api/v1/namespaces/${ns}/pods/${podName}`);
+    const st = pod.status || {};
+    out.phase = st.phase;
+    out.node = pod.spec?.nodeName;
+    out.containers = (st.containerStatuses || []).map((c) => {
+      const w = c.state?.waiting;
+      const t = c.state?.terminated;
+      const last = c.lastState?.terminated;
+      return {
+        name: c.name,
+        ready: !!c.ready,
+        restarts: c.restartCount || 0,
+        /* waiting.reason 就是答案本身：CrashLoopBackOff / ImagePullBackOff /
+           ContainerCreating / OOMKilled（后者在 lastState 里） */
+        waiting: w ? { reason: w.reason, message: w.message || null } : null,
+        terminated: t ? { reason: t.reason, exitCode: t.exitCode, at: t.finishedAt } : null,
+        lastTerminated: last ? { reason: last.reason, exitCode: last.exitCode, at: last.finishedAt } : null,
+        image: pod.spec?.containers?.find((x) => x.name === c.name)?.image || null,
+      };
+    });
+    out.conditions = (st.conditions || []).map((c) => ({
+      type: c.type, status: c.status, reason: c.reason || null, message: (c.message || '').slice(0, 160) || null,
+    }));
+
+    /* 事件要按对象查，不能拉全量：一个跑了 42h 的集群有几千条事件。 */
+    const ev = await json(req,
+      `/api/v1/namespaces/${ns}/events?fieldSelector=${encodeURIComponent(`involvedObject.name=${podName}`)}`)
+      .catch(() => ({ items: [] }));
+    out.events = ev.items
+      .map((e) => ({
+        at: e.lastTimestamp || e.eventTime || e.metadata.creationTimestamp,
+        type: e.type, reason: e.reason, count: e.count || 1,
+        message: String(e.message || '').replace(/\s+/g, ' ').slice(0, 200),
+      }))
+      .sort((x, y) => String(y.at).localeCompare(String(x.at)))
+      .slice(0, 10);
+    return out;
+  }
+
+  /** 重启 = 删掉 pod，让 ReplicaSet 重新拉一个。不用 rollout restart：
+   *  那要 patch deployment（多一份写权限），效果在这里是一样的。 */
+  async function restart(appName) {
+    const { apps: list } = await apps({ includeSystem: true });
+    const a = list.find((x) => sameName(x.name, appName)) || list.find((x) => sameName(x.pod, appName));
+    if (!a) return { error: `没找到应用「${appName}」` };
+    if (a.role === 'system' && !appName) return { error: '这是系统组件，不能从这儿重启' };
+    const pods = (await json(req, `/api/v1/namespaces/${a.ns}/pods`)).items
+      .filter((p) => podBelongsTo(p, a.name))
+      .map((p) => p.metadata.name);
+    if (!pods.length) return { error: `「${a.name}」当前没有在跑的 pod，没什么可重启的` };
+    for (const p of pods) {
+      await req(`/api/v1/namespaces/${a.ns}/pods/${p}`, { method: 'DELETE', timeout: 8000 });
+    }
+    return { app: a.name, restarted: pods, note: '已删除，控制器会重新拉起一个' };
+  }
+
   return {
     kind: 'k8s',
     info: () => `${creds.how} → ${creds.host}:${creds.port}`,
@@ -351,6 +438,8 @@ export function createK8s(o = {}) {
     series,
     apps,
     logs,
+    diagnose,
+    restart,
     /** 自检：三个来源分别能不能用，报错要具体 */
     async health() {
       const out = { k8s: null, prom: null, sample: null };

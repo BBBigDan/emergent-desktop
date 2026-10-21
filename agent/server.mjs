@@ -240,6 +240,20 @@ function needsGate(s, name) {
   return !explicit;
 }
 
+/* 这句话里有"托付动作"吗。
+   中文里请求和疑问的边界很细：「能帮我把 x 挪走吗」是请求（带"挪"），
+   「n8n 正常吗」是疑问（没有任何动作词）。所以先找动作词，再找疑问词 ——
+   顺序很重要，反过来所有客气的请求都会被误判成疑问。 */
+const ACT_WORDS = /(帮我|帮忙|替我|给我|麻烦|把|挪|移|删除|删掉|删了|清掉|清理|重装|装个|卸载|重启|重启一下|写|创建|新建|保存|压缩|改个名|重命名)/;
+const ASK_WORDS = /([?？]|吗|呢|是不是|有没有|为什么|为何|怎么|如何|什么|哪)/;
+
+function asksOnly(s) {
+  if (s.goal?.kind !== 'ask') return false;
+  const t = String(s.goal.text || '');
+  if (ACT_WORDS.test(t)) return false;
+  return ASK_WORDS.test(t);
+}
+
 function requestApproval(s, { id, name, args }) {
   return new Promise((resolve) => {
     const d = describeDanger(name, args);
@@ -263,7 +277,21 @@ function describeDanger(name, args) {
       detail: `会重启占内存最多的应用，它正在做的事会中断`,
     };
   }
-  if (name === 'fs_move') return { label: '移动这些文件？', detail: `共 ${args.files?.length ?? '?'} 个` };
+  if (name === 'fs_move') {
+    return { label: `把「${args.from}」移到「${args.to}」？`, detail: '移动后原位置就没了' };
+  }
+  if (name === 'fs_delete') {
+    return { label: `把「${args.path}」删掉？`, detail: '进 ~/.trash，还能捞回来' };
+  }
+  if (name === 'fs_write') {
+    return {
+      label: `写「${args.path}」？`,
+      detail: `${String(args.content ?? '').length} 字，同名文件会被覆盖`,
+    };
+  }
+  if (name === 'k8s_restart') {
+    return { label: `重启「${args.app}」？`, detail: '它正在做的事会中断，十几秒不可用' };
+  }
   return { label: `${name}？`, detail: '会改变这台机器上的东西' };
 }
 
@@ -501,6 +529,18 @@ async function runTurn(s, goal) {
                普通问答里模型会照抄示例、在没有拖动的场面上换一个问题 ——
                用户会看到一句跟他刚才说的话无关的质问。问答回合的问题走 scene_show 的 ask 字段。 */
             result = { error: 'scene_ask 只用于手势回合。要问问题，用 scene_show 的 ask/yes/no 字段重新铺一屏。' };
+          } else if (asksOnly(s) && s.tools.level(name) === 'danger') {
+            /* 疑问不是授权。
+               实测：用户问「n8n 现在正常吗」，7B 查完状态顺手调了 k8s_restart，
+               把 n8n 重启了一遍 —— 它把"问情况"读成了"帮我处理"。
+               审批门拦不住这件事：按钮上写着"重启 n8n？"，用户很容易顺手点允许，
+               而他从头到尾没要求过重启。
+               所以判据放在**用户的这句话**上：话里有动作（删/挪/重启/写）才算委托；
+               只有疑问（吗/怎么/为什么/正常吗）就只准看、不准动 —— 要动先问。 */
+            result = {
+              error: '用户这句是在问情况，不是让你动手。先用 scene_show 的 ask 把'
+                + '「要不要我这么做」问出来，等他点了再说 —— 这一回合不要执行任何改变。',
+            };
           } else if (needsGate(s, name)) {
             const ok = await requestApproval(s, { id, name, args });
             result = ok ? await s.tools.exec(name, args) : { denied: true, reason: 'user refused' };
@@ -628,6 +668,20 @@ async function runTurn(s, goal) {
            模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */
         if (name === 'sys_status' && result?.cpu != null) { s.lastStatus = result; s.statusTurn = s.turn; }
         if (name === 'app_list' && Array.isArray(result?.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
+        /* 文件类问题（"什么占地方"、"下载了什么"）的答案是**文件**，不是仪表。
+           标一下，兜底屏就别再拿内存读数去凑 —— 实测它会给"磁盘什么最占地方"
+           铺出三个内存百分比，"n8n 占 2%"，语义全错而且看不出来。 */
+        if (name.startsWith('fs_')) { s.fsTurn = s.turn; }
+        /* 兜底要用的原始结果。只在有内容时覆盖 —— 空目录不算"有东西可铺"。
+           而且**各自记自己的回合**：fs_move 也会把 fsTurn 置上，如果用 fsTurn
+           判断"这轮扫过盘吗"，一次移动就会把上一轮那张扫描表翻出来。 */
+        if (name === 'fs_scan' && Array.isArray(result?.items) && result.items.length) {
+          s.lastScan = result; s.scanTurn = s.turn;
+        }
+        if (name === 'fs_list' && Array.isArray(result?.entries) && result.entries.length) {
+          s.lastList = result; s.listTurn = s.turn;
+        }
+        if (name === 'k8s_get' && result?.app) { s.lastDiag = result; s.diagTurn = s.turn; }
 
         /* ── 渐进首屏 ──
            数据到手（1~2 秒）就先按真实读数铺开，不等模型想完整屏（4~9 秒）。
@@ -700,6 +754,74 @@ async function runTurn(s, goal) {
        会答非所问：问"装了哪些应用"，屏幕上却是上一轮的 CPU 曲线。 */
     const freshStatus = s.statusTurn === s.turn;
     const freshApps = s.appsTurn === s.turn;
+
+    /* 文件类问题：兜底给**表**，不给仪表。
+       "磁盘上什么最占地方"的正确形态是一列文件，不是三个内存百分比 ——
+       之前这里没分流，模型兜底铺出来的屏语义全错（n8n 占 2% 磁盘？），
+       而且数字是真的，所以看起来特别像回事。 */
+    const sc = s.scanTurn === s.turn ? s.lastScan : null;
+    const ls = sc ? null : (s.listTurn === s.turn ? s.lastList : null);
+    if (!s.drew && (sc || ls)) {
+      const spec = sc
+        ? {
+          title: '最占地方的几项',
+          subtitle: `${sc.path || '~'} · 共 ${sc.totalText}`,
+          root: {
+            type: 'table',
+            head: ['名字', '占用'],
+            rows: sc.items.map((i) => [i.path || i.name, i.sizeText]),
+          },
+        }
+        : {
+          title: `${ls.path || '~'} 里有什么`,
+          subtitle: `共 ${ls.total} 项`,
+          root: {
+            type: 'table',
+            head: ['名字', '大小', '日期'],
+            rows: ls.entries.map((e) => [e.name, e.dir ? '目录' : (e.sizeText || '—'), e.mtime || '']),
+          },
+        };
+      s.drew = true;
+      emit(s, { t: 'surface', op: 'set', spec });
+      emit(s, { t: 'note', message: '模型没给这一屏，由系统按文件结果铺了一张表' });
+    }
+
+    /* 诊断类问题：兜底给一张"证据卡"，不留空屏。
+       "n8n 正常吗"这种问题，正确答案就是几行事实（状态、就绪、重启次数、
+       容器等没等待、最近事件）。模型只调了 k8s_get 就说话时，屏幕上原本什么都没有 ——
+       而这几行恰好是它嘴里那句话的依据。 */
+    const dg = s.diagTurn === s.turn ? s.lastDiag : null;
+    if (!s.drew && dg && !sc && !ls) {
+      const up = dg.upH == null ? ''
+        : dg.upH >= 1 ? `已运行约 ${Math.round(dg.upH)} 小时`
+          : dg.upH * 60 >= 1 ? `已运行约 ${Math.round(dg.upH * 60)} 分钟` : '刚起来不到 1 分钟';
+      const items = [{
+        title: `${dg.state === 'running' ? '运行中' : (dg.state || dg.phase || '状态未知')}`,
+        sub: [`就绪 ${dg.ready || '?'}`, `重启 ${dg.restarts ?? 0} 次`, up].filter(Boolean).join(' · '),
+      }];
+      if (dg.memMB) items.push({ title: `占内存 ${dg.memMB} MB` });
+      for (const c of dg.containers || []) {
+        if (c.waiting?.reason) {
+          items.push({ title: `${c.name}：卡在 ${c.waiting.reason}`, sub: c.waiting.message || '', icon: '!' });
+        } else if (c.lastTerminated?.reason && c.lastTerminated.reason !== 'Completed') {
+          items.push({ title: `${c.name}：上一次是 ${c.lastTerminated.reason}`, sub: `退出码 ${c.lastTerminated.exitCode}` });
+        }
+      }
+      /* 只要 Warning。Created / Started / Pulled 是每次启动都有的例行事件，
+         铺出来就是四行噪音 —— 用户问"正常吗"，答案不该是"它被创建过"。 */
+      const warns = (dg.events || []).filter((e) => e.type === 'Warning').slice(0, 4);
+      for (const e of warns) {
+        items.push({ title: `${e.reason}（${e.count} 次）`, sub: e.message, icon: '!' });
+      }
+      if (!warns.length) items.push({ title: '没有异常事件', sub: '最近这个 pod 没报错' });
+      s.drew = true;
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: { title: dg.app || '应用状态', subtitle: `${dg.ns || ''} · ${dg.pod || ''}`.trim(), root: { type: 'list', items } },
+      });
+      emit(s, { t: 'note', message: '模型没给这一屏，由系统按诊断结果铺了一张卡' });
+    }
+
     if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') {
       const line = s.lastVoice
         || (freshStatus
@@ -753,7 +875,7 @@ const TOOL_WORDS = /(sys_status|app_list|fs_scan|logs_tail|mem_trim|fs_move|scen
      真正的读数（23%）反而被挤掉。实测它会稳定地这么写，
      因为训练数据里的助手都这么开头。以"如下 / 以下"收尾、
      或"情况 / 状态 / 信息"打头再接"如下"的，一律不算说话。 */
-const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)|(如下|以下|有|包括)[：:]?$|(情况|状态|信息|数据|结果|应用|监控)[^。]{0,8}(如下|以下)/;
+const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)|(如下|以下|有|包括)[：:]?$|(情况|状态|信息|数据|结果|应用|监控)[^。]{0,8}(如下|以下)|请稍等|稍等|我明白了|让我(先|来)|重新铺/;
 
 /* ───────────────────────── HTTP ───────────────────────── */
 

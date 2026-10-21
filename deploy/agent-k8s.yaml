@@ -31,10 +31,15 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    # delete 只为一件事：k8s_restart（删 pod 让控制器重建）。它在审批门后面。
+    verbs: ["get", "list", "delete"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # 诊断"为什么没起来"要看事件：ImagePullBackOff 的 pod 根本没有日志
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
   # Prometheus 走 API 的 service proxy，权限是 services/proxy 而不是 services
   - apiGroups: [""]
     resources: ["services/proxy"]
@@ -97,8 +102,14 @@ spec:
         # 集群内自己就是数据源，不需要 kubeconfig
         - name: SYS
           value: k8s
+        # 用户文件挂在 /userspace：宿主机 /olares/rootfs/userspace 里有
+        # pvc-userspace-<id>/Home（和 Files 应用同一个目录），代码按前缀认它
+        - name: FS_ROOT
+          value: /userspace
+        # 三个 b。写成两个 b 时 isMine() 会静默失效，应用列表永远为空 ——
+        # 现在 detectUserSuffix 会验证它，对不上就退回统计推断（见 k8s.mjs）
         - name: OLARES_USER
-          value: bbigdan
+          value: bbbigdan
         - name: TZ
           value: Asia/Shanghai
         # 用来记住"这轮说过什么"之类的 SID 前缀，不参与业务
@@ -109,6 +120,10 @@ spec:
       volumeMounts:
         - name: app
           mountPath: /app
+        # 读写挂载：fs_move / fs_write / fs_delete 要动真文件。
+        # 边界由 agent/sources/fs.mjs 守（realpath 后必须还在这个目录下）。
+        - name: userspace
+          mountPath: /userspace
       readinessProbe:
         tcpSocket:
           port: 8788
@@ -134,3 +149,8 @@ spec:
         # 代码 + .env + sessions/ 都在这一个目录下，rsync 一次全到位
         path: /olares/emergent-agent/app
         type: DirectoryOrCreate
+    - name: userspace
+      hostPath:
+        # Files 应用自己的存储根。/userspace/pvc-userspace-<id>/Home = 用户的 ~
+        path: /olares/rootfs/userspace
+        type: Directory
