@@ -702,7 +702,7 @@ Rust 工具链只在**重建 wheel** 时用一次（`/root/axbuild.yaml` 那个 
 | **M3 输出通道** | 渲染树 + 10 个组件；`draw` + 语义层 + `drawOn` | "Downloads 什么占地方" 直接给可操作的表；"画个开心的表情" 桌面粒子聚成笑脸 |
 | **M4 自造工具** | 工具注册 + `needs` 强制 + 技能加载 | "给 Navidrome 加个歌单" 自己查 API、写脚本、自测、等你批准 |
 | **M5 人格层** | L0 种子 + 漂移注入 + 面板（**✅ 2026-10-21，见下**；L0.5 知识轨迹未做） | 它会说"我今天看到…"，且能指出那条信息是哪来的 |
-| **M6 产品化** | 打成 Olares 应用 | 市场里能装能卸 |
+| **M6 产品化** | 打成 Olares 应用（**✅ 2026-10-21，见下**；镜像与多用户隔离未做） | 市场里能装能卸 |
 
 M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么样；M5 让它有"自己"。
 
@@ -733,6 +733,37 @@ M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么�
 
 **边界**：只记得"做过"什么，不记得"决定"过什么；L0.5（每天学一个新知识）没做。
 这是风味层，`PERSONA=off` 一句话关掉，记忆照常。
+
+### M6 落地（2026-10-21）
+
+一句话：**它现在是一个能在市场里装、能在市场里卸的应用，而不是一台机器上的一个 pod。**
+
+验收链路上的四件事，都在真机上验过：
+
+| 验收 | 结果 |
+|---|---|
+| 装 | `olares-cli chart lint` 通过 → 上传本地源 → `market install` → 4/4 Running |
+| 入口 | entrance `emergentdesktop` 注册进网关（和 navidrome 同一条路）；根路径与 `/agent/` 都 200 |
+| 数据 | `Home/Agent/{memory,drift,persona.md}` 在 Files 里可见；卸载重装后 16 条记忆、人格设定、drift 全在 |
+| 卸 | `market uninstall` → 命名空间 Terminating → 数据保留 |
+
+三条取舍值得记下来：
+
+1. **走市场而不是 helm**。helm 能把 pod 跑起来，但没有 Application 记录、没有 entrance、
+   没有 NetworkPolicy —— 桌面上看不到图标，从市场点进来是 404。而"卸载"这件事在 helm 那条路上
+   是十几个 `kubectl delete`。
+2. **代码仍然不进镜像**。节点上没有 docker/nerdctl/buildah，也没有可推的仓库 —— 打不了镜像。
+   于是沿用 hostPath + 重启进程，另加一个 initContainer 检查代码在不在：
+   没有它，用户看到的是 node 的 `MODULE_NOT_FOUND` 堆栈，而那行报错不会告诉他该跑什么。
+   **这是这一版最大的产品债**，`values.image.agent` 已经是普通字段，换真镜像即可。
+3. **工作负载从裸 Pod 换成 Deployment**。原来那个裸 Pod 能存在，是因为
+   `appns-validating-webhook` 只校验 deployments/statefulsets/daemonsets 的 CREATE ——
+   它是一条约束的缝，不是设计。装成应用之后，Deployment 反而成了自愈的来源
+   （删 pod 20 秒后自己回来，实测）。
+
+**多用户隔离没做**：RBAC 还是集群级只读，代码里按命名空间后缀过滤"哪些是我的"。
+单用户等价，多用户会看到别人的 pod。要做干净得给每个用户的命名空间建 Role/RoleBinding，
+而命名空间是装应用时才出现的 —— 绑定也得动态。
 
 ### token 账本（2026-10-21，横切能力，不占分期）
 

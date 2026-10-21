@@ -54,11 +54,16 @@ data:
         # agent 自己认 `/agent/`（见 server.mjs 开头的说明），
         # 这样它的接口不会和官方 olares-app 的 `/api/*` 抢路径。
         #
+        # 指向的是**装成 Olares 应用之后**那个 Deployment（namespace
+        # emergentdesktop-bbbigdan，Service 名 emergentdesktop，端口 8788）。
+        # 裸 Pod 那条路已经退役：没有自愈，而且它挂的是整个 userspace ——
+        # 两个进程同时写同一份 memory.axeb 会把图写坏（踩过一次，别让两套并存）。
+        #
         # 三个必须：proxy_buffering off（下行是 SSE，缓冲了事件就攒着一起发）、
         # proxy_read_timeout 长（一轮对话可能几十秒没数据）、
         # gzip 别碰 text/event-stream（gzip_types 里没有它，天然安全）。
         location /agent/ {
-            proxy_pass http://emergent-agent.user-space-bbbigdan.svc.cluster.local:8788/agent/;
+            proxy_pass http://emergentdesktop.emergentdesktop-bbbigdan.svc.cluster.local:8788/agent/;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
@@ -138,6 +143,11 @@ metadata:
   namespace: user-space-bbbigdan
   labels:
     app: emergent-shell
+    # `tier: bfl` 不是冒充：装成 Olares 应用之后，应用命名空间里的 NetworkPolicy
+    # 只放行两类来源 —— 同用户的 user-internal / system 命名空间，以及
+    # **tier=bfl 的桌面入口**。这个 pod 现在就是桌面入口（edge-desktop Service
+    # 指到它），不给这个标签，它连自己后端的 /agent/ 都连不上（实测 499）。
+    tier: bfl
 spec:
   restartPolicy: Always
   containers:

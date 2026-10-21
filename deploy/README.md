@@ -33,6 +33,71 @@ envoy ──► Service edge-desktop (80 → 91)
 > 裸 Pod 没有 Deployment 的自愈能力，节点重调度后需要重新 `kubectl apply`。开发期可以接受；
 > 真要长期跑，可以把它注册成 Olares 应用（需要走 app 安装流程），那时 webhook 自然会放行。
 
+## 装成 Olares 应用（M6）
+
+```bash
+./deploy/install.sh              # 装或升级（幂等）
+./deploy/install.sh --lint       # 只校验 chart，不装
+./deploy/install.sh --uninstall  # 卸干净，保留数据
+```
+
+走的是 `olares-cli market`（应用市场 API），不是 `helm upgrade --install`。两者都能把 pod 跑起来，
+差别在**之外**的那些东西：
+
+| | helm 直接装 | 走市场 |
+|---|---|---|
+| pod 能起来 | ✅ | ✅ |
+| Application 记录（桌面图标、卸载入口） | ❌ | ✅ |
+| entrance（`https://emergentdesktop.<用户>.olares.com`） | ❌ | ✅ |
+| NetworkPolicy（只放行本用户 + 系统网关） | ❌ | ✅ |
+| `--uninstall` 是一行 | ❌（要手动删一堆） | ✅ |
+
+`olares-cli chart lint` 是这套东西里唯一能提前拦住错误的地方 —— 它跑的是市场入库同一条流水线：
+清单结构、helm dry-run、hostPath 类型、容器资源上限、Chart 与清单版本一致。**每次改 chart 先跑 `--lint`**。
+
+### 安装器给了什么、我们不能再猜什么
+
+装完之后，两个路径由安装器填进 `values`，脚本从 Deployment 的 volumes 里读回来（别自己拼）：
+
+```
+userspace.appData → /olares/rootfs/userspace/pvc-userspace-<user>-<随机>/Data/emergentdesktop
+userspace.userData → /olares/rootfs/userspace/pvc-userspace-<user>-<随机>/Home
+```
+
+`pvc-` 后面那段是随机的，猜错的后果是"跑起来了、数据写进了另一个目录"，而界面上看不出来。
+
+### 为什么代码还是走 hostPath，不进镜像
+
+节点上没有 docker/nerdctl/buildah，也没有可推的镜像仓库 —— 打不了镜像。所以沿用"tar 到 appData，
+重启进程生效"这条路。为了让"代码没铺"这件事自己说出来，chart 里加了一个 initContainer
+（`busybox`，检查 `/app/agent/server.mjs` 在不在），否则用户看到的是一屏 node 的
+`MODULE_NOT_FOUND` 堆栈，那行报错只会说"找不到模块"，不会告诉他该跑什么。
+
+**这也是这一版最大的产品债**：真正可分发要有一个装了代码的镜像。`values.image.agent`
+已经是个普通字段，换成真镜像即可，剩下的只是 CI。
+
+### 三个坑（都是实测踩出来的）
+
+1. **同一个版本号只能上传一次**（HTTP 409 `version already exists`）。改代码不用重传 chart ——
+   代码在 appData 里，重传的是代码；只有改 chart 才需要升版本号。
+2. **状态决定动词**。`market status -a` 会把卸载过的应用留成一行 `uninstalled`，
+   照着应用名 grep 就会把"首次安装"当成"升级"，而 upgrade 在 uninstalled 状态下会被后端拒。
+   脚本按 STATE 列分派。
+3. **桌面壳要 `tier: bfl` 标签**。应用命名空间里的 NetworkPolicy（安装器生成）只放行
+   同用户的 user-internal/system 命名空间，以及 `tier=bfl` 的桌面入口；`emergent-shell`
+   现在就是桌面入口，不打这个标签它连自己的后端都连不上（实测 499）。
+
+### 卸载与数据
+
+`--uninstall` 只删应用与命名空间，**不动** `Home/Agent` 和 `Data/emergentdesktop`。
+记忆不该因为重装而消失 —— 实测卸载再装，16 条记忆、人格设定、drift 记录全在。
+
+### 还没做的隔离
+
+RBAC 还是集群级只读（`ClusterRole`），代码里用命名空间后缀过滤"哪些应用是我的"。
+单用户机器上等价；**多用户机器上这是真的会看到别人的 pod**。要做干净，得给每个用户的
+命名空间建 Role/RoleBinding（而命名空间是装应用时才出现的，所以绑定也要动态）。
+
 ## 首次部署
 
 ```bash

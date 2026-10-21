@@ -127,7 +127,7 @@ function loadCreds() {
 function makeClient(creds) {
   const keepAlive = new https.Agent({ keepAlive: true, maxSockets: 8 });
 
-  return function request(pathname, { timeout = 6000, method = 'GET' } = {}) {
+  return function request(pathname, { timeout = 6000, method = 'GET', body = null, contentType = 'application/json' } = {}) {
     return new Promise((resolve, reject) => {
       const opt = {
         host: creds.host,
@@ -144,18 +144,27 @@ function makeClient(creds) {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
-          const body = Buffer.concat(chunks).toString('utf8');
+          const text = Buffer.concat(chunks).toString('utf8');
           if (res.statusCode >= 400) {
-            const e = new Error(`k8s ${res.statusCode} ${pathname.slice(0, 60)}: ${body.slice(0, 160)}`);
+            const e = new Error(`k8s ${res.statusCode} ${pathname.slice(0, 60)}: ${text.slice(0, 160)}`);
             e.status = res.statusCode;
             reject(e);
-          } else resolve(body);
+          } else resolve(text);
         });
       });
       req.on('timeout', () => { req.destroy(new Error(`k8s 超时 ${timeout}ms ${pathname.slice(0, 50)}`)); });
       req.on('error', reject);
       if (creds.token) req.setHeader('Authorization', `Bearer ${creds.token}`);
-      req.end();
+      /* 写请求只在 k8s_restart 里用（patch 一个 annotation）。带 body 时必须给
+         Content-Length，否则 API server 会当成空 body 直接 400。 */
+      if (body != null) {
+        const payload = typeof body === 'string' ? body : JSON.stringify(body);
+        req.setHeader('Content-Type', contentType);
+        req.setHeader('Content-Length', Buffer.byteLength(payload));
+        req.end(payload);
+      } else {
+        req.end();
+      }
     });
   };
 }
@@ -414,21 +423,44 @@ export function createK8s(o = {}) {
     return out;
   }
 
-  /** 重启 = 删掉 pod，让 ReplicaSet 重新拉一个。不用 rollout restart：
-   *  那要 patch deployment（多一份写权限），效果在这里是一样的。 */
+  /** 重启 = 触发一次滚动重启（patch deployment 的 pod template annotation）。
+   *
+   *  上一版是"删掉 pod，让 ReplicaSet 重新拉一个"。效果一样，代价差很多：
+   *  删 pod 需要 `pods: delete` 集群权限 —— 那是**能删任何 namespace 的任何 pod**，
+   *  包括 os-* 里的系统组件。审批门挡得住"模型乱来"，挡不住"进程被控"。
+   *  patch 一处的上限是"让它重启一次"，授权面小一个量级。
+   *
+   *  代价：只对 Deployment 有效。StatefulSet / 裸 Pod 从这儿重启不了，如实说。 */
   async function restart(appName) {
     const { apps: list } = await apps({ includeSystem: true });
     const a = list.find((x) => sameName(x.name, appName)) || list.find((x) => sameName(x.pod, appName));
     if (!a) return { error: `没找到应用「${appName}」` };
     if (a.role === 'system' && !appName) return { error: '这是系统组件，不能从这儿重启' };
-    const pods = (await json(req, `/api/v1/namespaces/${a.ns}/pods`)).items
-      .filter((p) => podBelongsTo(p, a.name))
-      .map((p) => p.metadata.name);
-    if (!pods.length) return { error: `「${a.name}」当前没有在跑的 pod，没什么可重启的` };
-    for (const p of pods) {
-      await req(`/api/v1/namespaces/${a.ns}/pods/${p}`, { method: 'DELETE', timeout: 8000 });
+
+    const deps = (await json(req, `/apis/apps/v1/namespaces/${a.ns}/deployments`)).items
+      .filter((d) => sameName(d.metadata.name, a.name));
+    if (!deps.length) {
+      return {
+        error: `「${a.name}」不是 Deployment，从这儿重启不了。`
+          + '（它的控制器不是 ReplicaSet，改一下 pod 模板这条路对它不适用。）',
+      };
     }
-    return { app: a.name, restarted: pods, note: '已删除，控制器会重新拉起一个' };
+    const at = new Date().toISOString();
+    for (const d of deps) {
+      await req(`/apis/apps/v1/namespaces/${a.ns}/deployments/${d.metadata.name}`, {
+        method: 'PATCH',
+        contentType: 'application/merge-patch+json',
+        body: { spec: { template: { metadata: { annotations: { 'kubectl.kubernetes.io/restartedAt': at } } } } },
+        timeout: 8000,
+      });
+    }
+    return {
+      app: a.name,
+      restarted: deps.map((d) => d.metadata.name),
+      kind: 'deployment',
+      at,
+      note: '已触发滚动重启，新 pod 会自己起来（旧 pod 先退，所以会有几秒空档）',
+    };
   }
 
   return {

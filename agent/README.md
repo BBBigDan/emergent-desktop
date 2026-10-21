@@ -568,8 +568,12 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
    这台机器上它好用；换集群如果没有 node-exporter / cAdvisor，应用列表会没有内存数。
 6. **流式 token**：现在 `say` 是一整句到达。真模型要按 SSE 分块推，前端得支持"同一行字追加"
    （现在的"逐字生长"是渲染动画，不是真流式）。
-7. **鉴权**：`/api/*` 在 `nginx.conf` 里没校验。要接 authelia 的 forward-auth
+7. **鉴权**：装成 Olares 应用之后，入口的 `authLevel: private` 由网关兜住了
+   （没登录过不去，实测未登录访问会被 edge 拦下）。但**裸端口**仍然没有校验 ——
+   集群内任何 pod 都能直连 `8788`。要更严就上 authelia forward-auth
    （`authelia-backend-svc:9091/api/verify`，无 cookie 返 401，已实测）。
+   比鉴权更紧的一层是 RBAC：现在是集群级只读 + 代码里按命名空间后缀过滤，
+   单用户等价，多用户会看到别人的 pod（见 `deploy/README.md` 最后一节）。
 8. **审计**：每次工具调用落 `~/Agent/audit/*.jsonl`，返回值脱敏（抹 JWT / Bearer 形状）。
 9. **`/api/debug` 已默认关闭**（需要 `DEBUG=1` 启动）。它会把整个会话消息原样吐出来，
    含系统提示词和记忆注入 —— 线上不该有这个出口。

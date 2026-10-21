@@ -1678,6 +1678,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* 就绪检查。**不是"端口开着"** —— k8s 的 readiness 用 tcpSocket 时，
+     一个没有模型 key 的进程也会被判成就绪，用户看到"服务正常"但每句话都报错。
+     这里判的是"能不能干活"：模型配了没有、数据源是什么、两个可降级的子系统活没活。
+     模型没配 → 503 → pod 一直是 NotReady，界面直接显示"未就绪"，不用等第一句话。 */
+  if (p === '/api/health' && req.method === 'GET') {
+    const hasModel = MODEL_ID === 'mock' || !!process.env.MODEL_KEY;
+    const body = {
+      ok: hasModel,
+      model: MODEL_ID,
+      sys: SYS,
+      memory: memory.store || 'off',
+      persona: persona.on,
+      sessions: sessions.size,
+      up: Math.round(process.uptime()),
+    };
+    if (!hasModel) body.hint = 'MODEL_KEY 没配。装的时候要建 Secret emergent-desktop-env';
+    res.writeHead(hasModel ? 200 : 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(body));
+    return;
+  }
+
   if (p === '/api/session') {
     const sid = u.searchParams.get('sid');
     const s = sid ? sessions.get(sid) : null;
@@ -1712,11 +1733,26 @@ const server = http.createServer(async (req, res) => {
 
 /* 记忆要在开门之前就绪：第一个请求进来时可能立刻就要"你记得吗"。
    它起不来只降级成无记忆，不能连累主循环 —— 一个打不开的库让整台桌面罢工，
-   是比失忆严重得多的事故。 */
-try {
-  await memory.start();
-} catch (e) {
-  console.warn('[memory] 启动失败，退化为无记忆模式：' + e.message);
+   是比失忆严重得多的事故。
+
+   **要重试**。这是多容器应用共有的一个坑：agent 和记忆侧车同时启动，
+   python 拉起 axolotl 要半秒多，agent 先连必然失败。只试一次的代价是
+   "装好了、pod 2/2 Running、记忆一直是 off" —— 而日志里那句
+   "侧车不可用"看起来像环境问题，不像竞态。（实测第一次装就是这样。）
+   重试 6 次 / 每次 2 秒：够等一个 python 进程，也不至于让服务卡住不开门。 */
+for (let i = 0; i < 6; i++) {
+  try {
+    await memory.start();
+    if (i) console.log(`[memory] 侧车第 ${i + 1} 次尝试连上了`);
+    break;
+  } catch (e) {
+    if (i === 5) {
+      console.warn('[memory] 启动失败，退化为无记忆模式：' + e.message);
+    } else {
+      console.warn(`[memory] 侧车还没就绪，2s 后重试（${i + 1}/6）：${e.message}`);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
 }
 
 /* 人格层同理：它起不来就当没有这个人格（不注入身份、不漂移），
