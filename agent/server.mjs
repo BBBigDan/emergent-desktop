@@ -23,10 +23,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import url from 'node:url';
 
-import { makeTools, defaultOverview } from './tools.mjs';
+import { makeTools, defaultOverview, coldTools } from './tools.mjs';
 import { createMockModel } from './model.mock.mjs';
 import { createOpenAIModel } from './model.openai.mjs';
-import { buildSystemPrompt } from './prompt.mjs';
+import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
@@ -64,7 +64,17 @@ const SYS = process.env.SYS || 'k8s';            // k8s | host | mock —— 只
    所以默认值必须落在价格表 ¥0 的那一列上，想花钱自己改 MODEL。 */
 const DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
 const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : 'mock');
-const MAX_STEPS = Number(process.env.MAX_STEPS || 8);
+/* 一轮最多几步。
+ *
+ * 8 是给"造工具"留的（写元数据 → 贴代码 → 试跑 → 改 → 装，五步起步）。
+ * 但**普通问答用不到 8**：实测一轮"机器怎么样"翻了 8 次，其中 2 次是被服务端
+ * 拒掉的调用（k8s_restart / scene_ask），有效工具只有 3 个。
+ * 每多一步就是**多一次整份上下文**（12k 起），8 步 = 10 万 token 输入。
+ *
+ * 所以拆成两个上限：默认 5，一旦这一轮动了造工具的那几个，才放宽到 8。
+ * 判据写在代码里（看到 tool_* / skill_save 被调用），不靠模型自己声明。 */
+const MAX_STEPS = Number(process.env.MAX_STEPS || 5);
+const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 8);
 const APPROVAL_MS = 90_000;
 
 /* ───────────────────────── 会话 ───────────────────────── */
@@ -541,6 +551,26 @@ function healToolCalls(s) {
   }
 }
 
+/** 这一轮要不要把"冷门工具组"和它们的说明书发出去。
+ *
+ *  判据是**用户这句话**，不是模型的自述。两个方向的代价不对称：
+ *  漏判 = 它明明能做却说做不到（用户直接损失一次）；误判 = 多花 2.6k token。
+ *  所以关键词宁可宽。
+ *
+ *  为什么必须在这里做：工具表 6k token 是**每一次调用**都要重发的，
+ *  而造工具那六件 + 1500 token 的规程，三十轮里难得用一次。
+ */
+function coldAllow(goal) {
+  const text = goal.kind === 'ask'
+    ? String(goal.text || '')
+    : `${goal.intent?.kind || ''} ${goal.intent?.target || ''} ${goal.intent?.label || ''}`;
+  const allow = new Set();
+  if (/工具|脚本|接口|api|歌单|插件|技能|装个|写个|做个|造|下载|爬|抓|webhook|hook|文档|文档里|http/i.test(text)) {
+    allow.add('forge');
+  }
+  return allow;
+}
+
 async function runTurn(s, goal) {
   if (s.busy) { emit(s, { t: 'busy' }); return; }
   /* 预算闸放在最前面：**不是**等这一轮跑完再记账。
@@ -569,6 +599,7 @@ async function runTurn(s, goal) {
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
   s.lastSpoken = '';
   s.pendingNext = '';     // 上一件工具留下的"下一步"（只用来推模型一把）
+  s.forgeStep = false;    // 这一轮有没有动造工具的那几个（决定步数上限，见 MAX_STEPS）
 
   /* 每轮取一次记忆。取的是**用户这句话**相关的几条 ——
      不是把整本日记塞进去：7B 的窗口撑不住，而且它会开始复述过去。
@@ -599,7 +630,11 @@ async function runTurn(s, goal) {
   } catch (e) {
     console.warn('[forge] 工具表刷新失败：' + e.message);
   }
-  const ctxNote = [memNote, skillNote].filter(Boolean).join('\n\n');
+  /* 冷门组按场景发：这一轮用户没提造工具，那六个工具和它 1500 token 的规程就都不发。
+     判据在代码里（coldAllow），不靠模型自觉 —— 它连 needs.net 都填不对。 */
+  const allow = coldAllow(goal);
+  const guideNote = allow.has('forge') ? FORGE_GUIDE : '';
+  const ctxNote = [memNote, skillNote, guideNote].filter(Boolean).join('\n\n');
 
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
@@ -622,13 +657,14 @@ async function runTurn(s, goal) {
     let lastSig = '';
     let repeats = 0;
     let nudges = 0;
-    for (let step = 0; step < MAX_STEPS; step++) {
+    const stepCap = () => (s.forgeStep ? MAX_STEPS_FORGE : MAX_STEPS);
+    for (let step = 0; step < stepCap(); step++) {
       /* 上一轮工具刚跑完就被按了停：这里也要接住，别再多问模型一次 */
       if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
       emit(s, { t: 'think', on: true, step });
       let out;
       const reqMsgs = withMemory(s.messages, ctxNote);
-      const schemas = s.tools.schemas();
+      const schemas = s.tools.schemas(coldTools(allow));
       try {
         out = await s.model.complete({
           messages: reqMsgs,
@@ -768,6 +804,9 @@ async function runTurn(s, goal) {
 
       for (const c of calls) {
         const name = c.function.name;
+        /* 造工具是长跑：一旦这一轮动了 tool_* / skill_save，步数上限放宽。
+           其余情况按 5 步收 —— 每多一步都是一次完整的上下文重发。 */
+        if (/^(tool_|skill_save)/.test(name)) s.forgeStep = true;
         const argsRaw = safeJSON(c.function.arguments);
         /* 一条消息里有多个 tool_call 时，**第一个的参数会被服务端截断**
            （实测：tool_write 的 code 直接没了，只剩 name/description/params）。
@@ -793,11 +832,16 @@ async function runTurn(s, goal) {
             result = { error: badArgs };
           } else if (brokenArgs) {
             /* 不执行，直接告诉它为什么 —— 这类失败百分之九十是"代码太长被截断"，
-               不点名的话，它会以为参数没错，只是工具没装好。 */
+               不点名的话，它会以为参数没错，只是工具没装好。
+               但**只有 tool_* 才是"代码太长"**：实测 sys_status 发了个坏参数，
+               收到的是"把脚本压到 40 行以内、再调一次 tool_write" ——
+               它当时没有脚本，这条建议把它带偏了一整轮（多花一次 10k 上下文）。 */
             result = {
               error: '参数不是合法 JSON'
                 + (calls.length > 1 ? '：一条消息里有多个 tool_call 时，第一个会被截断。' : '（少了个括号）')
-                + ' 把脚本压到 40 行以内、一条消息只发一个调用，再调一次 tool_write。',
+                + (name.startsWith('tool_')
+                  ? ' 把脚本压到 40 行以内、一条消息只发一个调用，再调一次 tool_write。'
+                  : ` 重新发一次 ${name}，只发这一个调用，参数写完整。`),
             };
           } else if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.tools.level(name) === 'danger') {
             /* 「拖一下」只是意图，决不能在同一个回合里直接变成执行。
@@ -963,7 +1007,14 @@ async function runTurn(s, goal) {
 
         /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
            模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */
-        if (name === 'sys_status' && result?.cpu != null) { s.lastStatus = result; s.statusTurn = s.turn; }
+        if (name === 'sys_status' && result?.cpu != null) {
+          s.lastStatus = result;
+          s.statusTurn = s.turn;
+          /* 应用状态现在跟着 sys_status 一起回来（合并成一次往返），
+             所以兜底屏要用的 lastApps 也从这里取。留着 app_list 那条分支
+             只是为了让旧会话恢复出来的行为不变。 */
+          if (Array.isArray(result.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
+        }
         if (name === 'app_list' && Array.isArray(result?.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
         /* 文件类问题（"什么占地方"、"下载了什么"）的答案是**文件**，不是仪表。
            标一下，兜底屏就别再拿内存读数去凑 —— 实测它会给"磁盘什么最占地方"

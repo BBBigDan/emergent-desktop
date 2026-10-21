@@ -121,15 +121,14 @@ export function createMockModel() {
           return { content: '' };
         }
 
-        /* — 共同前奏：看数据 → 铺一屏 — */
+        /* — 共同前奏：看数据 → 铺一屏 —
+           一次 sys_status 就够：它现在连应用状态一起返回（合并前要两次往返，
+           而每次往返都要重发整份上下文）。 */
         if (!has(messages, 'sys_status')) {
           return { content: '我看一眼。', tool_calls: [tc('sys_status', {})] };
         }
-        if (!has(messages, 'app_list')) {
-          return { content: '', tool_calls: [tc('app_list', {})] };
-        }
         if (!has(messages, 'scene_set')) {
-          const apps = resultOf(messages, 'app_list').apps || [];
+          const apps = resultOf(messages, 'sys_status').apps || [];
           /* 一句话只放读数，不放判断 —— 判断由场上的分叉去问。
              这一行有 18 字硬预算，写成"CPU 71%、内存 60%，n8n 一直在重启"会被腰斩。 */
           return {
@@ -224,10 +223,10 @@ export function createMockModel() {
           if (!has(messages, 'logs_tail')) {
             return { content: '', tool_calls: [tc('logs_tail', { app: name, lines: 8 })] };
           }
-          if (!has(messages, 'scene_transition')) {
+          if (!has(messages, 'scene_set')) {
             return {
               content: '日志是 502 + OOMKilled，不是网络问题。',
-              tool_calls: [tc('scene_transition', { spec: appScene(name, resultOf(messages, 'logs_tail')) })],
+              tool_calls: [tc('scene_set', { op: 'transition', spec: appScene(name, resultOf(messages, 'logs_tail')) })],
             };
           }
           return { content: '' };

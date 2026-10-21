@@ -23,6 +23,35 @@ import { createFs } from './sources/fs.mjs';
 
 const GB = 1024 ** 3;
 
+/* ───────────────────────── 工具分组（省 token 用） ─────────────────────────
+ *
+ * 34 个工具的 JSON schema 一次就是 6k token，**每一次调用都要重发**。
+ * 但其中大部分是长尾：造工具那六件、记忆管理那两件，几十轮才用一次。
+ *
+ * 所以把它们标成"冷门组"，只在**这句话看起来要干这件事**的时候才发。
+ * 三条纪律：
+ *   1. 判据写在代码里（关键词），不靠模型自己声明 —— 它连 needs.net 都填不对。
+ *   2. **漏判的代价必须是小的**。所以冷门组只收"用户不提就绝不会用到"的能力；
+ *      读文件、铺屏、查状态这些永远常驻，宁可多花 token 也不让它"做不到"。
+ *   3. 已经装好的自造工具**永远在表里**（它们不在这张表里），装完就能用。
+ */
+export const TOOL_GROUPS = {
+  /* 造工具：一轮里能干完，但整轮只有它是主角时才需要 */
+  forge: ['tool_write', 'tool_code', 'tool_try', 'tool_keep', 'skill_save', 'web_get'],
+  /* 记忆管理：问"你记得什么 / 忘掉它"时才用；检索 memory_recall 常驻 */
+  memAdmin: ['memory_stats', 'memory_forget'],
+};
+
+/** 这一轮**不发**给模型的工具名。`allow` 里没有的组，整组摘掉。 */
+export function coldTools(allow = new Set()) {
+  const drop = new Set();
+  for (const [g, names] of Object.entries(TOOL_GROUPS)) {
+    if (allow.has(g)) continue;
+    for (const n of names) drop.add(n);
+  }
+  return drop;
+}
+
 /* ── 数据源：host 读本机真实数字，mock 给固定假数据（截图与自测要可复现） ── */
 
 function hostStatus() {
@@ -238,20 +267,42 @@ export function makeTools(o = {}) {
 
   add('sys_status', {
     level: 'safe',
-    describe: '读一次系统状态：CPU、内存、磁盘的真实占用，以及谁在吃内存。'
-      + '返回 0~1 的比例，不是百分数。',
-    schema: { type: 'object', properties: {}, additionalProperties: false },
-    run: async () => {
-      if (source === 'mock') return { ...MOCK_STATUS };
+    describe: '读一次系统状态：CPU、内存、磁盘的真实占用，谁在吃内存（top），'
+      + '以及用户装的应用各自什么状态。返回 0~1 的比例，不是百分数。'
+      + '问"机器怎么样/卡不卡/哪个应用出问题了"，这一个工具就够了。',
+    schema: {
+      type: 'object',
+      properties: {
+        includeSystem: { type: 'boolean', description: '应用列表里连系统组件一起看，缺省 false' },
+      },
+      additionalProperties: false,
+    },
+    run: async ({ includeSystem } = {}) => {
+      if (source === 'mock') {
+        return { ...MOCK_STATUS, apps: MOCK_APPS.map((a) => ({ name: a.name, state: a.state, memPct: a.mem })) };
+      }
 
       if (cluster) {
         const s = await cluster.nodeMetrics();
         const totalMB = (s.memTotal || 15.6) * 1024;
-        /* top 只给前 5 条、名字去后缀：模型要的是"谁在吃"，不是集群清单。
-           给全量只会让它照着念一遍 pod 名字。
-           **memPct 必须给**：实测模型拿到 memMB=382 之后，会自己"换算"成
-           value:0.382 塞进仪表 —— 屏幕上显示 38%，而它其实只占 2.4%。
-           单位对不上时模型不会问，它会直接除个 1000。 */
+        /* 应用状态**在这里一起取**，不再单独一个 app_list。
+         *
+         * 理由不是"少一个工具"，是**少一次往返**：每多一次工具调用，就要把
+         * 整份上下文（此刻 9.5k token）重新发一遍。"机器怎么样"这类问题
+         * 天然需要"指标 + 应用"两样，分两次问等于为同一份上下文付两遍钱。
+         * 实测：合并前这类问题稳定跑 2~3 步，合并后 1 步就能铺屏。
+         *
+         * `top` 只给前 5 条、名字去后缀：模型要的是"谁在吃"，不是集群清单。
+         * 给全量只会让它照着念一遍 pod 名字。
+         * **memPct 必须给**：实测模型拿到 memMB=382 之后，会自己"换算"成
+         * value:0.382 塞进仪表 —— 屏幕上显示 38%，而它其实只占 2.4%。
+         * 单位对不上时模型不会问，它会直接除个 1000。 */
+        const apps = await cluster.apps({ includeSystem: !!includeSystem })
+          .then((r) => r.apps.map((a) => ({
+            name: a.name, state: a.state, restarts: a.restarts,
+            memPct: a.memMB ? +(a.memMB / totalMB).toFixed(3) : 0,
+          })))
+          .catch(() => null);
         return {
           cpu: s.cpu, mem: s.mem, disk: s.disk,
           memTotal: s.memTotal, memUsed: s.memUsed, memFree: s.memFree,
@@ -261,6 +312,7 @@ export function makeTools(o = {}) {
             memPct: +(r.memMB / totalMB).toFixed(3),
             cpu: +r.cpu.toFixed(3),
           })),
+          apps,
           src: 'olares',
         };
       }
@@ -275,6 +327,8 @@ export function makeTools(o = {}) {
     },
   });
 
+  /* 单独的应用列表。**不再发给模型**（hidden）—— sys_status 已经带着它。
+     留着是因为旧会话/旧提示词里还有它的名字，exec 认；也方便人工调试。 */
   add('app_list', {
     level: 'safe',
     describe: '列出用户装了的应用，以及各自的状态、占用时长、吃多少内存。'
@@ -304,6 +358,7 @@ export function makeTools(o = {}) {
         })),
       };
     },
+    hidden: true,
   });
 
   /* ── 文件：读 ──
@@ -721,21 +776,42 @@ export function makeTools(o = {}) {
     },
   });
 
+  /* 铺屏 / 换屏是**同一个工具的两个模式**，不是两个工具。
+   *
+   * 分开写的时候，两份 `spec` 的 JSON schema 一字不差地各占一份 ——
+   * 光是重复就多烧 470 token（每次调用、每一步都发）。
+   * 更糟的是它给模型多了一个"选哪个"的决策点，而这个决策它经常选错：
+   * 第一屏用了 transition（空场溶解，什么都看不见），换景却用了 set（硬切）。
+   * 现在只有一个 op 枚举，选错的代价变小，语义也回来了：
+   * **第一屏用替换，之后用换景**是这个系统的规则，不该由模型每轮重猜。 */
   add('scene_set', {
     level: 'safe',
-    describe: '铺一整屏，替换当前所有内容。只有第一屏用这个。',
-    schema: { type: 'object', properties: { spec: SPEC_SCHEMA }, required: ['spec'], additionalProperties: false },
-    run: async ({ spec }) => {
+    describe: '铺一整屏（替换当前所有内容），或者换一整屏（溶解 → 重组）。'
+      + '第一屏用缺省的 replace；已经有内容、要换景时填 transition。',
+    schema: {
+      type: 'object',
+      properties: {
+        spec: SPEC_SCHEMA,
+        op: {
+          type: 'string',
+          enum: ['replace', 'transition'],
+          description: '缺省 replace（第一屏）；已经有一屏、要换掉它时用 transition',
+        },
+      },
+      required: ['spec'],
+      additionalProperties: false,
+    },
+    run: async ({ spec, op }) => {
       const r = normalizeSpec(spec);
       if (!r.spec) return { ok: false, error: 'spec 没有可用的 layer', dropped: r.dropped };
-      return { ok: true, op: 'set', spec: r.spec, ...tail(r) };
+      return { ok: true, op: op === 'transition' ? 'transition' : 'set', spec: r.spec, ...tail(r) };
     },
   });
 
   add('scene_patch', {
     level: 'safe',
     describe: '只改值，不重排。指标刷新、进度推进、换一句问话都走这个。'
-      + ' 不能新建 layer，也不能改 kind —— 要加东西用 scene_transition。',
+      + ' 不能新建 layer，也不能改 kind —— 要加东西用 scene_set 的 transition。',
     schema: { type: 'object', properties: { ops: OPS_SCHEMA }, required: ['ops'], additionalProperties: false },
     run: async ({ ops }) => {
       const r = normalizeOps(ops);
@@ -762,13 +838,16 @@ export function makeTools(o = {}) {
 
   add('scene_transition', {
     level: 'safe',
-    describe: '换一整屏：溶解 → 换几何 → 重组。已经有内容之后再换景都用这个，不要用 set。',
+    describe: '旧名字，等价于 scene_set{op:"transition"}。不要再调它，用 scene_set。',
     schema: { type: 'object', properties: { spec: SPEC_SCHEMA }, required: ['spec'], additionalProperties: false },
     run: async ({ spec }) => {
       const r = normalizeSpec(spec);
       if (!r.spec) return { ok: false, error: 'spec 没有可用的 layer', dropped: r.dropped };
       return { ok: true, op: 'transition', spec: r.spec, ...tail(r) };
     },
+    /* 不发给模型：它只是给旧脚本 / 旧会话留的入口。
+       工具表按 `hidden` 过滤掉，但 invoke 仍然认这个名字。 */
+    hidden: true,
   });
 
   /* ── 输出通道之二：渲染树（DOM）──
@@ -1183,12 +1262,18 @@ export function makeTools(o = {}) {
       return D.size;
     },
     isDynamic: (name) => D.has(name),
-    /** 给模型看的 tools 数组（OpenAI 兼容形状，换真模型不用改） */
-    schemas() {
-      return Object.values(T).map((t) => ({
-        type: 'function',
-        function: { name: t.name, description: t.describe, parameters: t.schema },
-      }));
+    /** 给模型看的 tools 数组（OpenAI 兼容形状，换真模型不用改）。
+     *  `hidden` 的不发：它们是旧名字 / 旧入口，`exec` 仍然认（旧会话、旧脚本不会断），
+     *  但不再占每次请求的 token —— 工具表是上下文里最贵的一块。
+     *  `drop` 是按场景裁掉的冷门组（见 TOOL_GROUPS）；不传就是全给。 */
+    schemas(drop = null) {
+      return Object.values(T)
+        .filter((t) => !t.hidden)
+        .filter((t) => !drop || !drop.has(t.name))
+        .map((t) => ({
+          type: 'function',
+          function: { name: t.name, description: t.describe, parameters: t.schema },
+        }));
     },
 
     async exec(name, args) {
