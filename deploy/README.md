@@ -166,3 +166,45 @@ DOM 里只有两样东西：
 
 正解是 `float a = core * vA; gl_FragColor = vec4(color * a, a);` 配 `NormalBlending`。
 换成 `AdditiveBlending` 会把 a 再乘一次（变全黑）；换成 `CustomBlending(One, One)` 也试过，同样不显示。
+
+## agent 服务（`agent-k8s.yaml`）
+
+粒子场的服务端。和壳层同一套思路：裸 Pod + hostPath + Service，不动任何官方资源。
+
+```
+kubectl apply -f agent-k8s.yaml          # 首次
+```
+
+**三个刻意的选择：**
+
+1. **裸 Pod 而不是 Deployment** —— 和壳层同一个理由（`appns-validating-webhook`
+   只校验 deployments/statefulsets/daemonsets 的 CREATE）。代价是没有自愈。
+2. **hostPath `/olares/emergent-agent/app`** —— 代码、`.env`、`sessions/` 都在这一棵树里，
+   同步一次全到位；改完重启进程就生效，不用 build 镜像。
+3. **只读 ClusterRole** —— `pods` / `pods/log` / `deployments` / `services:proxy`。
+   不给 secrets、不给 configmaps、不给写。它现在只需要"看"。
+
+**更新代码：**
+
+```bash
+# 在仓库根目录
+tar czf - --exclude='.kube' --exclude='sessions' --exclude='.env' agent shell \
+  | ssh root@199.68.217.186 'tar xzf - -C /olares/emergent-agent/app'
+# .env 单独传（key 不进 tar、不进命令行参数）
+cat agent/.env | ssh root@199.68.217.186 'cat > /olares/emergent-agent/app/agent/.env && chmod 600 /olares/emergent-agent/app/agent/.env'
+# 让 node 重新加载（裸 Pod，删了要自己重建）
+kubectl delete pod emergent-agent -n user-space-bbbigdan
+kubectl apply -f agent-k8s.yaml
+```
+
+**入口**：`https://<域名>/agent/`，由壳层的 nginx 转过去（`shell-k8s.yaml` 里的
+`location /agent/`）。前缀不剥 —— agent 自己认 `/agent/`，这样它的接口不会和
+官方 olares-app 的 `/api/*` 抢路径。
+
+**踩过的坑：**
+
+- `.kube` 必须排除在 tar 之外。那里面是集群客户端私钥，等于 root shell。
+- nginx 的 `location /agent/` 需要 `proxy_buffering off`，否则 SSE 会被攒着一起发。
+- ConfigMap 是 subPath 挂载，改完**必须重建 Pod**：`kubectl exec nginx -s reload` 没用，
+  容器里那份文件根本不会更新。
+- `WEB_ROOT` 要指到 `/app/shell`（装页面的那层）。指错了页面能开但 `./src/*.js` 全 404。

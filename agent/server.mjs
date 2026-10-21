@@ -29,7 +29,11 @@ import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt } from './prompt.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, '..');            // 仓库根：dev 模式下同时服务 shell/
+const ROOT = path.resolve(HERE, '..');            // 仓库根
+/* 页面（agent.html 与它 import 的 src/、vendor/）在哪个目录。
+   集群里代码挂在 /app，页面就在 /app/shell —— 用环境变量指过去，
+   静态路由和相对引用的对应关系不变。 */
+const WEB_ROOT = path.resolve(process.env.WEB_ROOT || path.join(ROOT, 'shell'));
 
 /* .env 只给本地调试用：key 不进仓库（.gitignore 里有 agent/.env）。
    自己读而不用 dotenv，是为了保持"零依赖"——这个服务将来要直接丢进 k8s。 */
@@ -634,7 +638,18 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, `http://${req.headers.host}`);
-  const p = decodeURIComponent(u.pathname);
+  let p = decodeURIComponent(u.pathname);
+
+  /* 统一前缀 `/agent/`。
+   *
+   * 为什么要它：这个东西最终要挂在那台机器的桌面上，和官方的 `/api/*`
+   * 共用一个域名。把 agent 的接口放在 `/agent/` 下面，才不会和
+   * olares-app 的登录/接口抢路径。
+   *
+   * 剥掉前缀之后，下面所有路由照旧按 `/api/*`、`/` 判断 —— 于是同一份代码
+   * 本地（直接 8788）和集群里（nginx 转过来）走的是完全相同的分支。
+   * 前端也因此可以用**相对**路径（`api/events`），不必知道自己在哪个前缀下。 */
+  if (p === '/agent' || p.startsWith('/agent/')) p = p.slice('/agent'.length) || '/';
 
   /* ── 下行事件流 ── */
   if (p === '/api/events' && req.method === 'GET') {
@@ -711,9 +726,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* ── 静态（dev 模式：仓库根，于是 /shell/agent.html 能直接 import ./src/*） ── */
-  let file = path.join(ROOT, p === '/' ? '/shell/agent.html' : p);
-  if (!file.startsWith(ROOT)) { res.writeHead(403).end('forbidden'); return; }
+  /* ── 静态 ──
+   * WEB_ROOT 指向**装页面那个目录**（默认仓库里的 shell/），于是页面里的
+   * 相对引用 `./src/field.js` 天然对应 `/src/field.js`。
+   * 部署进集群时把它指到 /app/shell，路径规则一个字不用改。 */
+  let file = path.join(WEB_ROOT, p === '/' ? 'agent.html' : p);
+  if (!file.startsWith(WEB_ROOT)) { res.writeHead(403).end('forbidden'); return; }
   try {
     const st = await fs.stat(file);
     if (st.isDirectory()) file = path.join(file, 'index.html');
@@ -729,7 +747,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`emergent-agent  http://127.0.0.1:${PORT}/shell/agent.html`);
+  console.log(`emergent-agent  http://127.0.0.1:${PORT}/agent/`);
   console.log(`  model=${MODEL_ID}  data=${SYS}  base=${process.env.MODEL_BASE || 'https://api.siliconflow.cn/v1'}`);
   if (MODEL_ID !== 'mock' && !process.env.MODEL_KEY) {
     console.warn('  ⚠ 没有 MODEL_KEY，连上后会报错。在 agent/.env 里写 MODEL_KEY=sk-...');

@@ -181,7 +181,7 @@ const sid = localStorage.getItem('sid') || (crypto.randomUUID?.() ?? String(Math
 localStorage.setItem('sid', sid);
 
 function send(msg) {
-  return fetch('/api/send', {
+  return fetch('api/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sid, ...msg }),
@@ -209,7 +209,7 @@ function clearThink() {
   statEl.classList.remove('off');
 }
 
-const es = new EventSource(`/api/events?sid=${sid}`);
+const es = new EventSource(`api/events?sid=${sid}`);
 es.onmessage = (e) => {
   let m;
   try { m = JSON.parse(e.data); } catch { return; }

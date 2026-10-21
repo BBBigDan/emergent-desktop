@@ -1,0 +1,136 @@
+# 涌现式桌面 · agent 服务（跑在集群里）
+#
+# 和 shell 同一套思路：裸 Pod + hostPath + Service，不动任何官方资源。
+#
+#   - 代码放 hostPath /olares/emergent-agent/app，改完 tar 上去、重启进程即生效
+#   - 只读 k8s：一个 ClusterRole 给 pods / pods-log / deployments / services:proxy
+#     不给 secrets、不给 configmaps、不给写。它只需要"看"，审批门后面的事还没接。
+#   - 挂在 shell 的 nginx 下 `/agent/`（见 shell-k8s.yaml 的 location /agent/）
+#
+# 首次部署：
+#   kubectl apply -f agent-k8s.yaml
+# 更新代码：
+#   tar czf - agent shell | ssh root@host 'tar xzf - -C /olares/emergent-agent/app'
+#   kubectl delete pod emergent-agent -n user-space-bbbigdan   # 让 node 重新加载
+#
+# 为什么不给 Deployment：Olares 的 appns-validating-webhook 只校验
+# deployments/statefulsets/daemonsets 的 CREATE，裸 Pod 不受拦。代价是没有自愈。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: emergent-agent
+  namespace: user-space-bbbigdan
+---
+# 只读。范围刚好够 sys_status / app_list / logs_tail 用 ——
+# 多给一条（比如 secrets）就意味着这个 pod 被攻破时能读到全集群的凭据。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: emergent-agent-read
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Prometheus 走 API 的 service proxy，权限是 services/proxy 而不是 services
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: emergent-agent-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: emergent-agent-read
+subjects:
+  - kind: ServiceAccount
+    name: emergent-agent
+    namespace: user-space-bbbigdan
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: emergent-agent
+  namespace: user-space-bbbigdan
+spec:
+  selector:
+    app: emergent-agent
+  ports:
+    - name: http
+      port: 8788
+      targetPort: 8788
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emergent-agent
+  namespace: user-space-bbbigdan
+  labels:
+    app: emergent-agent
+spec:
+  serviceAccountName: emergent-agent
+  restartPolicy: Always
+  containers:
+    - name: agent
+      image: docker.io/library/node:22-alpine
+      imagePullPolicy: IfNotPresent
+      workingDir: /app
+      # 不用 shell 包一层：node 收到 SIGTERM 才会走完 idle 落盘
+      command: ["node", "/app/agent/server.mjs"]
+      ports:
+        - containerPort: 8788
+      env:
+        - name: PORT
+          value: "8788"
+        # 页面在 /app/shell，于是 page 里的 ./src/x.js 对应 /src/x.js
+        - name: WEB_ROOT
+          value: /app/shell
+        # 集群内自己就是数据源，不需要 kubeconfig
+        - name: SYS
+          value: k8s
+        - name: OLARES_USER
+          value: bbigdan
+        - name: TZ
+          value: Asia/Shanghai
+        # 用来记住"这轮说过什么"之类的 SID 前缀，不参与业务
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      volumeMounts:
+        - name: app
+          mountPath: /app
+      readinessProbe:
+        tcpSocket:
+          port: 8788
+        initialDelaySeconds: 3
+        periodSeconds: 10
+      livenessProbe:
+        tcpSocket:
+          port: 8788
+        initialDelaySeconds: 20
+        periodSeconds: 30
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          cpu: 800m
+          memory: 512Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+  volumes:
+    - name: app
+      hostPath:
+        # 代码 + .env + sessions/ 都在这一个目录下，rsync 一次全到位
+        path: /olares/emergent-agent/app
+        type: DirectoryOrCreate
