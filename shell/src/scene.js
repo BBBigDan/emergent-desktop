@@ -161,6 +161,9 @@ export class FieldScene {
        不是省事：同时展开三个细节，场就变成了低分辨率的表格。 */
     const focus = spec.focus || list[0]?.id;
 
+    /* 先排带，再让各层进带。每层自己往上加常数的做法，加法一多必然撞。 */
+    this.L = this._bands(list, a);
+
     const gauges = list.filter((l) => l.kind === 'gauge');
     gauges.forEach((l, i) => this._gauge(l, i, gauges.length, a));
 
@@ -374,12 +377,61 @@ export class FieldScene {
     return { base: start, len: n, idx: Uint16Array.from(pts, (_, k) => ((start + k) * 7919 + 13) % 6400) };
   }
 
+  /**
+   * 纵向分层。
+   *
+   * 场只有 560px 高，而所有层都排在同一条竖轴上：仪表 → 曲线 → 结论 → 分叉。
+   * 每层原先各自往上加常数（a.y+150 / +276 / +470 / +588），加法一多必然撞：
+   * 实测"结论"落在曲线中间（fork 存在时它被挪到 +372，正好是曲线的地盘），
+   * "分叉"的下沿贴到说话行上。
+   *
+   * 所以先排带、再进带，而且是**从下往上**排：分叉贴底（它离说话行最近，
+   * 是"等你回答"的东西），结论在它上面一行，曲线占剩下的中间，仪表顶在最上面。
+   * 少一层时上面的带跟着往下让 —— 空出来的空间归内容，不留在中间。
+   */
+  _bands(list, a) {
+    const has = (k) => list.some((l) => l.kind === k);
+    const noteN = list.filter((l) => l.kind === 'condense').length;
+    const fork = has('fork');
+    const trace = has('trace');
+    const head = has('gauge') || has('stream');
+    const bottom = a.y + a.h;
+
+    /* 分叉：圆心贴底 128（标题在 -30、分支文字在 +96，正好落在带内） */
+    const forkCy = fork ? bottom - 128 : null;
+    /* 往上还有多少可用：分叉的标题上方要留一口气，别让结论贴上去 */
+    let top = fork ? forkCy - 60 : bottom - 26;
+
+    /* 结论：从下往上堆，多的往上叠；它是"一行字"，不占带高 */
+    const noteBase = noteN ? (head || trace || fork ? top - 6 : a.y + a.h * 0.5) : null;
+    if (noteN) top = noteBase - 30 * (noteN - 1) - 8;
+
+    /* 曲线：标签行在 tTop-28，绘图区 tTop..tBase。
+       上界受仪表让位（a.y+300），下界受结论让位；挤不下就压短，但不低于 96。 */
+    let tBase = Math.min(top, a.y + 452);
+    let tTop = Math.min(a.y + 300, tBase - 96);
+    if (tTop < a.y + 250) tTop = a.y + 250;      // 不低于仪表栏的下沿
+    if (tBase - tTop < 96) tBase = tTop + 96;
+
+    return {
+      bottom,
+      gaugeCy: a.y + 150,
+      forkCy,
+      noteBase,
+      tTop,
+      tBase,
+      /* 乱团没有自己的带：它属于"这一屏出问题了"，挂在曲线下方 */
+      turbCy: Math.min(tBase - 26, (noteBase ?? top) - 36),
+      trace,
+    };
+  }
+
   /** 环形仪表：整圈点云，前 value 段亮，其余压暗 */
   _gauge(spec, i, count, a, reuse) {
     const R = 52;
     const gap = 250;
     const cx = a.x + a.w / 2 + (i - (count - 1) / 2) * gap;
-    const cy = a.y + 150;
+    const cy = this.L?.gaugeCy ?? a.y + 150;
     const N = 180;
     const v = clamp(spec.value ?? 0, 0, 1);
     const lit = Math.max(0, Math.min(N, Math.round(v * N)));
@@ -532,8 +584,9 @@ export class FieldScene {
        "CPU / 内存" 那行字到 a.y+210 左右。原来 label 放在 a.y+214，
        实测正好压在仪表下面（"CPU 一小时" 贴着第一个圆的下沿）。
        留 40px 的呼吸，标签才不会看起来是属于某个仪表的。 */
-    const yTop = a.y + 276;
-    const yBase = a.y + 430;
+    /* 位置来自 _bands：它已经算过"下面还有结论 / 分叉要让多少" */
+    const yTop = this.L?.tTop ?? a.y + 276;
+    const yBase = this.L?.tBase ?? a.y + 430;
 
     const layer = this.layers.get(spec.id) || {};
     layer.spec = spec;
@@ -643,7 +696,7 @@ export class FieldScene {
   /** 分叉：两股流从一点分开，越靠外越散；光标是第三个吸引子 */
   _fork(spec, a) {
     const cx = a.x + a.w / 2;
-    const cy = a.y + 470;
+    const cy = this.L?.forkCy ?? a.y + 470;
     const opts = (spec.options || []).slice(0, 2);
     const layer = { spec, anchor: { x: cx, y: cy }, branches: [] };
     layer.hot = { type: 'circle', cx, cy, r: 66, gestures: ['tap'] };
@@ -699,7 +752,10 @@ export class FieldScene {
        不然它会正好压在两个选项中间 —— "Downloads 有 11 GB" 和 "归档 / 先不动"
        叠在一起，看着像写错行。分叉占了 a.y+470..+700 那一条带。 */
     const hasFork = [...this.layers.values()].some((l) => l.spec?.kind === 'fork');
-    const y = hasFork ? a.y + 372 : a.y + 588 + i * 26;
+    /* 位置由 _bands 给：它知道底下压着几条结论、有没有分叉。
+       以前这里是"有分叉就 +372"，而 +372 正好是曲线的地盘 —— 结论压在线上。 */
+    const nb = this.L?.noteBase;
+    const y = nb != null ? nb - i * 26 : (hasFork ? a.y + 372 : a.y + 588 + i * 26);
     const t = new ParticleText({
       field: f, alloc: this.alloc, x: a.x + a.w / 2, y, size: 17, max: 20,
       /* 结论是**要读的**，不是装饰。原来用 COL.dim（#5d7fa4）：
@@ -716,7 +772,7 @@ export class FieldScene {
   /** 异常：一小团乱点，level 决定数量和抖动 */
   _turbulence(spec, a) {
     const cx = a.x + 74;
-    const cy = a.y + 452;
+    const cy = this.L?.turbCy ?? a.y + 452;
     const lv = clamp(spec.level ?? 0.3, 0, 1);
     const N = Math.round(70 + 150 * lv);
     const pts = [];
@@ -748,6 +804,9 @@ export class FieldScene {
   /** focus 的细节读数（挂在锚点下方） */
   _detail(layer, a) {
     const f = this.field;
+    /* 仪表自己已经有"读数 + 标签"两行，detail 会写在 captions 上（cy+40 vs cy+33）。
+       一格仪表不需要第三种数字。 */
+    if (layer.spec?.kind === 'gauge') return;
     const p = layer.anchor || { x: a.x + a.w / 2, y: a.y + 200 };
     const s = layer.spec;
     const live = s.kind === 'stream' && s.progress != null;
