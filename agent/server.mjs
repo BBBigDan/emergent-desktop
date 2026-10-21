@@ -1761,14 +1761,14 @@ for (let i = 0; i < 6; i++) {
    而日志里那句"侧车不可用"看不出是拉镜像慢。等下次删 pod 才恢复 —— 没人会去删。
    所以这里留一个后台重试：每 30 秒试一次、最多 10 分钟，连上了就照常工作。
    只重试 axolotl 这一条路，绝不顺手退回 SQLite（两份库并存 = 记忆分叉）。 */
-if (!memory.ok()) {
+if (!memory.ok) {
   let tries = 0;
   const timer = setInterval(async () => {
     tries += 1;
-    if (memory.ok() || tries > 20) { clearInterval(timer); return; }
+    if (memory.ok || tries > 20) { clearInterval(timer); return; }
     try {
       await memory.start();
-      if (memory.ok()) {
+      if (memory.ok) {
         console.log(`[memory] 后台第 ${tries} 次重试连上了侧车`);
         clearInterval(timer);
       }
