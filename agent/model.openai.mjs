@@ -19,7 +19,9 @@
  */
 
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
-const DEFAULT_MODEL = 'deepseek-ai/DeepSeek-V4-Flash';
+/* 默认落在一张 ¥0 的模型上：余额为 0 的账户用收费模型会触发账户级停服，
+   连免费模型一起 402。要换更强的模型，自己设 MODEL。 */
+const DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
 
 /** 只保留 OpenAI 认识的字段。`intent` 这类私有字段漏出去就是 400。 */
 function cleanMessages(messages) {

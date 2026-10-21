@@ -30,7 +30,7 @@ SYS=mock node agent/server.mjs           # 工具返回固定假数据（截图 
 
 ```ini
 MODEL_KEY=sk-...                          # 必填（MODEL=mock 时不需要）
-MODEL=deepseek-ai/DeepSeek-V4-Flash       # 任何 OpenAI 兼容模型名；mock = 不联网
+MODEL=Qwen/Qwen2.5-7B-Instruct            # 默认落在 ¥0 那一列；mock = 不联网
 MODEL_BASE=https://api.siliconflow.cn/v1  # 换厂商只改这一行
 SYS=host                                  # host 读本机真数字 / mock 用固定假数据
 ```
@@ -42,10 +42,20 @@ SYS=host                                  # host 读本机真数字 / mock 用�
 
 - 接口通，key 有效，`/v1/models` 能列出 98 个模型。
 - **但所有模型都返回 `402 code 30001 account balance insufficient`** —— 包括标着"免费"的那些。
-  硅基流动的免费额度是记在账户上的赠金，赠金用尽后连免费模型也会 402。
-  需要实名认证 + 领新用户赠金，或充一点钱。
-- 能用的时候实测延迟（带工具调用）：`DeepSeek-V4-Flash` ~1.1s/步且会并行发调用，
-  `Qwen2.5-7B-Instruct` ~0.9s/步最稳，`GLM-5.3-Flash` ~3s/步，`Qwen3-8B` 首次调用 90s（冷启动）。
+- **这条是怎么来的（重要，别再踩）**：账户余额本来是 0（或赠金已过期），
+  ¥0 的模型还能跑；探测时混进了四个收费模型（`DeepSeek-V4-Flash`、`GLM-5.3-Flash`、
+  `Qwen3.5-9B` 等），每个只跑了几百 token、合计不到一分钱 —— 但余额是 0，
+  扣费异步结算后变成负数，触发「现金余额 < 0 → 停止该账户的全部 API」，
+  **于是几分钟后连 ¥0 的 Qwen 也开始 402**。
+  名字里带 `Flash` 不代表免费，这是这次最贵的一课。
+- 解锁办法：实名认证 + 充值任意金额（0.01 元即可），之后扣费顺序变成「现金 → 券」。
+- 已把默认 `MODEL` 改成 `Qwen/Qwen2.5-7B-Instruct`（¥0），并在
+  `tools/dev/probe-model.mjs` 里做了硬保护：探到非免费名单的模型会直接拒绝，
+  必须显式 `--paid`。
+
+能用的时候实测延迟（带工具调用）：`Qwen2.5-7B-Instruct` ~0.9s/步最稳；
+`DeepSeek-V4-Flash` ~1.1s/步且会并行发调用（收费）；`GLM-5.3-Flash` ~3s/步（收费）；
+`Qwen3-8B` 首次调用 90s（冷启动）。
 
 ### 没有余额怎么继续开发
 

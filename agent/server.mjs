@@ -49,7 +49,12 @@ const PORT = Number(process.env.PORT || 8788);
 const SYS = process.env.SYS || 'host';            // host | mock —— 只决定"数据从哪来"
 /* 模型与数据源是**两件事**：SYS=mock + 真模型，能在可复现的假数据上调提示词；
    SYS=host + mock 模型，能在真数据上验工具。混成一个开关就没法分开排障。 */
-const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? 'deepseek-ai/DeepSeek-V4-Flash' : 'mock');
+/* 默认用**免费**模型。这不是省钱，是"零余额账户"这条现实：
+   硅基流动的规则是「现金余额 < 0 → 账户级停服」，而停服是账户级的 ——
+   收费模型欠的不到一分钱，会把 ¥0 的免费模型一起带走（2026-10-21 实测踩过）。
+   所以默认值必须落在价格表 ¥0 的那一列上，想花钱自己改 MODEL。 */
+const DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
+const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : 'mock');
 const MAX_STEPS = Number(process.env.MAX_STEPS || 8);
 const APPROVAL_MS = 90_000;
 
