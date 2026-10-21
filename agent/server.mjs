@@ -134,6 +134,7 @@ async function getSession(sid) {
       tools: makeTools({ source: SYS }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
+      abortCtl: null,       // 这一轮的中断开关（用户按停）
       busy: false,
       turn: 0,
       lastAdjustTo: null,
@@ -294,9 +295,57 @@ const summarize = (r) => {
   return 'ok';
 };
 
+/* "这一轮被打断了"不是一种错误，是一条单独的路。
+   用哨兵而不是 Error：它不该被下面的 catch 当成失败去写 error 事件，
+   也不该出现在模型的上下文里。 */
+const ABORT_TURN = Symbol('turn aborted');
+
+/**
+ * 打断。三件事必须一起做，否则"停"会留下烂摊子：
+ *   1. 掐掉在飞的模型请求（AbortSignal 一路传到 fetch）
+ *   2. 放掉挂着的审批 —— 它在等一个再也不会来的回答
+ *   3. 补上缺失的 tool 结果（见 healToolCalls）
+ */
+function abortTurn(s) {
+  if (!s.busy || !s.abortCtl) return false;
+  s.abortCtl.abort();
+  if (s.pending) {
+    const p = s.pending;
+    s.pending = null;
+    clearTimeout(p.timer);
+    p.resolve(false);
+    emit(s, { t: 'approval_done', ok: false });
+  }
+  return true;
+}
+
+/**
+ * 打断时，历史可能停在"助手要调工具、结果还没回来"。
+ * 下一次请求会因此 400 —— OpenAI 协议要求每个 tool_call 都有对应的 tool 消息。
+ * 补一条"被打断"的结果：这不是假装执行过，是把"它确实没拿到结果"如实写进历史。
+ */
+function healToolCalls(s) {
+  let i = s.messages.length - 1;
+  while (i >= 0 && s.messages[i].role === 'tool') i--;
+  const m = s.messages[i];
+  if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls) || !m.tool_calls.length) return;
+  const answered = new Set(
+    s.messages.slice(i + 1).filter((x) => x.role === 'tool').map((x) => x.tool_call_id),
+  );
+  for (const c of m.tool_calls) {
+    if (answered.has(c.id)) continue;
+    s.messages.push({
+      role: 'tool', name: c.function?.name, tool_call_id: c.id,
+      content: JSON.stringify({ error: '用户打断了这一轮，没有执行完' }),
+    });
+  }
+}
+
 async function runTurn(s, goal) {
   if (s.busy) { emit(s, { t: 'busy' }); return; }
   s.busy = true;
+  s.abortCtl = new AbortController();
+  let aborted = false;
   s.goal = goal;
   s.turn++;
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
@@ -326,6 +375,8 @@ async function runTurn(s, goal) {
     let lastSig = '';
     let repeats = 0;
     for (let step = 0; step < MAX_STEPS; step++) {
+      /* 上一轮工具刚跑完就被按了停：这里也要接住，别再多问模型一次 */
+      if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
       emit(s, { t: 'think', on: true, step });
       let out;
       try {
@@ -340,7 +391,12 @@ async function runTurn(s, goal) {
              代价是纯闲聊也要付一次 sys_status —— 一次本地读 /proc，可以接受。 */
           toolChoice: step === 0 && goal.kind === 'ask' ? 'required' : 'auto',
           goal: { ...goal, pendingTo: s.lastAdjustTo },
+          signal: s.abortCtl.signal,
         });
+      } catch (e) {
+        /* 用户按停 / 信号已断：走打断那条路，不当作模型故障 */
+        if (e?.aborted || s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
+        throw e;
       } finally {
         /* 必须放 finally：模型超时或 402 时 await 会抛，写在后面的
            think:off 就永远发不出去 —— 前端会一直停在"低相干度"，
@@ -615,12 +671,21 @@ async function runTurn(s, goal) {
       }
     }
   } catch (e) {
-    emit(s, { t: 'error', message: String(e?.message || e) });
+    if (e !== ABORT_TURN) emit(s, { t: 'error', message: String(e?.message || e) });
+  } finally {
+    if (aborted) {
+      healToolCalls(s);
+      emit(s, { t: 'note', message: '这一轮被打断了' });
+      /* 说一句，别让屏幕"忽然安静" —— 用户按了停，需要看到它承认这件事。
+         不说"好的"：它不是答应了什么，是停下来了。
+         这一句也进记录：它同样是"说出口的话"。 */
+      speak(s, '停下了');
+    }
+    s.busy = false;
+    s.abortCtl = null;
+    emit(s, { t: 'idle' });
+    scheduleSave(s);         // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
   }
-
-  s.busy = false;
-  emit(s, { t: 'idle' });
-  scheduleSave(s);           // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
 }
 
 const safeJSON = (v) => {
@@ -741,6 +806,10 @@ const server = http.createServer(async (req, res) => {
       runTurn(s, { kind: 'intent', intent: body.intent });
     } else if (body.t === 'approve') {
       settleApproval(s, !!body.ok);
+    } else if (body.t === 'abort') {
+      /* 打断也要回执：客户端点了停却什么都没发生，是最难受的一种失败 */
+      const ok = abortTurn(s);
+      emit(s, { t: 'note', message: ok ? '收到「停」' : '当前没有在跑的回合' });
     }
     return;
   }

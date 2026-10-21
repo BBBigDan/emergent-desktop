@@ -103,7 +103,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   histBtn.type = 'button';
   histBtn.hidden = true;
 
-  layer.append(histEl, histBtn);
+  /* 跑着的时候，那个角上写的是"能做什么"，不是"记录"。
+     两件事互斥，所以共用一个位置 —— 一秒里只能有一件事是对的。 */
+  const stopBtn = el('button', 'ag-stop', '停 · Esc');
+  stopBtn.type = 'button';
+  stopBtn.hidden = true;
+
+  layer.append(histEl, histBtn, stopBtn);
 
   function histPush(r, text) {
     const t = String(text || '').trim();
@@ -161,6 +167,19 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     e.stopPropagation();
     histOpen ? closeHist() : openHist();
   });
+
+  /* 停。给的是"停"而不是"取消"：这一轮已经产生的读数、已经铺开的那一屏
+     都属于用户看过的内容，不该被撤回 —— 撤回是"什么都没发生"，
+     而事实上发生了一半。 */
+  function abortAsk() {
+    if (!busy) return;
+    insp('stop', '你按了停');
+    send({ t: 'abort' });
+    stopBtn.textContent = '停…';
+    /* 服务端一般 100ms 内回 idle；万一没回，别让按钮永远卡在"停…" */
+    setTimeout(() => { stopBtn.textContent = '停 · Esc'; }, 3000);
+  }
+  stopBtn.addEventListener('click', (e) => { e.stopPropagation(); abortAsk(); });
   /* 点在雾以外就收起：没有遮罩层，就不该有"点哪儿都关不掉"的感觉 */
   addEventListener('pointerdown', (e) => {
     if (!histOpen) return;
@@ -188,6 +207,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 记录入口贴在场的右下角外侧 —— 它属于"这一层"的控件，不悬在屏幕角落 */
     histBtn.style.top = `${lineY - 42}px`;
     histBtn.style.right = `${Math.max(26, W - area.x - area.w + 10)}px`;
+    stopBtn.style.top = histBtn.style.top;
+    stopBtn.style.right = histBtn.style.right;
   }
 
   function build() {
@@ -310,6 +331,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let pendingApproval = null;
   let busy = false;
 
+  /* 「在跑」是一件事，不是两个 flag。
+     原来 busy 只管状态栏，现在它还要决定那个角上写"停"还是"记录" ——
+     分开写迟早有一处忘了同步，而忘了同步的表现是"点了停没反应"或
+     "跑着跑着记录按钮冒出来"。 */
+  function setBusy(v) {
+    busy = v;
+    stopBtn.hidden = !v || open === false;
+    histBtn.hidden = v || log.length < 2 || open === false;
+  }
+
   function setThink(on) {
     thinking += on ? 1 : -1;
     if (thinking < 0) thinking = 0;
@@ -356,7 +387,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         break;
 
       case 'turn':
-        busy = true;
+        setBusy(true);
         insp(m.kind === 'intent' ? '→ 手势' : '→ 你问',
           m.kind === 'intent' ? describe(m.intent) : lineText);
         break;
@@ -429,7 +460,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       case 'idle':
         /* 兜底：即使 think:off 因为断线丢了，一轮结束也必须让场重新成形 */
         clearThink();
-        busy = false;
+        setBusy(false);
         statTxt.textContent = 'ready';
         break;
 
@@ -442,7 +473,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         clearThink();
         say(friendly(m.message));
         insp('error', m.message);
-        busy = false;
+        setBusy(false);
         statTxt.textContent = 'ready';
         break;
 
@@ -616,7 +647,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.rimTo = 0;
     gt.enabled = true;
     onOpenChange?.(true);
-    histBtn.hidden = log.length < 2;
+    setBusy(busy);
 
     connect();
     /* 相干度回升要跨过 set 那一帧，否则 set 里那次 slotBegin 会把它顶回去 */
@@ -745,6 +776,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     get scene() { return scene; },
     get open() { return open; },
     isOpen: () => open,
+    isBusy: () => busy,
+    abort: abortAsk,
     open: openAgent,
     close: closeAgent,
     /** Esc 的分级：先收记录，再收这一层。返回 true 表示"这一下被吃掉了" */

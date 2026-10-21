@@ -402,6 +402,17 @@ body.launching .rail-zone { display: none; }
 .ag-hist-btn:hover, .ag-hist-btn.on { color: rgba(190, 225, 255, .66); }
 .ag-hist-btn[hidden] { display: none; }
 
+/* 停：跑着的时候占同一个角。用的是审批那种琥珀色 —— 
+   在这一层里，琥珀 = "这是一个会改变状态的动作"，白蓝 = "只是看"。 */
+.ag-stop {
+  position: fixed; z-index: 5; pointer-events: auto; cursor: pointer;
+  background: transparent; border: 0; padding: 3px 2px;
+  font: 10.5px/1 ui-monospace, Menlo, monospace; letter-spacing: .14em;
+  color: rgba(255, 178, 87, .52); transition: color .2s;
+}
+.ag-stop:hover { color: rgba(255, 205, 140, .95); }
+.ag-stop[hidden] { display: none; }
+
 /* 审批的兜底：当场里没有分叉可借用时，用一条 DOM 带子。
    审批是**系统的 affordance**，不受模型表达自由支配 —— 所以它允许不是粒子。 */
 .ag-gate {

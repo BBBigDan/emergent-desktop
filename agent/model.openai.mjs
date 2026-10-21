@@ -63,7 +63,7 @@ export function createOpenAIModel(o = {}) {
     throw new Error('缺少 MODEL_KEY：在 agent/.env 里写 MODEL_KEY=sk-...（或设环境变量）');
   }
 
-  async function once({ messages, tools, toolChoice = 'auto' }) {
+  async function once({ messages, tools, toolChoice = 'auto', signal }) {
     const body = {
       model,
       messages: cleanMessages(messages),
@@ -75,6 +75,11 @@ export function createOpenAIModel(o = {}) {
       body.tools = tools;
       body.tool_choice = toolChoice;
     }
+    /* 两个中断源合流：自己的超时，加上"用户按了停"。
+       没有第二个的话，点了停还要等满 timeoutMs（默认 60s）才收手 ——
+       所谓"能打断"就成了一句空话。 */
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const sig = signal ? AbortSignal.any([deadline, signal]) : deadline;
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
@@ -86,7 +91,7 @@ export function createOpenAIModel(o = {}) {
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: sig,
         });
 
         const text = await r.text();
@@ -123,6 +128,12 @@ export function createOpenAIModel(o = {}) {
           ms: Date.now() - t0,
         };
       } catch (e) {
+        /* 用户按了停：这不叫失败，别重试、别包装成"模型超时" */
+        if (signal?.aborted) {
+          const a = new Error('用户打断');
+          a.aborted = true;
+          throw a;
+        }
         /* 超时 / DNS / 连接被重置：同样是"过一会儿再来" */
         if (e.status) throw e;
         lastErr = new Error(
@@ -140,8 +151,8 @@ export function createOpenAIModel(o = {}) {
   return {
     name: `sf:${model}`,
     model,
-    async complete({ messages, tools, toolChoice }) {
-      const out = await once({ messages, tools, toolChoice });
+    async complete({ messages, tools, toolChoice, signal }) {
+      const out = await once({ messages, tools, toolChoice, signal });
       if (out.truncated && !out.tool_calls.length) {
         console.warn('[model] 输出被 max_tokens 截断');
       }

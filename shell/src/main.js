@@ -279,7 +279,11 @@ function toggleFullscreen() {
 const _esc = () => {
   /* Esc 撤掉的是"眼前最上面那一层"：记录是浮在场上的，先收它 */
   if (agent?.isOpen()) {
+    /* 三级：先收记录，再停这一轮，最后才收整个场。
+       "停下这一轮"排在"收起"前面，因为跑着的时候用户按 Esc 想撤的多半是
+       这三十秒的等待，而不是他刚打开的这片界面。 */
     if (agent.closeHistory?.()) return;
+    if (agent.isBusy?.()) { agent.abort?.(); return; }
     agent.close();
     return;
   }
