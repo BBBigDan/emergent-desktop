@@ -31,6 +31,35 @@ Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的�
 界面上看不出是谁的错，只会觉得这系统不准。所以校验层做两件事：**挡住**，然后**如实回报**
 （`dropped` / `adjusted` 作为工具结果回给模型，否则它会在同一个错误上重复八次）。
 
+## 长期记忆（M2）
+
+`memory.mjs` + `sources/graph.mjs`，零依赖（`node:sqlite`）。它做三件事：
+
+1. **抽取**：一轮问答结束后，让主模型把"值得长期记住"的东西写成 1~3 条事实
+   （偏好 / 做过的事 / 因果 / 认得的东西）；读数、寒暄、计划都不记。
+2. **回忆**：下一轮开头按用户这句话去图里定向取几条，拼进系统提示。
+   不是 dump 全库 —— 7B 的窗口撑不住，而且它会开始复述过去。
+3. **巩固**：每 6 轮（或 6 小时）算一次五信号，剪掉没人再碰的，把反复同框的实体
+   塌缩成摘要节点，拍一张快照。
+
+| 位置 | 内容 |
+|---|---|
+| `~/Agent/memory/memory.db` | 图：fact / entity / community 三类节点 + `about` / `covers` 边 |
+| `~/Agent/memory/snapshots/` | `VACUUM INTO` 快照，留最近 5 份 |
+| `GET /agent/api/memory?q=n8n` | 当前 stats + 一次回忆 —— **唯一可观测入口** |
+
+环境变量：`MEMORY=0` 整个关掉；`MEMORY_DIR=/path` 指定目录
+（默认落在用户的 `~/Agent/memory`，用户在 Files 里看得见；挂载不可用时退回 `agent/memory/`）。
+
+工具：`memory_recall`（查）/ `memory_stats`（看有什么）/ `memory_forget`（忘，danger 过审批）。
+抽取失败只丢那一轮，不影响对话；记忆库打不开就退化成无记忆模式，不连累主循环。
+
+自测（不需要模型，也不需要集群）：
+
+```
+node agent/memory.test.mjs
+```
+
 ## 数据从哪来（`sources/k8s.mjs`）
 
 不调 `kubectl`，直接用 `node:https` 打 k8s API。三个理由：零依赖（kubectl 是 60MB 二进制，

@@ -193,6 +193,7 @@ export function buildShow(args) {
 
 export function makeTools(o = {}) {
   const source = o.source || 'host';
+  const memory = o.memory || null;
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
 
@@ -512,6 +513,78 @@ export function makeTools(o = {}) {
       }
       const from = MOCK_STATUS.mem;
       return { from, to, freedGB: +((from - to) * MOCK_STATUS.memTotal).toFixed(1), restarted: 'n8n' };
+    },
+  });
+
+  /* ── 长期记忆 ──
+   * 记忆不是"再给模型一个数据库"：抽取在每轮结束时自动发生（memory.mjs），
+   * 这里的三个工具只负责**人主动问起来**的场合。
+   * 少了它们，用户问"你记得我上次说什么吗"就只能靠系统提示里那几行，
+   * 而模型一旦想不起细节就会开始编 —— 编历史比忘事坏得多。 */
+  const noMem = () => ({ error: '这台机器上记忆还没起来（记忆库没打开）。如实说"我现在想不起来"。' });
+
+  add('memory_recall', {
+    level: 'safe',
+    describe: '去长期记忆里定向查一件事。用户问"我以前说过…吗""上次那个…"时用它。'
+      + ' 它按关键词和图上的邻近关系取，不是把全部记忆倒出来。',
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '要找的东西，用用户话说，例如 "n8n 端口"' },
+        k: { type: 'number', description: '要几条，默认 5，最多 8' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    run: async ({ query, k } = {}) => {
+      if (!memory) return noMem();
+      const n = Math.min(8, Math.max(1, Number(k) || 5));
+      const r = memory.recall(String(query || ''), n);
+      if (!r.facts.length) return { ok: true, found: 0, note: '记忆里没有相关的东西。不要编。' };
+      return {
+        ok: true,
+        found: r.facts.length,
+        facts: r.facts.map((f) => ({ text: f.text, when: f.when, about: f.about })),
+      };
+    },
+  });
+
+  add('memory_stats', {
+    level: 'safe',
+    describe: '看记忆里都有什么：多少条、哪些主题、最近记住了什么、上次巩固剪掉了什么。'
+      + ' 用户问"你记得什么""最近在忙什么"时用它，然后铺一屏给他看。',
+    schema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => {
+      if (!memory) return noMem();
+      const s = memory.stats();
+      /* 只回可读的那部分。节点 id、权重这些是给巩固用的，进上下文只是噪音。 */
+      return {
+        ok: true,
+        facts: s.facts,
+        entities: s.entities,
+        communities: s.communities,
+        pruned: s.pruned,
+        themes: s.themes,
+        recent: s.recent,
+        last: s.last,
+      };
+    },
+  });
+
+  add('memory_forget', {
+    level: 'danger',
+    describe: '把某件事从长期记忆里删掉（软删，能捞回来）。用户说"忘了这件事"时才用。',
+    schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: '要忘掉的那件事，用用户的话说' } },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    run: async ({ query }) => {
+      if (!memory) return noMem();
+      const r = memory.forget(String(query || ''));
+      if (!r.forgotten.length) return { ok: true, forgotten: [], note: '没找到对应的记忆' };
+      return { ok: true, forgotten: r.forgotten };
     },
   });
 

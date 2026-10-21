@@ -27,6 +27,7 @@ import { makeTools, defaultOverview } from './tools.mjs';
 import { createMockModel } from './model.mock.mjs';
 import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt } from './prompt.mjs';
+import { createMemory, EXTRACT_SYS } from './memory.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -121,6 +122,39 @@ function makeModel() {
   }
 }
 
+/* ───────────────────────── 长期记忆 ───────────────────────── */
+
+/* 抽取走**同一个模型配置**。理由在 memory.mjs 里：lobster 的原设计就是
+   "你就是抽取器"。多一个模型就是多一份 key、多一个延迟、多一种不一致。
+   它跑在后台，不挡回话 —— 抽一条事实的成本不该由用户等。 */
+let memModel = null;
+const memory = createMemory({
+  extractor: async (text) => {
+    /* mock 模型不会老实返回 JSON，本地跑协议时干脆不抽 —— 记忆本身照常可用 */
+    if (MODEL_ID === 'mock') return '{"facts":[]}';
+    memModel = memModel || makeModel();
+    const out = await memModel.complete({
+      messages: [
+        { role: 'system', content: EXTRACT_SYS },
+        { role: 'user', content: text },
+      ],
+    });
+    return out.content || '';
+  },
+});
+
+/** 记忆上下文拼进**第一条 system**，而不是另起一条 system。
+ *  另起一条在 OpenAI 兼容服务上不一定被接受（有的只认第一条 system），
+ *  而"改了第一条的内容"在协议上永远安全。 */
+function withMemory(messages, note) {
+  if (!note) return messages;
+  const i = messages.findIndex((m) => m.role === 'system');
+  if (i < 0) return [{ role: 'system', content: note }, ...messages];
+  const out = messages.slice();
+  out[i] = { ...out[i], content: `${out[i].content}\n\n${note}` };
+  return out;
+}
+
 async function getSession(sid) {
   let s = sessions.get(sid);
   if (!s) {
@@ -131,7 +165,7 @@ async function getSession(sid) {
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
       messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: buildSystemPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS }),
+      tools: makeTools({ source: SYS, memory }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
       abortCtl: null,       // 这一轮的中断开关（用户按停）
@@ -216,6 +250,7 @@ function speak(s, text) {
   /* 同一句话不记两次：一轮里"模型自由文本"和"兜底句"可能撞车 */
   const last = (s.log || [])[s.log.length - 1];
   if (!last || last.r !== 'a' || last.t !== t) pushLog(s, 'a', t);
+  s.lastSpoken = t;
   emit(s, { t: 'say', text: t });
 }
 
@@ -290,6 +325,9 @@ function describeDanger(name, args) {
       label: `写「${args.path}」？`,
       detail: `${String(args.content ?? '').length} 字，同名文件会被覆盖`,
     };
+  }
+  if (name === 'memory_forget') {
+    return { label: `忘掉「${args.query}」？`, detail: '从长期记忆里删掉。软删，能捞回来' };
   }
   if (name === 'k8s_restart') {
     return { label: `重启「${args.app}」？`, detail: '它正在做的事会中断，十几秒不可用' };
@@ -392,6 +430,22 @@ async function runTurn(s, goal) {
   s.lastSpecSig = null;
   s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
+  s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
+  s.lastSpoken = '';
+
+  /* 每轮取一次记忆。取的是**用户这句话**相关的几条 ——
+     不是把整本日记塞进去：7B 的窗口撑不住，而且它会开始复述过去。
+     取失败就当没有记忆，不能因为记忆服务而答不上一句话。 */
+  let memNote = '';
+  let memHits = [];
+  try {
+    const m = await memory.context(goal.kind === 'ask' ? goal.text : '');
+    memNote = m.text;
+    memHits = m.hits || [];
+  } catch (e) {
+    console.warn('[memory] 取上下文失败：' + e.message);
+  }
+  if (memHits.length) console.log(`[memory] 注入 ${memNote.length} 字，命中 ${memHits.length} 条`);
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
      所以它必须是会话的一部分，不能是旁路通道。 */
@@ -419,7 +473,7 @@ async function runTurn(s, goal) {
       let out;
       try {
         out = await s.model.complete({
-          messages: s.messages,
+          messages: withMemory(s.messages, memNote),
           tools: s.tools.schemas(),
           /* 第一轮的第一步**强制取证**。
              这不是不信任模型，是"先看再说"属于协议而不是建议：
@@ -427,7 +481,10 @@ async function runTurn(s, goal) {
              它把示例里的 71% 原样抄了出来）。让它自己决定要不要看，
              等于让最不可靠的一环决定"事实从哪来"。
              代价是纯闲聊也要付一次 sys_status —— 一次本地读 /proc，可以接受。 */
-          toolChoice: step === 0 && goal.kind === 'ask' ? 'required' : 'auto',
+          /* 强制取证是为了防止它凭空编读数。但**记忆里已经有答案**时，
+             强制调工具反而有害：实测它会去挑一个"看起来相关"的工具（k8s_get），
+             拿到与该问题无关的结果，然后什么也不说 —— 记忆就白存了。 */
+          toolChoice: step === 0 && goal.kind === 'ask' && !memHits.length ? 'required' : 'auto',
           goal: { ...goal, pendingTo: s.lastAdjustTo },
           signal: s.abortCtl.signal,
         });
@@ -580,6 +637,12 @@ async function runTurn(s, goal) {
               : result.surface ? `surface ${result.surface.root?.type || ''}`
                 : result.op ? `scene ${result.op}` : 'ok';
           console.log(`[tool] ${name} ${Date.now() - t0}ms ${tag}`);
+          /* 这一轮干过什么。它**不进**模型上下文（那会让模型变成在念流水账），
+             只在回合结束时交给记忆抽取：审计日志是"真实发生过的事"，
+             而真实发生过的事才是 L0 记忆该有的种子。 */
+          if (s.acts.length < 12) {
+            s.acts.push({ name, brief: JSON.stringify(args ?? {}).slice(0, 70), note: summarize(result) });
+          }
         }
 
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */
@@ -684,6 +747,9 @@ async function runTurn(s, goal) {
           s.lastList = result; s.listTurn = s.turn;
         }
         if (name === 'k8s_get' && result?.app) { s.lastDiag = result; s.diagTurn = s.turn; }
+        /* 记忆类工具各自记自己的回合：拿"这轮问过记忆"去判断"这轮看过文件"会铺错屏 */
+        if (name === 'memory_stats' && result?.ok) { s.lastMemStats = result; s.memTurn = s.turn; }
+        if (name === 'memory_recall' && result?.ok) { s.lastMemHits = result; s.memTurn = s.turn; }
 
         /* ── 渐进首屏 ──
            数据到手（1~2 秒）就先按真实读数铺开，不等模型想完整屏（4~9 秒）。
@@ -831,6 +897,57 @@ async function runTurn(s, goal) {
       emit(s, { t: 'note', message: '模型没给这一屏，由系统按诊断结果铺了一张卡' });
     }
 
+    /* 记忆类问题：兜底也要有一屏。
+       "你记得什么"最糟的答案是屏幕上只有一行字和一片空粒子 —— 那看起来像"什么都不记得"。
+       这里直接把 stats 铺成表，数字都是服务端自己算的，不经过模型转述。 */
+    const ms = s.memTurn === s.turn ? s.lastMemStats : null;
+    if (!s.drew && ms && ms.facts) {
+      s.drew = true;
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: {
+          title: '记得的事',
+          subtitle: `${ms.facts} 条记忆 · ${ms.entities} 个实体 · ${ms.communities} 个社群`,
+          root: {
+            type: 'table',
+            head: ['主题', '条数', '最近'],
+            rows: (ms.themes || []).map((t) => [t.label, String(t.n), t.last || '—']),
+          },
+        },
+      });
+      emit(s, { t: 'note', message: '模型没铺这一屏，由系统按记忆统计铺了一张表' });
+    }
+    const mh = s.memTurn === s.turn ? s.lastMemHits : null;
+    if (!s.drew && mh && mh.found) {
+      s.drew = true;
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: {
+          title: '记忆里的这几条',
+          subtitle: `共 ${mh.found} 条`,
+          root: { type: 'list', items: mh.facts.map((f) => ({ title: f.text, sub: f.when })) },
+        },
+      });
+      emit(s, { t: 'note', message: '模型没铺这一屏，由系统按回忆结果铺了一张卡' });
+    }
+
+    /* 记忆兜底：模型什么都没说、什么都没铺，但这轮明明从记忆里取到了东西。
+       沉默是最坏的答案 —— 用户会以为它不记得。这里把取到的那几条摆出来。 */
+    if (!s.spoke && !s.drew && memHits.length && s.goal?.kind === 'ask') {
+      s.drew = true;
+      s.spoke = true;
+      speak(s, '我记得这件事');
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: {
+          title: '记忆里是这么记的',
+          subtitle: `来自以前的会话 · ${memHits.length} 条`,
+          root: { type: 'list', items: memHits.map((h) => ({ title: h.text, sub: h.when })) },
+        },
+      });
+      emit(s, { t: 'note', message: '模型没有回答，由系统把记忆摆出来' });
+    }
+
     if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') {
       const line = s.lastVoice
         || (freshStatus
@@ -860,6 +977,18 @@ async function runTurn(s, goal) {
          这一句也进记录：它同样是"说出口的话"。 */
       speak(s, '停下了');
     }
+    /* 回合结束后台抽记忆。只抽问答回合：
+       手势回合里的话大多是"把内存拖到 34%"，那是一次操作，不是一件值得记住的事。
+       抽取失败只丢这一轮，不影响对话（memory.mjs 里自己 catch）。 */
+    if (!aborted && goal.kind === 'ask') {
+      memory.afterTurn({
+        sid: s.sid,
+        turn: s.turn,
+        user: goal.text,
+        reply: s.lastSpoken || '',
+        actions: s.acts || [],
+      }).catch(() => {});
+    }
     s.busy = false;
     s.abortCtl = null;
     emit(s, { t: 'idle' });
@@ -873,7 +1002,7 @@ const safeJSON = (v) => {
 };
 
 /* 工具名出现在"说的话"里 = 它在自言自语（"请调用 scene_ask ……"），不该给用户看 */
-const TOOL_WORDS = /(sys_status|app_list|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：
@@ -1019,6 +1148,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* 记忆。给调试和验收用：`GET /agent/api/memory?q=n8n`。
+     它也是"这台东西到底记不记得住"的**唯一可观测入口** ——
+     平时用户看不到记忆，出了问题也没法问它"你记了什么"。 */
+  if (p === '/api/memory' && req.method === 'GET') {
+    const q = u.searchParams.get('q') || '';
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      res.end(JSON.stringify(memory.debug(q), null, 1));
+    } catch (e) {
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
+    return;
+  }
+
   if (p === '/api/session') {
     const sid = u.searchParams.get('sid');
     const s = sid ? sessions.get(sid) : null;
@@ -1050,6 +1193,25 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
   }
 });
+
+/* 记忆要在开门之前就绪：第一个请求进来时可能立刻就要"你记得吗"。
+   它起不来只降级成无记忆，不能连累主循环 —— 一个打不开的库让整台桌面罢工，
+   是比失忆严重得多的事故。 */
+try {
+  await memory.start();
+} catch (e) {
+  console.warn('[memory] 启动失败，退化为无记忆模式：' + e.message);
+}
+
+/* 停机时把后台抽取跑完再走。kubectl delete pod 给的是 SIGTERM，
+   node 默认立刻退出 —— 那正好会把"最后一轮记忆"丢掉，而它往往是刚说完的那件正事。 */
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => {
+    try { await Promise.race([memory.drain(), new Promise((r) => setTimeout(r, 3000))]); } catch { /* 不等了 */ }
+    memory.stop();
+    process.exit(0);
+  });
+}
 
 server.listen(PORT, () => {
   console.log(`emergent-agent  http://127.0.0.1:${PORT}/agent/`);
