@@ -37,8 +37,9 @@ envoy ──► Service edge-desktop (80 → 91)
 
 ```bash
 # 1. 静态资源（在仓库根目录执行）
+#    index.html + src + vendor 是壳层；agent.html 是调试页，别漏（少它就只有 404 可点）
 ssh root@HOST 'mkdir -p /olares/emergent-shell/www'
-scp -r shell/index.html shell/src shell/vendor root@HOST:/olares/emergent-shell/www/
+scp -r shell/index.html shell/agent.html shell/src shell/vendor root@HOST:/olares/emergent-shell/www/
 
 # 2. 建 configmap / service / pod
 scp deploy/shell-k8s.yaml root@HOST:/root/
@@ -48,6 +49,10 @@ ssh root@HOST 'kubectl apply -f /root/shell-k8s.yaml'
 scp deploy/switch.sh root@HOST:/root/
 ssh root@HOST 'bash /root/switch.sh dev'
 ```
+
+> **`apply` 之后前端不会自己更新。** pod 是 `subPath` 挂 ConfigMap、静态文件走
+> hostPath，两边都不会因为你改仓库而变。改完前端必须重新 `scp`/`tar` 一次
+> （`/olares/emergent-shell/www`），改完 nginx 必须重建 pod。
 
 ## 登录页（auth）
 
@@ -197,19 +202,29 @@ kubectl delete pod emergent-agent -n user-space-bbbigdan
 kubectl apply -f agent-k8s.yaml
 ```
 
-**入口**：`https://<域名>/agent/`，由壳层的 nginx 转过去（`shell-k8s.yaml` 里的
-`location /agent/`）。前缀不剥 —— agent 自己认 `/agent/`，这样它的接口不会和
-官方 olares-app 的 `/api/*` 抢路径。
-
-这个地址现在是**桌面壳**，不是 agent 页。agent 已经是桌面的一层
-（`shell/src/deskagent.js`，见 `docs/场界面-设计与接口.md` §11）：
+**入口只有一个**：`https://desktop.bbbigdan.olares.com`（也就是桌面本身）。
+agent 是桌面的一层（`shell/src/deskagent.js`，见 `docs/场界面-设计与接口.md` §11）：
 
 - 鼠标贴到底边 → 粒子下沉、边缝亮起；点击或上拖 → 场从桌面里展开
 - 双击桌面空白 → 同样展开
 - Esc → 收起，粒子散回球面
 
-`agent.html` 还留着，但它只是"把场单独拿出来看"的调试页。
-`?dev=1` 才显示观察窗/连接状态；`?apps=demo` 不带登录态也能把桌面立起来（调 UI 用）。
+`/agent/` **不是入口，是接口的挂载点**：壳层 nginx（`shell-k8s.yaml` 的
+`location /agent/`）把整段前缀转给 agent pod，前缀不剥 —— agent 自己认 `/agent/`，
+这样它的 `/api/*` 不会和官方 olares-app 抢路径。前端因此必须写**根绝对**路径
+`/agent/api/send`：写相对 `api/send` 只在调试页（页面就挂在 `/agent/` 下）成立，
+放到桌面根上会被解析成 `/api/send`、被反代回官方 pod 拿到 404，而且不报错 ——
+表现为"场展开了，但永远停在 connecting"。
+
+> 注意区分：`bbbigdan.olares.com` 是 Olares 门户，`desktop.bbbigdan.olares.com`
+> 才是被 `edge-desktop` 这个 Service 接管的那台桌面。改完前端要 `scp` 到
+> `/olares/emergent-shell/www`（壳层）**和** `/olares/emergent-agent/app/shell`
+> （agent pod 自己的 `WEB_ROOT`，调试页/隧道用它）两处，否则你会在两个地址上
+> 看到两个不同版本的界面。
+
+`agent.html` 还留着，但它只是"把场单独拿出来看"的调试页（`/agent/agent.html`）。
+`?dev=1` 才显示观察窗/连接状态；`?apps=demo` 不带登录态也能把桌面立起来（调 UI 用）；
+`?debug=1` 把 `window.__em` 挂出去，给 CDP 量粒子状态。
 
 **踩过的坑：**
 

@@ -163,8 +163,17 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   let es = null;
 
+  /* 接口一律走根绝对路径 `/agent/api/*`。
+   *
+   * 相对路径只在"页面正好挂在 /agent/ 下面"时才对（agent.html 就是）。
+   * 但这一层是**桌面**：浏览器地址是 desktop.<id>.olares.com 的 `/`，
+   * 相对的 `api/send` 会被解析成 `/api/send`，然后被壳层 nginx 原样反代回
+   * 官方的 olares-app:91 —— 返回 404，EventSource 一直重连，
+   * 表现就是"场展开了，但永远停在 connecting"。 */
+  const API = '/agent/api';
+
   function send(msg) {
-    return fetch('api/send', {
+    return fetch(`${API}/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sid, ...msg }),
@@ -173,7 +182,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   function connect() {
     if (es) return;
-    es = new EventSource(`api/events?sid=${sid}`);
+    es = new EventSource(`${API}/events?sid=${sid}`);
     es.onmessage = (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch { return; }

@@ -6,7 +6,7 @@
 const TOKEN_KEY = 'ed_token';
 
 export function terminusBase() {
-  // desktop.bbigdan.olares.com -> bbbigdan.olares.com
+  // desktop.bbbigdan.olares.com -> bbbigdan.olares.com
   const h = location.host;
   return h.startsWith('desktop.') ? h.slice('desktop.'.length) : h;
 }
