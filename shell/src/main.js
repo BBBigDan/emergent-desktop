@@ -9,6 +9,7 @@ import { ShellWindow } from './window.js';
 import { createRail } from './rail.js';
 import { createLauncher } from './launcher.js';
 import { createStatus } from './status.js';
+import { createDeskAgent } from './deskagent.js';
 import { myApps, gotoLogin, logout, terminusBase } from './api.js';
 
 /* WebGL 起不来时别静默失败：整个桌面就只剩一块渐变背景，没有任何报错。
@@ -31,6 +32,9 @@ const boot = document.getElementById('boot');
 let rail = null;
 let launch = null;
 let status = null;
+/* 桌面里的 agent：不是页面，是这一层。唤出时它接管同一批粒子，
+   桌面（应用栏 / 启动台 / 状态面板）让位；收起时粒子散回球面。 */
+let agent = null;
 
 window.addEventListener('resize', () => {
   field.resize();
@@ -165,9 +169,38 @@ function escapeHtml(s) {
 }
 
 /* ------------------------------- 启动 ------------------------------- */
+
+/* `?apps=demo`：不带登录态也能把桌面立起来。
+ * 调 UI（尤其是 agent 这一层）不该先过一次 SSO —— 它和登录本来就没关系。
+ * 图标是粒子按名字生成的，所以这里不需要真实 icon。 */
+function demoApps() {
+  if (new URLSearchParams(location.search).get('apps') !== 'demo') return null;
+  return [
+    { id: 'files', name: 'files', title: 'Files', icon: '', host: 'about:blank', openMethod: 'default' },
+    { id: 'vault', name: 'vault', title: 'Vault', icon: '', host: 'about:blank', openMethod: 'default' },
+    { id: 'n8n', name: 'n8n', title: 'n8n', icon: '', host: 'about:blank', openMethod: 'default' },
+    { id: 'navidrome', name: 'navidrome', title: 'Navidrome', icon: '', host: 'about:blank', openMethod: 'default' },
+  ];
+}
+
 (async function start() {
   try {
-    const apps = await myApps();
+    /* agent 先挂上：它不需要应用列表，但它是这个桌面的"底" ——
+       用户任何时候贴着底边都该能把它拉出来，哪怕应用列表还没到。 */
+    agent = createDeskAgent({
+      field,
+      onOpenChange: (v) => {
+        if (!v) return;
+        /* 场被 agent 接管时，桌面的三处"边缘 UI"先收拢：
+           它们用的是各自的粒子段，不会覆盖场，但同时在屏幕上就是三套东西在说话。 */
+        rail?.close();
+        launch?.close();
+        field.setLaunchMode(0);
+        status?.close();
+      },
+    });
+
+    const apps = demoApps() || await myApps();
 
     rail = createRail({
       apps,
@@ -210,7 +243,7 @@ function escapeHtml(s) {
 
     /* ?debug=1 时把内部对象挂出去，便于用 CDP 量粒子状态 */
     if (new URLSearchParams(location.search).has('debug')) {
-      window.__em = { field, rail, launch, status, wins, cycleLaunch };
+      window.__em = { field, rail, launch, status, wins, cycleLaunch, agent };
     }
 
     boot.classList.add('hide');
@@ -242,8 +275,9 @@ function toggleFullscreen() {
   d.documentElement.requestFullscreen?.({ navigationUI: 'hide' }).catch(() => {});
 }
 
-// Esc：先退出应用列表，再收应用栏，都没有就关最上层窗口
+// Esc：先收 agent，再退出应用列表，再收应用栏，都没有就关最上层窗口
 const _esc = () => {
+  if (agent?.isOpen()) { agent.close(); return; }
   if (field.launchMode) { launch?.close(); field.setLaunchMode(0); return; }
   if (rail?.isOpen()) { rail.close(); return; }
   let top = null;
@@ -251,6 +285,12 @@ const _esc = () => {
   top?.requestClose();
 };
 window.addEventListener('keydown', (e) => {
+  /* 在输入框里打字时，按键归输入框。不排除的话，跟 agent 说话时打一个 "f"
+     就会整个桌面进全屏 —— 而且用户完全不知道是自己打出来的。 */
+  const t = document.activeElement;
+  const typing = t instanceof Element
+    && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+  if (typing && e.key !== 'Escape') return;
   if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey && !e.altKey) {
     toggleFullscreen();
     return;

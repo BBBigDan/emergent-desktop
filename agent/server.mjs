@@ -729,8 +729,12 @@ const server = http.createServer(async (req, res) => {
   /* ── 静态 ──
    * WEB_ROOT 指向**装页面那个目录**（默认仓库里的 shell/），于是页面里的
    * 相对引用 `./src/field.js` 天然对应 `/src/field.js`。
-   * 部署进集群时把它指到 /app/shell，路径规则一个字不用改。 */
-  let file = path.join(WEB_ROOT, p === '/' ? 'agent.html' : p);
+   * 部署进集群时把它指到 /app/shell，路径规则一个字不用改。
+   *
+   * 根路径给**桌面壳**，不是 agent 页：agent 已经是桌面的一层（deskagent.js），
+   * 不再是一个独立页面。agent.html 还留着，但它现在只是"把场单独拿出来看"
+   * 的调试页（?dev=1 那套观察窗还在上面）。 */
+  let file = path.join(WEB_ROOT, p === '/' ? 'index.html' : p);
   if (!file.startsWith(WEB_ROOT)) { res.writeHead(403).end('forbidden'); return; }
   try {
     const st = await fs.stat(file);

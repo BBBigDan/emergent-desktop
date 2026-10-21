@@ -247,6 +247,9 @@ export class Field {
     this.drawA = new Float32Array(n);
     this.drawS = new Float32Array(n);
     this.drawD = new Float32Array(n);       // 逐点出场延迟（0..1，drawOn 用）
+    /* 窗口边缘粒子的整体亮度（agent 展开时退到 0，见 step） */
+    this.rimDim = 1;
+    this.rimTo = 1;
     this.drawUse = new Uint8Array(n);       // 哪几颗点被这幅画借走了
     this.drawCol = new Float32Array(n * 3);
     this.drawMix = 0;                        // 当前混合量
@@ -610,6 +613,10 @@ export class Field {
     const UI = '#boot, .win, .win-glow, .rail-zone, .stat-zone';
 
     const down = (e) => {
+      /* uiLock：场被 agent 接管期间，桌面不许抢指针。
+         不只是"转了球不好看" —— agent 拖仪表的那一下会被这里当成拖动，
+         球跟着转、仪表跟着动，两个东西同时在响应同一只手。 */
+      if (this.uiLock) return;
       if (id !== null || e.button !== 0) return;
       if (e.target instanceof Element && e.target.closest(UI)) return;
       id = e.pointerId;
@@ -1810,6 +1817,20 @@ export class Field {
 
   slotBegin(opt = {}) {
     if (!this.col0) this.col0 = this.col.slice();
+    /* 先把上一轮占用过的点交还给环境。
+     *
+     * 只 `drawUse.fill(0)` 是不够的：那只是"这张工牌作废"，而点的 alpha
+     * 还停在旧值上。换场之后没有任何人再负责把它们写回去 —— 它们就原地亮着，
+     * 亮成了上一屏的化石。实测症状：开着窗口唤出 agent，窗口边缘残留一圈旧点，
+     * 看起来像"agent 被关在窗口里"。
+     *
+     * 交还的方式不是置 0（那会让桌面球面凹掉一块），而是恢复成环境点的
+     * 基础亮度与大小 —— 它们重新成为背景的一部分，位置由球面目标拉回去。 */
+    for (let i = 0; i < AMBIENT_N; i++) {
+      if (this.drawUse[i] !== 1) continue;
+      this.alpha[i] = this.baseA[i];
+      this.size[i] = this.baseS[i];
+    }
     this.drawUse.fill(0);
     this.drawN = 0;
     this.drawSeen = true;
@@ -2360,7 +2381,7 @@ export class Field {
         this.vel[i2 + 1] = 0;
         /* 飞的时候要整束看得见；快落进核心时按 spread 稀疏（不然核心是死白） */
         const thin = lerp(1, this.pu[i] < 0.42 ? 1 : 0.20, smooth(0.84, 1, uf));
-        this.alpha[i] = this.baseA[i] * heat * smooth(0, 0.14, uf) * thin;
+        this.alpha[i] = this.baseA[i] * heat * smooth(0, 0.14, uf) * thin * this.rimDim;
         this.size[i] = this.baseS[i] * 1.05;
       } else {
         /* 环流 + 长大：弹簧追目标（原型用 560/64，滞后几 px，柔软但不散） */
@@ -2380,7 +2401,7 @@ export class Field {
             if (du < 0.09) pk = Math.max(pk, Math.exp(-((du / 0.03) ** 2)));
           }
         }
-        let a = this.baseA[i] * dimK * heat;
+        let a = this.baseA[i] * dimK * heat * this.rimDim;
         if (spread > 0.01) a *= lerp(1, this.pu[i] < 0.42 ? 1 : 0.20, spread);
         /* 晕在小团阶段要**更亮**：它是"这一团在流动"的观感来源（壳层背景本来就很亮，
            照原型那样把它压到 0.45 就直接看不见了），撑开后再压回原型的比例 */
@@ -2469,6 +2490,17 @@ export class Field {
   step(dt) {
     this.time += dt;
     const t = this.time;
+
+    /* 桌面让位系数：agent 展开时，窗口边缘那圈粒子要跟着 DOM 一起退掉。
+     *
+     * 只靠 CSS 淡 out 窗口是不够的 —— 边框是**粒子**画的，CSS 碰不到它。
+     * 结果就是"agent 被框在窗口里"：DOM 淡了，框还亮着。
+     * 平滑过渡而不是直接置 0：窗口边上是一股一直在流的粒子，硬切会像断了电。 */
+    this.rimDim += (this.rimTo - this.rimDim) * Math.min(1, dt * 3.4);
+    /* 指数收敛永远差最后一口气：0.002 的 alpha 单颗看不见，
+       但窗口四角挤着几百颗，加法混合叠起来就是一道看得见的框。
+       所以贴近目标时直接吸附 —— 这一层要么在，要么彻底不在。 */
+    if (Math.abs(this.rimDim - this.rimTo) < 0.01) this.rimDim = this.rimTo;
 
     /* ---- 空闲态判定：所有窗口都关了 → 粒子聚成形态 ---- */
     const busy = this.groups.some((g) => g.active || g.closing);

@@ -148,7 +148,12 @@ export class FieldScene {
     this.jitter = spec.mood === 'alert' ? 1.1 : spec.mood === 'working' ? 0.55 : 0.3;
     if (this.reduced) this.jitter *= 0.35;
 
-    f.slotBegin({ dim: 0.97, dot: 0.95 });
+    /* dim 是"没被占用的环境粒子"还留多亮。
+     *
+     * 原来是 0.97：桌面球面和场几乎一样亮，两套点阵叠在一起，分不清哪层是界面。
+     * 场展开时桌面本该让位 —— 0.62 让球退成很淡的底噪，它还在（用户知道桌面没走），
+     * 但不再和仪表抢注意力。 */
+    f.slotBegin({ dim: 0.62, dot: 0.95 });
 
     const list = (spec.layers || []).filter((x) => x && x.kind);
     /* 只有 focus 那一个进 L2（凝聚成字），其余只给形状 —— 这是注意力分层，
@@ -696,7 +701,10 @@ export class FieldScene {
     const y = hasFork ? a.y + 372 : a.y + 588 + i * 26;
     const t = new ParticleText({
       field: f, alloc: this.alloc, x: a.x + a.w / 2, y, size: 17, max: 20,
-      color: hasFork ? '#93b8d8' : COL.dim, align: 'center', font: FONT, label: `c-${spec.id}`,
+      /* 结论是**要读的**，不是装饰。原来用 COL.dim（#5d7fa4）：
+         在满屏环境粒子上几乎看不见 —— 字被背景点吃掉了，
+         用户只会觉得"这里好像有点东西"。 */
+      color: hasFork ? '#93b8d8' : '#8ab4d8', align: 'center', font: FONT, label: `c-${spec.id}`,
     });
     t.set(spec.text || '');
     this.texts.push(t);
@@ -872,9 +880,14 @@ export class FieldScene {
     const k = Math.max(0, Math.min(layer.N - 1, Math.round(s * (layer.N - 1))));
     layer.peak.x = layer.xs[k];
     layer.peak.y = Math.max(layer.box.yTop + 2, layer.ys[k] - 20);
-    /* "峰" 而不是 "↑"：点阵字里的箭头只有三个点，16px 下读起来像 "1"，
-       于是 "↑68%" 被看成 "168%"。中文在这里反而更清楚。 */
-    layer.peak.set(`峰${Math.round(peak * 100)}%`, { force: true });
+    /* 只写数字，不写前缀。
+     *
+     * 试过两种前缀，都不行：
+     *   "↑" —— 点阵字里箭头只有三个点，16px 下读成 "1"，"↑68%" 成了 "168%"；
+     *   "峰" —— 这个标注用的是 FONT_LAT（Bahnschrift），**它没有中文字形**，
+     *          浏览器回退到别的字体，采样出来是另一个字（实测显示成 "故43%"）。
+     * 位置本身已经说明它是"这一段里的最高点"，数字就够了。 */
+    layer.peak.set(`${Math.round(peak * 100)}%`, { force: true });
   }
 }
 

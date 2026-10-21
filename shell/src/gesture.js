@@ -56,6 +56,9 @@ export class GestureTracker {
     this.onEnd = o.onEnd || (() => {});
     this.now = o.now || (() => performance.now());
     this.g = null;
+    /* 桌面平时也在监听：agent 收起时这一层不该接管指针，
+       否则在窗口/图标上点一下也会被当成"点了场上某个元素"。 */
+    this.enabled = true;
   }
 
   attach(target = window) {
@@ -67,6 +70,7 @@ export class GestureTracker {
   }
 
   down(x, y) {
+    if (!this.enabled) return this;
     const hit = this.pick(x, y);
     this.g = {
       x0: x, y0: y, x, y, t0: this.now(),
