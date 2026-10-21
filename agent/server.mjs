@@ -208,6 +208,8 @@ function speak(s, text) {
     .replace(/!\[[^\]]*\]\([^)]*\)?/g, '')
     .replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
     .replace(/https?:\/\/\S{40,}/g, '')
+    /* 行内 markdown 记号在点阵里就是几个多余的符号：「`~/Downloads`」会原样画出来 */
+    .replace(/[*`_]{1,2}([^*`_]+)[*`_]{1,2}/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
   if (!t) return;
@@ -763,15 +765,22 @@ async function runTurn(s, goal) {
     const ls = sc ? null : (s.listTurn === s.turn ? s.lastList : null);
     if (!s.drew && (sc || ls)) {
       const spec = sc
-        ? {
-          title: '最占地方的几项',
-          subtitle: `${sc.path || '~'} · 共 ${sc.totalText}`,
-          root: {
-            type: 'table',
-            head: ['名字', '占用'],
-            rows: sc.items.map((i) => [i.path || i.name, i.sizeText]),
-          },
-        }
+        ? (sc.totalBytes === 0
+          ? {
+            title: '这儿是空的',
+            subtitle: `${sc.path || '~'} · 共 0B`,
+            /* 一张全是 0B 的表看起来像"没查到"，不如直说 */
+            root: { type: 'text', text: '这几个目录里都没有文件。' },
+          }
+          : {
+            title: '最占地方的几项',
+            subtitle: `${sc.path || '~'} · 共 ${sc.totalText}`,
+            root: {
+              type: 'table',
+              head: ['名字', '占用'],
+              rows: sc.items.map((i) => [i.path || i.name, i.sizeText]),
+            },
+          })
         : {
           title: `${ls.path || '~'} 里有什么`,
           subtitle: `共 ${ls.total} 项`,
