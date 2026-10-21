@@ -10,7 +10,7 @@ jobs:
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: bbigdan   # 假设：GHCR 按登录名解析 installation，大小写敏感
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: 三种命名各推一次
         run: |
