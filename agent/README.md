@@ -77,6 +77,69 @@ node agent/memory.test.mjs        # 用 SQLite 那份跑全部逻辑
 
 侧车的接口、wheel 怎么重建、怎么排障：见 `deploy/README.md` 的"记忆侧车（axolotl）"。
 
+## 自造工具（M4）
+
+不可能给每个应用写适配器。所以给它一套"读文档 → 写脚本 → 试跑 → 装起来"的流程，
+产物是**用户能在 Files 里打开、改、删的普通文件**：
+
+```
+~/Agent/tools/<name>/manifest.json    叫什么、要什么参数、要碰什么（needs）、版本
+~/Agent/tools/<name>/run.mjs|run.cjs  脚本，只用 node 内建模块
+~/Agent/tools/<name>/history/         旧版本（改了代码就归档，可回滚）
+~/Agent/skills/<slug>.md              "该怎么做"，会进系统提示
+~/Agent/audit/tools-<day>.jsonl       每次调用一行：谁、什么参数、多久、成没成
+```
+
+| 工具 | 干什么 |
+|---|---|
+| `web_get` | 读一个 http 文档（造工具之前先看） |
+| `tool_write` | 起个头：名字 / 说明 / 参数表 / net + fs（都可以不填），**落成草稿** |
+| `tool_code` | 单独贴脚本（只有 name + code 两个字段） |
+| `tool_try` | 试跑一次（danger，过审批；审批前系统会把代码铺到屏幕上） |
+| `tool_keep` | 注册，之后每轮工具表里都有它（danger） |
+| `tool_list` | 已装的 + 草稿 |
+| `skill_save` | 记一页"以后就这么办" |
+
+**三处不由模型决定的地方，也是这层的全部价值：**
+
+1. **草稿不是工具。** `tool_write` 只落盘（`manifest.json` 里 `status: draft`），
+   下一轮的工具表里没有它。只有 `tool_keep`（用户点过头）之后才注册。
+   改一个已发布的工具，状态自动退回 draft —— 改了代码就得重新看一眼。
+2. **域名清单由运行时强制，而且它有两个来源**（`agent/tools/guard.mjs`，靠
+   `node --import` 先于脚本执行）。生效的清单 = `manifest.needs.net` ∪ **从代码里读出来的
+   完整 URL**（只对 `level: confirm` 生效）。两个来源都会摆到审批卡上：卡片上写的是
+   "这一次真的能连哪些"，不是"模型说它能连哪些"。
+   **读不出来的地址一律拒** —— 拼出来的域名（`['evil','example','org'].join('.')`）
+   不会出现在卡片上，也就进不来。这是护栏真正挡的东西：不是"它想连什么"，
+   而是"卡片没说的那一部分"。
+   文件：`fs` 三套 API（同步 / 回调 / promises）全部包住，路径不在 `needs.fs` 里直接抛，
+   `rename(from,to)` 两个参数都要过。进程：`child_process` / `process.binding` /
+   `process.dlopen` 一律禁。子进程环境只给 `PATH / HOME / TZ / EM_TOOL_ARGS / EM_TOOL_NEEDS` ——
+   给全了等于把集群令牌一起递过去。
+   `tool_keep` 时会把读出来的域名落进 `manifest.needs.net`，之后再跑就不用推断了；
+   用户翻 `~/Agent/tools` 也能看到它要连哪儿。
+3. **每次调用进审计。** 自造工具是这台机器上唯一"行为不预先确定"的东西。
+
+它不是沙箱。同一进程里的 JS 总能绕（`process.mainModule` 之类），
+它把"偷偷连一个域名"从一行 `fetch` 变成"对着要给人看的 manifest 撒谎"。
+这是**知情**级别的防护，真隔离得上容器，那是另一件事。
+
+**为什么代码要单独发**（`tool_code` 而不是 `tool_write` 一把梭）：
+实测 7B 让它在一个 JSON 里同时写 `params` 和三十行脚本，它会**静默地**只发
+`name/description/params`，`code` 根本不在参数里 —— 然后重试十次都一样，
+屏幕上只看到"少了必填参数 code"。拆成"元数据"和"代码"两步之后，
+最难的那一步只剩一个字符串字段。
+
+自测（不需要模型、不需要集群）：
+
+```
+node agent/tools/forge.test.mjs   # 31 项：拼出来的域名被拒、越权文件被拒、代码里读得到的放行、
+                                  # 超时被杀、版本与审计、忘填参数时兜底、扁平 needs 与继承
+```
+
+（Pod 里也能跑：`kubectl exec … -c agent -- sh -c 'cd /app && node agent/tools/forge.test.mjs'`，
+顺便验证 Linux 上的路径守卫。）
+
 ## 数据从哪来（`sources/k8s.mjs`）
 
 不调 `kubectl`，直接用 `node:https` 打 k8s API。三个理由：零依赖（kubectl 是 60MB 二进制，

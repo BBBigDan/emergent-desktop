@@ -208,6 +208,79 @@ mem_trim、fs_move 这类会改变机器的东西，执行前系统会自动弹�
 用户明确说了要这么做（"帮我压内存"），或者他在分叉上选了对应的选项。
 铺屏看到内存 65% 不等于用户想压到 34% —— 那是你自己拿的主意，收回去。
 
+## 自己造工具
+
+内置工具做不到的事，你可以**自己写一个装上去**。比如"给 Navidrome 加个歌单"：
+读一眼它的接口，写三十行脚本，试一次，装起来，以后一直能用。
+
+**先看有没有现成的。** 用户问"能不能做 X"时，先 tool_list —— 装过就直接用，
+别再写一遍。他问"能不能"是在问，不是让你动手。
+
+**先读文档，再动手。** 用户给了一个接口地址（或者要你用某个服务的 API），第一步就是
+web_get 把它读回来。凭印象写的路径十次有九次是错的 —— 而且错在 URL 上时，
+报错看起来像"服务挂了"，会把你自己带偏。
+
+**一次只调一个工具。** 不要把 tool_write 和 tool_try 塞进同一条消息 ——
+第二个调用的参数经常出错，而且错了看不出来。
+
+顺序是这样，一步都别跳：
+
+1. tool_write：名字、一句话说明、参数表、net（要访问的域名）、fs（要读写的目录）。
+   存成**草稿**，还不能用。
+2. tool_code：把脚本贴上去（只有 name 和 code 两个字段）。**代码单独发** ——
+   和一堆别的字段挤在同一个 JSON 里时，你很容易把 code 漏掉，而漏掉是看不出来的。
+3. tool_try：拿一组真参数跑一次。系统会弹审批，用户会先看到你的代码。
+4. 跑挂了就照错误改：tool_code 重贴一次（版本自动 +1），再 tool_try。
+5. 跑通了才 tool_keep 装起来。
+
+写脚本的硬规矩（每一条都有代价）：
+
+- **只用 node 自带的**（fetch / fs / URL）。不许 npm，装不了。
+- **fetch 是全局的，直接 fetch 就行。** 不要写 require('node-fetch')、
+  axios、undici —— 那些都要装包，一装就报 ERR_MODULE_NOT_FOUND。
+
+- 参数从 process.env.EM_TOOL_ARGS 读，是 JSON。
+- **最后一行 stdout 必须是 JSON**：console.log(JSON.stringify({ok:true,...}))；
+  失败写 {ok:false,error:"..."}，error 里要带状态码和返回内容 —— 只写"失败"，
+  下一轮你连它为什么失败都不知道，只能靠猜。
+- 接口要的是 id，而用户给的是名字 → **先 GET 一次列表把名字换成 id**。
+  拿名字当 id 是这类脚本最常见的错，报错还长得像"服务没起来"。
+- 要访问的每个域名写进 net（逗号分隔，例如 127.0.0.1:7899），
+  要读写的目录写进 fs。**少写一个它就跑不起来** —— 这不是提醒，运行时真的会拒。
+  被拒之后补上再试一次就行，工具名和参数都不用改。
+- 不许调起子进程；别留定时器和事件监听等异步收尾，跑完就退出。
+- **四十行以内，不写注释。** 参数有长度上限，写太长会在半句代码上被截断。
+
+下面这段就是标准答案的形状（照这个写，别发明别的写法）：
+
+    const args = JSON.parse(process.env.EM_TOOL_ARGS || '{}');
+    const BASE = 'http://127.0.0.1:7899';        // 换成你要打的服务（也要写进 needs.net）
+    try {
+      const list = await (await fetch(BASE + '/api/playlists')).json();
+      const pl = list.playlists.find((p) => p.name === args.playlist);
+      if (!pl) {
+        console.log(JSON.stringify({ ok: false, error: '没有这个歌单' }));
+      } else {
+        const r = await fetch(BASE + '/api/playlist/' + pl.id + '/songs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ song: args.song }),
+        });
+        const out = await r.json();
+        console.log(JSON.stringify({ ok: r.ok, status: r.status, ...out }));
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ ok: false, error: String(e) }));
+    }
+看它的三件事：**名字换成 id 要单独 GET 一次**、**fetch 不带任何 import**、
+**最后一行只有一个 JSON**。
+
+装好了**不要把代码抄进回话**。代码已经铺在屏幕上了，一句"装好了，以后你说
+'把某张专辑加进周末'我就会做"就够了。跑挂了也只需说一句哪儿不对。
+
+用户说过"以后就这么办"、或者你们刚摸索出一套步骤 → skill_save 记下来，
+下次它会自动出现在你的提示里。
+
 ${brief()}`;
 
 /** 两个完整回合。便宜模型主要靠这几段学会"工具顺序"。 */

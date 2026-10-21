@@ -28,6 +28,7 @@ import { createMockModel } from './model.mock.mjs';
 import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
+import { createForge } from './tools/forge.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -146,6 +147,12 @@ const memory = createMemory({
 /** 记忆上下文拼进**第一条 system**，而不是另起一条 system。
  *  另起一条在 OpenAI 兼容服务上不一定被接受（有的只认第一条 system），
  *  而"改了第一条的内容"在协议上永远安全。 */
+/* ───────────────────────── 自造工具 ─────────────────────────
+ * 用户目录下的 ~/Agent/tools（脚本 + manifest）和 ~/Agent/skills（做法）。
+ * 和记忆一样是可降级的：没挂上用户目录就只有内置工具，对话照常。 */
+/* TOOLBOX_HOME 只给本地调试用：没有 /userspace 时也能把工具落到一个干净的目录里 */
+const forge = createForge({ home: process.env.TOOLBOX_HOME || '' });
+
 function withMemory(messages, note) {
   if (!note) return messages;
   const i = messages.findIndex((m) => m.role === 'system');
@@ -165,7 +172,7 @@ async function getSession(sid) {
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
       messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: buildSystemPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS, memory }),
+      tools: makeTools({ source: SYS, memory, forge }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
       abortCtl: null,       // 这一轮的中断开关（用户按停）
@@ -271,9 +278,15 @@ function hear(s, text, r = 'u') {
  * 所以只有"模型自己拿的主意"才走这道门。
  */
 function needsGate(s, name) {
-  if (s.tools.level(name) !== 'danger') return false;
+  const lv = s.tools.level(name);
+  /* `confirm` 也是门。自造工具默认就是 confirm（文档 §5："默认 confirm"），
+     之前只认 danger，等于所有自造工具都不用点头就跑了 —— 实测一轮里
+     "把 So What 加进周末"直接执行，卡片没出现。名字叫 confirm 的东西不该静默执行。 */
+  if (lv !== 'danger' && lv !== 'confirm') return false;
   const g = s.goal;
-  const explicit = g?.kind === 'intent' && g.intent?.kind === 'pick';
+  /* 不过"用户在分叉上点过这个选项"只对 danger 有效：那是明确的授权；
+     自造工具每次动手都要看见一次（它要做的事不预先确定）。 */
+  const explicit = lv === 'danger' && g?.kind === 'intent' && g.intent?.kind === 'pick';
   return !explicit;
 }
 
@@ -292,8 +305,22 @@ function asksOnly(s) {
 }
 
 function requestApproval(s, { id, name, args }) {
-  return new Promise((resolve) => {
-    const d = describeDanger(name, args);
+  return new Promise(async (resolve) => {
+    /* "首次运行必须看代码"那道门。
+       顺序是**先看代码、再问要不要跑** —— 反过来就是"你先答应，代码待会儿再说"，
+       那不叫知情。代码由系统自己去磁盘读，不经模型转述。 */
+    try {
+      await showToolCode(s, name, args);
+    } catch (e) {
+      console.warn('[forge] 代码预览失败：' + e.message);
+    }
+    /* 它要连哪儿，由系统从代码里读出来，写进卡片 —— 模型填不对 needs.net，
+       但代码是它写的，代码里有什么我们看得见。 */
+    let extraNet = null;
+    if (name === 'tool_try' && args?.name) {
+      try { extraNet = await forge.inferred(args.name); } catch { extraNet = null; }
+    }
+    const d = describeDanger(s, name, args, extraNet);
     s.pending = { id, resolve };
     emit(s, { t: 'approval', id, tool: name, args, label: d.label, danger: d.detail });
     const timer = setTimeout(() => {
@@ -306,8 +333,41 @@ function requestApproval(s, { id, name, args }) {
   });
 }
 
+/** needs 变成人话：审批卡上那一行小字。 */
+function needsText(needs) {
+  const net = needs?.net || [];
+  const fs = needs?.fs || [];
+  const bits = [];
+  if (net.length) bits.push(`访问 ${net.join('、')}`);
+  if (fs.length) bits.push(`读写 ${fs.join('、')}`);
+  return bits.length ? bits.join(' · ') : '不碰网络和文件';
+}
+
+/** 把要跑的那份代码铺到场里。同一份代码在同一会话里只铺一次。 */
+async function showToolCode(s, name, args) {
+  const target = name === 'tool_try' ? args?.name
+    : name === 'tool_keep' ? args?.name
+      : (s.tools.isDynamic(name) ? name : null);
+  if (!target) return;
+  s.codeShown = s.codeShown || new Set();
+  const key = `${target}`;
+  if (s.codeShown.has(key)) return;
+  const info = await forge.code(target);
+  if (!info) return;
+  s.codeShown.add(key);
+  s.drew = true;
+  emit(s, {
+    t: 'surface', op: 'set',
+    spec: {
+      title: `${info.name}${info.status === 'draft' ? '（草稿）' : ''}`,
+      subtitle: `v${info.version} · ${needsText(info.needs)}`,
+      root: { type: 'code', lang: 'javascript', code: info.code.slice(0, 6000) },
+    },
+  });
+}
+
 /** 审批卡片要两段文字：一句短的进分叉（场里字很少），一句长的进日志（能说清代价） */
-function describeDanger(name, args) {
+function describeDanger(s, name, args, extraNet) {
   if (name === 'mem_trim') {
     return {
       label: `压到 ${Math.round(args.to * 100)}%？`,
@@ -331,6 +391,26 @@ function describeDanger(name, args) {
   }
   if (name === 'k8s_restart') {
     return { label: `重启「${args.app}」？`, detail: '它正在做的事会中断，十几秒不可用' };
+  }
+  if (name === 'tool_try') {
+    const m = s.tools.all?.[String(args?.name || '')] || {};
+    /* 合并 declare 的和从代码里读出来的，去重后一起说。
+       用户看到的必须是"这一次真的能连哪些"。 */
+    const net = [...new Set([...(m.needs?.net || []), ...(extraNet || [])])];
+    return {
+      label: `试跑「${args?.name}」？`,
+      detail: `${needsText({ net, fs: m.needs?.fs || [] })}。上面是它要跑的代码`,
+    };
+  }
+  if (name === 'tool_keep') {
+    return {
+      label: `把「${args?.name}」装起来？`,
+      detail: '以后每次用到它都会再问你一次（除非它自己声明成不需要问）',
+    };
+  }
+  if (s.tools.isDynamic(name)) {
+    const m = s.tools.all?.[name] || {};
+    return { label: `用「${name}」动手？`, detail: needsText(m.needs) };
   }
   return { label: `${name}？`, detail: '会改变这台机器上的东西' };
 }
@@ -368,6 +448,8 @@ const summarize = (r) => {
   if (r.freedGB != null) return `释放 ${r.freedGB} GB`;
   if (r.cpu != null) return `CPU ${Math.round(r.cpu * 100)}% · 内存 ${Math.round(r.mem * 100)}%`;
   if (r.lines) return `${r.lines.length} 行日志`;
+  if (r.version != null && r.name && (r.status || r.already)) return `${r.name} v${r.version}`;
+  if (r.ms != null) return r.ok === false ? '没成' : `跑完了 ${r.ms}ms`;
   return 'ok';
 };
 
@@ -432,6 +514,7 @@ async function runTurn(s, goal) {
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
   s.lastSpoken = '';
+  s.pendingNext = '';     // 上一件工具留下的"下一步"（只用来推模型一把）
 
   /* 每轮取一次记忆。取的是**用户这句话**相关的几条 ——
      不是把整本日记塞进去：7B 的窗口撑不住，而且它会开始复述过去。
@@ -446,6 +529,24 @@ async function runTurn(s, goal) {
     console.warn('[memory] 取上下文失败：' + e.message);
   }
   if (memHits.length) console.log(`[memory] 注入 ${memNote.length} 字，命中 ${memHits.length} 条`);
+
+  /* 技能（用户教过的做法）和工具表。两样都每轮刷新一次：
+     "以后就这么办"和"装起来吧"都在某一轮里说完，下一轮就该生效 —— 
+     重启才生效的约定，用户是看不见的。 */
+  let skillNote = '';
+  try {
+    skillNote = await forge.skillsForPrompt();
+  } catch (e) {
+    console.warn('[forge] 技能读取失败：' + e.message);
+  }
+  try {
+    const n = await s.tools.reload();
+    if (n) console.log(`[forge] 自造工具 ${n} 个可用`);
+  } catch (e) {
+    console.warn('[forge] 工具表刷新失败：' + e.message);
+  }
+  const ctxNote = [memNote, skillNote].filter(Boolean).join('\n\n');
+
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
      所以它必须是会话的一部分，不能是旁路通道。 */
@@ -466,6 +567,7 @@ async function runTurn(s, goal) {
   try {
     let lastSig = '';
     let repeats = 0;
+    let nudges = 0;
     for (let step = 0; step < MAX_STEPS; step++) {
       /* 上一轮工具刚跑完就被按了停：这里也要接住，别再多问模型一次 */
       if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
@@ -473,7 +575,7 @@ async function runTurn(s, goal) {
       let out;
       try {
         out = await s.model.complete({
-          messages: withMemory(s.messages, memNote),
+          messages: withMemory(s.messages, ctxNote),
           tools: s.tools.schemas(),
           /* 第一轮的第一步**强制取证**。
              这不是不信任模型，是"先看再说"属于协议而不是建议：
@@ -508,7 +610,7 @@ async function runTurn(s, goal) {
         emit(s, { t: 'note', message: '模型空回复，重试一次' });
         try {
           out = await s.model.complete({
-            messages: withMemory(s.messages, (memNote ? memNote + '\n\n' : '')
+            messages: withMemory(s.messages, (ctxNote ? ctxNote + '\n\n' : '')
               + '（上一次回答是空的。不要解释这件事，直接用一句话回答用户刚才的问题。）'),
             tools: s.tools.schemas(),
             toolChoice: memHits.length ? 'auto' : 'required',
@@ -570,6 +672,16 @@ async function runTurn(s, goal) {
 
       if (!calls.length) {
         if (voice) s.messages.push({ role: 'assistant', content: voice });
+        /* 造工具这件事是**多步**的：写元数据 → 贴代码 → 试跑 → 装。
+           实测 7B 常常在"读完文档"或"写完元数据"之后就说起客套话收工了 ——
+           从用户那边看，就是"它说在做，然后没动静了"。
+           所以只要上一件工具的返回里留着 next，就再推它一把（最多两次）。
+           这不是替它做决定，是把"你还没做完"这句话说给它听。 */
+        if (s.pendingNext && nudges < 2) {
+          nudges++;
+          s.messages.push({ role: 'user', content: `（还没做完。${s.pendingNext}）` });
+          continue;
+        }
         break;
       }
 
@@ -579,7 +691,10 @@ async function runTurn(s, goal) {
       const sig = calls.map((c) => `${c.function.name}:${c.function.arguments}`).join('|');
       if (sig === lastSig) {
         repeats++;
-        if (repeats >= 1) {
+        /* 允许连一次：换了代码再试一次时，tool_try 的参数**本来就是一样的**
+           （"同一个工具、同一组参数、新版本"），按一次就掐会把它自己的正常重试
+           判成卡住。上限仍是 8 步，不会因此转圈。 */
+        if (repeats >= 2) {
           emit(s, { t: 'note', message: '模型重复了同一组调用，已中止这一轮' });
           break;
         }
@@ -592,20 +707,44 @@ async function runTurn(s, goal) {
 
       for (const c of calls) {
         const name = c.function.name;
-        const args = safeJSON(c.function.arguments);
+        const argsRaw = safeJSON(c.function.arguments);
+        /* 一条消息里有多个 tool_call 时，**第一个的参数会被服务端截断**
+           （实测：tool_write 的 code 直接没了，只剩 name/description/params）。
+           这是拼装层的行为，关不掉（parallel_tool_calls: false 被静默忽略）。
+           所以这里把因果说出来：不说的话，模型看到的是"少了 code"，
+           会以为是自己的 JSON 写错，再发一遍还是两个调用，就这么转圈。 */
+        const multi = calls.length > 1
+          ? `（同一条消息里还有 ${calls.length - 1} 个调用没执行：一条消息只能有一个 tool_call，`
+            + '多个会让服务端把第一个的参数截断。下一次只发这一个。）'
+          : '';
+        const brokenArgs = argsRaw === null;
+        /* 模型忘了填的参数在这里补（只补 tool_* 的 name），而且必须在**审批之前**补：
+           卡片上写着"把 x 装起来？"，用户才知道自己在批什么。 */
+        const args = s.tools.fill ? s.tools.fill(name, brokenArgs ? {} : argsRaw) : (brokenArgs ? {} : argsRaw);
         const id = c.id;
         const t0 = Date.now();
         emit(s, { t: 'tool', id, name, args, state: 'run' });
 
         let result;
         try {
-          /* 「拖一下」只是意图，决不能在同一个回合里直接变成执行。
+          const badArgs = brokenArgs ? '' : (s.tools.check ? s.tools.check(name, args) : '');
+          if (badArgs) {
+            result = { error: badArgs };
+          } else if (brokenArgs) {
+            /* 不执行，直接告诉它为什么 —— 这类失败百分之九十是"代码太长被截断"，
+               不点名的话，它会以为参数没错，只是工具没装好。 */
+            result = {
+              error: '参数不是合法 JSON'
+                + (calls.length > 1 ? '：一条消息里有多个 tool_call 时，第一个会被截断。' : '（少了个括号）')
+                + ' 把脚本压到 40 行以内、一条消息只发一个调用，再调一次 tool_write。',
+            };
+          } else if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.tools.level(name) === 'danger') {
+            /* 「拖一下」只是意图，决不能在同一个回合里直接变成执行。
              这是整套交互里最要紧的一条语义（用户明确要求过：向下拖内存 =
              "我想降内存"，此时应该**问**他，而不是替他做）。
              写成代码而不是提示词，是因为它不该随模型好坏而变：
              弱模型会跳过问话直接调 mem_trim（实测过），强模型也可能在某次偷懒。
              等用户在分叉上点了 yes（那是 pick 手势），才放行。 */
-          if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.tools.level(name) === 'danger') {
             result = {
               error: '拖动只是意图，不是命令。用 scene_ask 把问题问出来就停手，等用户点选项 —— '
                 + '这一回合不要再执行任何动作。',
@@ -753,7 +892,12 @@ async function runTurn(s, goal) {
           : result?.closeSurface ? { ok: true, closed: true }
             : result?.draw ? { ok: true, drawn: result.draw.stop ? 0 : (result.draw.layers?.length || 0) }
               : result;
-        s.messages.push({ role: 'tool', name, tool_call_id: id, content: JSON.stringify(forContext) });
+        /* 失败的调用把"多调用"这条因果一起回给模型 —— 这是它唯一能改对的信息。 */
+        const ctxObj = forContext && typeof forContext === 'object' ? forContext : { r: forContext };
+        const ctxContent = multi && (result?.error || result?.ok === false)
+          ? JSON.stringify({ ...ctxObj, hint: multi })
+          : JSON.stringify(forContext);
+        s.messages.push({ role: 'tool', name, tool_call_id: id, content: ctxContent });
         emit(s, { t: 'tool', id, name, state: result?.denied ? 'denied' : result?.error ? 'err' : 'ok', ms: Date.now() - t0, note: summarize(result) });
 
         /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
@@ -767,6 +911,19 @@ async function runTurn(s, goal) {
         /* 兜底要用的原始结果。只在有内容时覆盖 —— 空目录不算"有东西可铺"。
            而且**各自记自己的回合**：fs_move 也会把 fsTurn 置上，如果用 fsTurn
            判断"这轮扫过盘吗"，一次移动就会把上一轮那张扫描表翻出来。 */
+        /* 自造工具：装好了要有一屏（否则"装起来了"只是屏幕上飘过的一句话，
+           用户不知道它叫什么、会碰什么、下次怎么用），跑挂了也要有一屏
+           （错误全文在日志里，用户看不到，也看不懂）。 */
+        /* 下一步该干什么，由工具自己说（forge 的返回值里带 next）。
+           它会被用来"推模型一把"——见下面回合结束那段。 */
+        if (result?.next) s.pendingNext = String(result.next);
+        if (result?.missing) s.pendingNext = `先用 tool_code 写代码。${result.next || ''}`.trim();
+        if (name === 'tool_keep' && result?.ok) { s.lastKept = result; s.keepTurn = s.turn; s.pendingNext = ''; }
+        if (name === 'tool_try' && result?.ok && result?.ok !== false && !result?.error) s.pendingNext = '试跑通了，可以 tool_keep 把它装起来';
+        if ((name === 'tool_try' || s.tools.isDynamic?.(name)) && result && result.ok === false) {
+          s.lastToolErr = { name: String(args?.name || name), error: String(result.error || '跑了但没成') };
+          s.toolErrTurn = s.turn;
+        }
         if (name === 'fs_scan' && Array.isArray(result?.items) && result.items.length) {
           s.lastScan = result; s.scanTurn = s.turn;
         }
@@ -975,6 +1132,41 @@ async function runTurn(s, goal) {
       emit(s, { t: 'note', message: '模型没有回答，由系统把记忆摆出来' });
     }
 
+    /* 自造工具的两头。装起来了要看到它是什么；跑挂了要看到那句话。
+       这两件事都不该只活在"它说了一句"里 —— 用户第二天想问"我让它装过什么"，
+       唯一的答案是屏幕上的这一屏。 */
+    const kept = s.keepTurn === s.turn ? s.lastKept : null;
+    if (!s.drew && kept) {
+      const m = s.tools.all?.[kept.name] || {};
+      s.drew = true;
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: {
+          title: `装好了：${kept.name}`,
+          subtitle: `v${kept.version || 1} · ${needsText(m.needs)}`,
+          root: {
+            type: 'list',
+            items: [
+              { title: String(m.describe || '').replace(/（自造工具 v\d+）$/, ''), sub: '现在可以直接让它做这件事' },
+              { title: '代码在 ~/Agent/tools/' + kept.name, sub: '想改就改，改完它会重新问你要不要跑' },
+            ],
+          },
+        },
+      });
+    }
+    const te = s.toolErrTurn === s.turn ? s.lastToolErr : null;
+    if (!s.drew && te) {
+      s.drew = true;
+      emit(s, {
+        t: 'surface', op: 'set',
+        spec: {
+          title: `${te.name} 没跑成`,
+          subtitle: '这是它自己报的错',
+          root: { type: 'code', lang: 'text', code: te.error.slice(0, 1200) },
+        },
+      });
+    }
+
     if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') {
       const line = s.lastVoice
         || (freshStatus
@@ -1023,13 +1215,26 @@ async function runTurn(s, goal) {
   }
 }
 
+/* 参数解析。**失败要能区分出来** —— "解析失败"和"模型真传了空对象"是两件事，
+   混成一个空对象，模型会以为自己的参数被收下了，然后在同一件事上错第二次。
+
+   另外有一条真机现象：**同一条消息里的第二个 tool_call，参数常常少一个右括号**
+   （实测 Qwen 7B 经 SiliconFlow，连着三次都只差一个 `}`）。补括号能救回来的
+   就救 —— 但**只准补括号和方括号，绝不准补引号**：补引号意味着原来那个字符串
+   本来就被截断了，把半个脚本当完整的存下来、再执行它，比明确失败坏得多。 */
 const safeJSON = (v) => {
   if (typeof v !== 'string') return v || {};
-  try { return JSON.parse(v); } catch { return {}; }
+  if (!v.trim()) return {};
+  try { return JSON.parse(v); } catch { /* 往下试修 */ }
+  const t = v.replace(/,\s*$/, '');
+  for (const tail of ['}', '}}', '}}}', ']', ']}', ']}}', '}]']) {
+    try { return JSON.parse(t + tail); } catch { /* 下一个 */ }
+  }
+  return null;
 };
 
 /* 工具名出现在"说的话"里 = 它在自言自语（"请调用 scene_ask ……"），不该给用户看 */
-const TOOL_WORDS = /(sys_status|app_list|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：

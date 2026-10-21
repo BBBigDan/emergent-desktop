@@ -36,3 +36,4 @@ agent/sessions/
 
 # ---- 长期记忆（本地跑出来的库与快照）----
 agent/memory/
+agent/.tools/

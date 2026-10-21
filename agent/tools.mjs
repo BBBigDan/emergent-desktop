@@ -194,8 +194,19 @@ export function buildShow(args) {
 export function makeTools(o = {}) {
   const source = o.source || 'host';
   const memory = o.memory || null;
+  const forge = o.forge || null;
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
+  /* 自造工具是**运行时**长出来的：这一轮刚 tool_keep 一个，下一轮就该能用。
+     所以它们单独放一个表，reload() 负责同步 —— 已装的加进来，被删掉的摘出去。 */
+  const D = new Set();
+  /* 最近动过的自造工具名。
+     实测 7B 会把 tool_keep 调成 `{}` —— 一个字都没填。它明明刚刚试跑成功，
+     只是没把名字带过来。这种时候系统知道它指的是哪个：只有一个草稿刚被动过。
+     让用户因为"模型忘了填名字"而多等一轮，不值。 */
+  let lastTool = '';
+  let drafts = [];         // 当前草稿名（reload 时刷新），给"只填了 {}"的调用兜底
+
 
   /* 真实集群采集器。构造失败不致命 —— 退回本机读数，
      但一定要在日志里说出来：静默降级会让人以为"集群数据就是这样的"。 */
@@ -944,10 +955,234 @@ export function makeTools(o = {}) {
     run: async () => ({ ok: true, draw: { stop: true } }),
   });
 
+  /* ─────────────────── 自造工具（文档 §5） ───────────────────
+   *
+   * 这套东西存在的理由：不可能给每个应用写适配器。读一眼 API 文档、写 30 行脚本、
+   * 注册成工具，之后一直能用。
+   *
+   * 但"让模型写代码并执行"是这台机器上风险最高的一件事，所以三处不由它决定：
+   *   1. 草稿不进工具表（write 只落盘，keep 才注册）
+   *   2. needs 由 guard.mjs 在子进程里强制（见 agent/tools/guard.mjs）
+   *   3. 每次调用进审计（~/Agent/audit/tools-<day>.jsonl）
+   *
+   * 名字用 tool_ 前缀，是为了让 TOOL_WORDS 一条正则就能把这些词从回话里滤掉。
+   */
+  /* 读文档。造工具这件事有一半的失败是"没看过就写"：
+     实测 7B 拿到"接口说明在 http://127.0.0.1:7899/doc"，也会直接编出
+     /api/v1/playlists 这种不存在的路径。给它一条**读**的通道，
+     它才有机会"先看再说" —— 这也是提示词里那条纪律在工具层的落点。 */
+  add('web_get', {
+    level: 'safe',
+    describe: '读一个 http/https 地址的原文（GET）。要照着某个服务的接口写脚本之前，'
+      + '先用它把文档读回来，别凭印象编路径。返回纯文本，最多 8000 字。',
+    schema: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'http:// 或 https:// 开头的完整地址' } },
+      required: ['url'],
+      additionalProperties: false,
+    },
+    run: async ({ url }) => {
+      let u;
+      try { u = new URL(String(url || '')); } catch { return { error: '这不是一个合法地址' }; }
+      if (!/^https?:$/.test(u.protocol)) return { error: '只支持 http 和 https' };
+      /* 云厂商的元数据地址：能拿到实例凭据，是 SSRF 最经典的那一个目标。
+         内部域名（*.internal / *.svc）也一并挡掉 —— 这台机器上真需要读的
+         是应用的对外地址，不是集群内网。 */
+      const h = u.hostname;
+      if (h === '169.254.169.254' || h.endsWith('.internal') || h.endsWith('.svc') || h === 'metadata') {
+        return { error: '这个地址不让读' };
+      }
+      try {
+        const r = await fetch(u, {
+          signal: AbortSignal.timeout(10000),
+          headers: { 'user-agent': 'emergent-agent/1.0 (+olares)' },
+        });
+        const ct = r.headers.get('content-type') || '';
+        const raw = await r.text();
+        const text = /json|text\/plain|xml/.test(ct)
+          ? raw
+          : raw.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ');
+        return {
+          ok: r.ok, status: r.status, type: ct.split(';')[0] || '(未知)',
+          chars: text.length, text: text.slice(0, 8000),
+        };
+      } catch (e) {
+        return { error: `读不到：${String(e?.message || e).slice(0, 120)}` };
+      }
+    },
+  });
+
+  add('tool_list', {
+    level: 'safe',
+    describe: '看看现在有哪些自造工具（已装的 + 草稿）。用户问"能不能做某件事"之前，先看一眼有没有现成的。',
+    schema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，自造工具用不了' };
+      const list = await forge.list();
+      return {
+        ok: true,
+        tools: list.map((t) => ({
+          name: t.name, what: t.description, status: t.status === 'published' ? '已装' : '草稿',
+          needs: t.needs, v: t.version,
+        })),
+        dir: '~/Agent/tools',
+      };
+    },
+  });
+
+  add('tool_write', {
+    level: 'safe',
+    describe: '写一个新工具（或改一个已有的）：名字、一句话说明、参数表、net（要访问的域名）、fs（要读写的目录）。'
+      + '只会存成草稿，要跑还得 tool_try，要装起来还得 tool_keep。'
+      + '脚本必须把结果打印成最后一行 JSON：console.log(JSON.stringify({ok:true,...}))；'
+      + '参数从 process.env.EM_TOOL_ARGS 读（JSON）。不许用子进程、不许装 npm 包。',
+    schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'a-z 0-9 下划线，例如 navidrome_playlist_add' },
+        description: { type: 'string', description: '一句话说它能干什么（以后模型靠它决定什么时候用）' },
+        params: {
+          type: 'object',
+          description: '参数表：{"album":{"type":"string","description":"专辑名"}}，类型只能是 string/number/boolean',
+        },
+        net: {
+          type: 'string',
+          description: '要访问的域名，多个用逗号隔开，例如 127.0.0.1:7899 或 api.example.com。'
+            + '**少写一个它就跑不起来**（运行时真的会拒）',
+        },
+        fs: { type: 'string', description: '要读写的目录，多个用逗号隔开，例如 ~/Documents' },
+        code: { type: 'string', description: '（可以留空，之后用 tool_code 贴）' },
+        level: { type: 'string', enum: ['confirm', 'safe'], description: 'confirm=每次执行都问用户（默认），safe=直接跑' },
+      },
+      required: ['name', 'description'],
+      additionalProperties: false,
+    },
+    run: async ({ name, description, params, needs, net, fs, code, level }) => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，自造工具用不了' };
+      const r = await forge.write({ name, description, params, needs, net, fs, code, level });
+      if (r.ok) lastTool = r.name;
+      /* 写完之后把它自己的 needs 说一遍：模型下一步要照着这份 needs 解释给用户听，
+         而 7B 记不住自己刚才在 JSON 里写过什么。 */
+      return r;
+    },
+  });
+
+  add('tool_code', {
+    level: 'safe',
+    describe: '把一个工具的脚本代码写进去（覆盖旧的）。tool_write 只写名字和参数，代码用这一步贴 —— '
+      + '两个字段：name 和 code。代码里读参数用 process.env.EM_TOOL_ARGS，'
+      + '最后一行必须 console.log(JSON.stringify({ok:true,...}))。',
+    schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '工具名，要和 tool_write 时的一致' },
+        code: { type: 'string', description: '完整的脚本源码，四十行以内' },
+      },
+      required: ['name', 'code'],
+      additionalProperties: false,
+    },
+    run: async ({ name, code }) => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，自造工具用不了' };
+      const r = await forge.setCode(name, code);
+      if (r.ok) lastTool = r.name;
+      return r;
+    },
+  });
+
+  add('tool_try', {
+    level: 'danger',
+    describe: '试运行一个工具（草稿也行）。会先问用户一次 —— 这是"首次运行看代码"那道门。'
+      + '把参数写成对象传进来，例如 {"album":"Kind of Blue","playlist":"周末"}。',
+    schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        args: { type: 'object', description: '给这个工具的参数' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    run: async ({ name, args }) => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，自造工具用不了' };
+      if (name) lastTool = name;
+      return forge.call(name, args || {});
+    },
+  });
+
+  add('tool_keep', {
+    level: 'danger',
+    describe: '把试通过的草稿装起来，之后随时能用。会问用户一次。',
+    schema: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    run: async ({ name }) => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，自造工具用不了' };
+      return forge.keep(name);
+    },
+  });
+
+  add('skill_save', {
+    level: 'safe',
+    describe: '把一个"以后照这样做"的做法记成技能（一页 markdown，用户能在 Files 里改）。'
+      + '用户说过"以后就这么办"、或者你刚摸索出一套步骤时用它。',
+    schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '短名字，例如 清理磁盘' },
+        when: { type: 'string', description: '什么时候该用它（一句话）' },
+        body: { type: 'string', description: '正文：可以照着做的步骤，用列表' },
+      },
+      required: ['name', 'body'],
+      additionalProperties: false,
+    },
+    run: async ({ name, when, body }) => {
+      if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，技能存不了' };
+      return forge.saveSkill({ name, when, body });
+    },
+  });
+
   return {
     all: T,
     /** 兜底屏要一条真曲线时用。没有集群就返回 null，调用方自己决定退化成什么。 */
     series: cluster ? (metric, o2) => cluster.series(metric, o2) : null,
+    /**
+     * 同步自造工具表。每轮开头调一次 —— 廉价的 readdir，比"重启才生效"好得多：
+     * 用户刚说完"装起来吧"，下一句话就该能直接用上。
+     */
+    async reload() {
+      if (!forge) return 0;
+      let list = [];
+      try { list = forge.registered(); } catch { return 0; }
+      /* 草稿按"最近动过"排：模型忘填名字时，它指的那个几乎一定是最后动过的那份。 */
+      try {
+        drafts = (await forge.list())
+          .filter((t) => t.status === 'draft')
+          .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
+          .map((t) => t.name);
+      } catch { drafts = []; }
+      const want = new Set(list.map((t) => t.name));
+      for (const n of D) if (!want.has(n)) { delete T[n]; D.delete(n); }
+      for (const t of list) {
+        if (T[t.name] && !D.has(t.name)) continue;   // 撞了内置名，别覆盖（forge 那层已经拦，双保险）
+        D.add(t.name);
+        T[t.name] = {
+          name: t.name,
+          level: t.level,
+          needs: t.needs,
+          describe: `${t.description}（自造工具 v${t.version}）`,
+          schema: t.schema,
+          run: (args) => forge.call(t.name, args || {}, { publishedOnly: true }),
+        };
+      }
+      return D.size;
+    },
+    isDynamic: (name) => D.has(name),
     /** 给模型看的 tools 数组（OpenAI 兼容形状，换真模型不用改） */
     schemas() {
       return Object.values(T).map((t) => ({
@@ -955,6 +1190,7 @@ export function makeTools(o = {}) {
         function: { name: t.name, description: t.describe, parameters: t.schema },
       }));
     },
+
     async exec(name, args) {
       const t = T[name];
       if (!t) return { error: `unknown tool: ${name}` };
@@ -962,6 +1198,35 @@ export function makeTools(o = {}) {
     },
     level(name) {
       return T[name]?.level || 'danger';   // 不认识的一律按危险处理
+    },
+    /**
+     * 把"模型忘了填"的参数补上，**在审批之前**。
+     * 只补一个：tool_* 的 name —— 同一时刻只可能有一个刚被动过的工具。
+     * 补了要留痕（assumed），别让它变成看不见的猜测。
+     */
+    fill(name, args) {
+      const a = { ...(args || {}) };
+      if (a.name) return a;
+      if (!['tool_code', 'tool_try', 'tool_keep'].includes(name)) return a;
+      /* 进程刚重启过时 lastTool 是空的 —— 退一步用"最后动过的那个草稿"。
+         模型不会无缘无故调 tool_keep：它指的必然是刚写完/刚试过的那个。 */
+      const nm = lastTool || drafts[0] || '';
+      if (nm) { a.name = nm; a.assumed = true; }
+      return a;
+    },
+    /**
+     * 参数先过一遍必填检查，**在审批之前**。
+     * 实测：7B 调 tool_try 时把 name 漏了，屏幕上先弹出一张"试跑「undefined」？"，
+     * 用户点了允许才收到"没有这个工具"。让他为一个不可能成功的动作点一次头，
+     * 比直接告诉他"少了 name"糟得多。
+     */
+    check(name, args) {
+      const t = T[name];
+      if (!t) return `没有叫「${name}」的工具`;
+      if (typeof t.check === 'function') return t.check(args);
+      const req = t.schema?.required || [];
+      const miss = req.filter((k) => args?.[k] == null || args[k] === '');
+      return miss.length ? `少了必填参数：${miss.join('、')}` : '';
     },
   };
 }

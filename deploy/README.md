@@ -305,3 +305,27 @@ kubectl exec -n user-space-bbbigdan emergent-agent -c memory -- ls -l /userspace
 - **两个容器是并行起的**，agent 会等侧车最多 8 秒（实测差 1~2 秒）。等不到就停用记忆，
   桌面照常 —— 但**不会**退回 SQLite（两份库同时活着等于记忆分叉）。
 - 侧车每 2.5 秒空闲落盘一次（`save_to` 临时文件 + rename），SIGTERM 时同步落盘再退。
+
+## 自造工具（M4）
+
+自造工具全部落在**用户空间**里，和 Files 应用看到的是同一批文件：
+
+```
+~/Agent/tools/<name>/manifest.json    名字 / 参数 / needs / 版本 / draft|published
+~/Agent/tools/<name>/run.mjs|run.cjs  脚本
+~/Agent/tools/<name>/history/         旧版本
+~/Agent/skills/<slug>.md              "以后就这么办"
+~/Agent/audit/tools-<day>.jsonl       每次调用一行
+```
+
+不需要挂新卷、不需要打新镜像 —— `userspace` 那个 hostPath 已经在 pod 里了。
+排查：
+
+```bash
+kubectl exec -n user-space-bbbigdan emergent-agent -c agent -- \
+  sh -c 'ls -la /userspace/pvc-userspace-*/Home/Agent/tools/'
+kubectl exec -n user-space-bbbigdan emergent-agent -c agent -- \
+  sh -c 'tail -5 /userspace/pvc-userspace-*/Home/Agent/audit/tools-*.jsonl'
+# 单元自测（不需要模型，Pod 里也能跑：验证 Linux 上的路径守卫）
+kubectl exec -n user-space-bbbigdan emergent-agent -c agent -- sh -c 'cd /app && node agent/tools/forge.test.mjs'
+```

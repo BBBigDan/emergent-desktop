@@ -55,7 +55,11 @@ export function createOpenAIModel(o = {}) {
   const apiKey = o.apiKey || process.env.MODEL_KEY || '';
   const model = o.model || process.env.MODEL || DEFAULT_MODEL;
   const temperature = Number(o.temperature ?? process.env.MODEL_TEMP ?? 0.3);
-  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 1200);
+  /* 2000 而不是 1200：这是一个**上限**，不是目标 —— 正常回话该停就停。
+   但 tool_write 要把一整段脚本装进一个 JSON 参数里，1200 会在半句代码上方
+   直接截断，而截断的表现是「参数不是合法 JSON」，看起来像模型的错（也确实是，
+   但它本来能对）。实测 7B 写 25 行脚本加参数就顶到 1200 的天花板。 */
+  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 2000);
   const timeoutMs = Number(o.timeoutMs ?? process.env.MODEL_TIMEOUT ?? 45_000);
   const retries = Number(o.retries ?? 2);
 
@@ -74,6 +78,14 @@ export function createOpenAIModel(o = {}) {
     if (tools?.length) {
       body.tools = tools;
       body.tool_choice = toolChoice;
+      /* 一次只要一个调用。
+       *
+       * 实测（Qwen 7B / SiliconFlow）：模型在**同一条消息里发两个 tool_call** 时，
+       * 第一个的 arguments 会在中途被切断 —— tool_write 的 code 直接没了，
+       * 于是"少了必填参数 code"，模型再试一次还是两个，死循环七次。
+       * 这是服务端拼装多调用时的行为，不是我们的解析问题（单独一个调用永远完整）。
+       * 所以这里从协议上关掉并行调用：宁可慢一步，也要让参数完整。 */
+      body.parallel_tool_calls = false;
     }
     /* 两个中断源合流：自己的超时，加上"用户按了停"。
        没有第二个的话，点了停还要等满 timeoutMs（默认 60s）才收手 ——
@@ -103,6 +115,14 @@ export function createOpenAIModel(o = {}) {
           /* 有的服务端不支持 tool_choice=required（或换了模型后不支持）。
              这不是"请求错了"，是"这个能力没有"——降级成 auto 再试一次，
              否则整个 agent 会因为一个可选参数而完全不可用。 */
+          /* 先撤 parallel_tool_calls（有些服务端不认这个字段，直接 400），
+             再撤 tool_choice=required。两个都是"能力没有"，不是"请求错了"。 */
+          if (body.parallel_tool_calls !== undefined && r.status >= 400 && r.status < 500) {
+            console.warn('[model] 该服务端不接受 parallel_tool_calls，去掉再试');
+            delete body.parallel_tool_calls;
+            attempt--;
+            continue;
+          }
           if (body.tool_choice === 'required' && r.status >= 400 && r.status < 500) {
             console.warn('[model] 该模型不接受 tool_choice=required，降级为 auto');
             body.tool_choice = 'auto';
