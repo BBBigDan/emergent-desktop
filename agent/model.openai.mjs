@@ -75,7 +75,6 @@ export function createOpenAIModel(o = {}) {
       body.tools = tools;
       body.tool_choice = toolChoice;
     }
-
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
@@ -96,6 +95,15 @@ export function createOpenAIModel(o = {}) {
 
         if (!r.ok) {
           const detail = (j?.error?.message || j?.message || text || '').slice(0, 300);
+          /* 有的服务端不支持 tool_choice=required（或换了模型后不支持）。
+             这不是"请求错了"，是"这个能力没有"——降级成 auto 再试一次，
+             否则整个 agent 会因为一个可选参数而完全不可用。 */
+          if (body.tool_choice === 'required' && r.status >= 400 && r.status < 500) {
+            console.warn('[model] 该模型不接受 tool_choice=required，降级为 auto');
+            body.tool_choice = 'auto';
+            attempt--;
+            continue;
+          }
           /* 4xx（除 429）是请求本身的问题，重试只会重复同一个错误 */
           const retryable = r.status === 429 || r.status >= 500;
           const err = new Error(`模型接口 ${r.status}：${detail || '(无返回内容)'}`);
@@ -132,8 +140,8 @@ export function createOpenAIModel(o = {}) {
   return {
     name: `sf:${model}`,
     model,
-    async complete({ messages, tools }) {
-      const out = await once({ messages, tools });
+    async complete({ messages, tools, toolChoice }) {
+      const out = await once({ messages, tools, toolChoice });
       if (out.truncated && !out.tool_calls.length) {
         console.warn('[model] 输出被 max_tokens 截断');
       }

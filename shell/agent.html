@@ -236,7 +236,13 @@ function onEvent(m) {
     case 'scene':
       /* 服务端的动作也走节拍器：mock 模型一秒钟能把四条指令全吐出来，
          但界面上必须有先后 —— 这就是"时序由前端强制"的意义。 */
-      if (m.op === 'set') pacer.run('set', () => { scene.set(m.spec); reassertLine(); });
+      if (m.op === 'set') {
+        /* 场上已经有东西时，"铺一屏"其实是换景。要不要有溶解重组，是**场的决定**，
+         不是模型的参数 —— 它对用户说"再给我一屏"时不该还得分 set / transition。 */
+        const full = (scene.spec?.layers?.length ?? 0) > 0;
+        if (full) pacer.run('transition', () => { scene.transition(m.spec); reassertLine(); });
+        else pacer.run('set', () => { scene.set(m.spec); reassertLine(); });
+      }
       else if (m.op === 'transition') pacer.run('transition', () => { scene.transition(m.spec); reassertLine(); });
       else if (m.op === 'patch') pacer.run('patch', () => { scene.patch(m.ops); reassertLine(); });
       else if (m.op === 'pulse') pacer.run('pulse', () => scene.pulse(m.kind, { at: m.at }));

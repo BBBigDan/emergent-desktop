@@ -23,7 +23,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import url from 'node:url';
 
-import { makeTools } from './tools.mjs';
+import { makeTools, defaultOverview } from './tools.mjs';
 import { createMockModel } from './model.mock.mjs';
 import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt } from './prompt.mjs';
@@ -187,6 +187,10 @@ async function runTurn(s, goal) {
   s.busy = true;
   s.goal = goal;
   s.turn++;
+  s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
+  s.sets = 0;
+  s.lastSpecSig = null;
+  s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
      所以它必须是会话的一部分，不能是旁路通道。 */
@@ -211,6 +215,13 @@ async function runTurn(s, goal) {
         out = await s.model.complete({
           messages: s.messages,
           tools: s.tools.schemas(),
+          /* 第一轮的第一步**强制取证**。
+             这不是不信任模型，是"先看再说"属于协议而不是建议：
+             便宜模型很容易跳过工具、直接凭上下文编一个读数（实测过：
+             它把示例里的 71% 原样抄了出来）。让它自己决定要不要看，
+             等于让最不可靠的一环决定"事实从哪来"。
+             代价是纯闲聊也要付一次 sys_status —— 一次本地读 /proc，可以接受。 */
+          toolChoice: step === 0 && goal.kind === 'ask' ? 'required' : 'auto',
           goal: { ...goal, pendingTo: s.lastAdjustTo },
         });
       } finally {
@@ -221,10 +232,33 @@ async function runTurn(s, goal) {
       }
 
       const calls = out.tool_calls || [];
-      if (out.content) emit(s, { t: 'say', text: out.content });
+      /* 便宜模型会把示例里的记号一起抄出来（"content: ..."、"→ scene_set(...)"），
+         或者写一整段带换行和清单的计划。场里只有**一行** 20 格，这些都不该下去：
+         截到第一行、去掉列表符号，剩下的由前端按字数再压。 */
+      const rawSpeech = String(out.content || '')
+        .replace(/^\s*(content|回答|你说)\s*[:：]\s*/i, '')
+        .replace(/^["'「](.*)["'」]$/, '$1')
+        .split('\n')[0]
+        .replace(/^\s*[-*·]\s*/, '')
+        .trim();
+      /* 提到工具名的话是"它对自己下的指令"，不是给用户的话。
+         实测原话："请调用 scene_ask 把问题问出来" —— 用户看到只会莫名其妙。 */
+      /* 手势回合干脆不要它说话：这一行该说"代价"，而代价（要重启谁）是系统知道的事，
+         模型只会复述用户动作或复述自己的计划。要它表达的地方是 scene_ask 的问题本身。 */
+      const isAdjust = s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust';
+      const speech = (isAdjust || TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech))
+        ? '' : rawSpeech.slice(0, 40);
+      /* 一轮只说一句话。
+         scene_show 的 reading 已经替它说过话了；之后模型再补一段
+         "机器当前负载情况是这样的……"，那不是给用户的话，是旁白。
+         场里只有一行，多说的每一句都要挤掉真正要看的东西 —— 所以后面的都咽掉，
+         但在观察窗留一条，免得以后查"它到底说了什么"时一头雾水。 */
+      const voice = speech && !s.spoke ? speech : '';
+      if (voice) emit(s, { t: 'say', text: voice });
+      else if (speech) emit(s, { t: 'note', message: `旁白已省略：${speech.slice(0, 24)}` });
 
       if (!calls.length) {
-        if (out.content) s.messages.push({ role: 'assistant', content: out.content });
+        if (voice) s.messages.push({ role: 'assistant', content: voice });
         break;
       }
 
@@ -254,7 +288,18 @@ async function runTurn(s, goal) {
 
         let result;
         try {
-          if (needsGate(s, name)) {
+          /* 「拖一下」只是意图，决不能在同一个回合里直接变成执行。
+             这是整套交互里最要紧的一条语义（用户明确要求过：向下拖内存 =
+             "我想降内存"，此时应该**问**他，而不是替他做）。
+             写成代码而不是提示词，是因为它不该随模型好坏而变：
+             弱模型会跳过问话直接调 mem_trim（实测过），强模型也可能在某次偷懒。
+             等用户在分叉上点了 yes（那是 pick 手势），才放行。 */
+          if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.tools.level(name) === 'danger') {
+            result = {
+              error: '拖动只是意图，不是命令。用 scene_ask 把问题问出来就停手，等用户点选项 —— '
+                + '这一回合不要再执行任何动作。',
+            };
+          } else if (needsGate(s, name)) {
             const ok = await requestApproval(s, { id, name, args });
             result = ok ? await s.tools.exec(name, args) : { denied: true, reason: 'user refused' };
           } else {
@@ -266,11 +311,90 @@ async function runTurn(s, goal) {
 
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */
         if (result && result.ok && result.op) {
-          emit(s, { t: 'scene', op: result.op, spec: result.spec, ops: result.ops, kind: result.kind, at: result.at });
+          /* 同一屏连铺两遍 = 模型在原地打转（实测：它会为了"更完整"再铺一次，
+             屏幕上就是同一屏反复溶解重组）。判重放在服务端而不是提示词里：
+             "做过没有"是状态问题，模型看不见自己的历史，服务端看得见。 */
+          if (result.op === 'set' && result.spec) {
+            const sig = JSON.stringify(result.spec.layers);
+            s.sets = (s.sets || 0) + 1;
+            if (sig === s.lastSpecSig) {
+              result.duplicate = true;
+              result.hint = '这一屏和现在屏幕上的一样，不要再铺一次';
+            } else if (s.sets > 2) {
+              result.duplicate = true;
+              result.hint = '这一轮已经铺过两屏了，停在这里，把决定权交给用户';
+            } else {
+              s.lastSpecSig = sig;
+            }
+          }
+          if (!result.duplicate && result.say) {
+            s.spoke = true;
+            s.lastVoice = String(result.say).slice(0, 40);
+            emit(s, { t: 'say', text: String(result.say).slice(0, 40) });
+          }
+          if (!result.duplicate) {
+            s.drew = true;
+            emit(s, { t: 'scene', op: result.op, spec: result.spec, ops: result.ops, kind: result.kind, at: result.at });
+          } else {
+            emit(s, { t: 'note', message: `重复的整屏已忽略：${result.hint}` });
+          }
         }
 
         s.messages.push({ role: 'tool', name, tool_call_id: id, content: JSON.stringify(result) });
         emit(s, { t: 'tool', id, name, state: result?.denied ? 'denied' : result?.error ? 'err' : 'ok', ms: Date.now() - t0, note: summarize(result) });
+
+        /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
+           模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */
+        if (name === 'sys_status' && result?.cpu != null) s.lastStatus = result;
+        if (name === 'app_list' && Array.isArray(result?.apps)) s.lastApps = result.apps;
+      }
+
+      /* 手势回合里，只要把问题问出去了就停 —— 球在用户那边。
+         不写这条，模型会接着"那我先执行吧"，然后在拦截和重试之间来回撞。 */
+      if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.drew) {
+        emit(s, { t: 'note', message: '已经把问题问出去了，这一轮到此为止' });
+        break;
+      }
+    }
+
+    /* 手势回合里把话补上：问题已经问出去了，但那一行字不能空着 */
+    if (s.drew && !s.spoke && s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust') {
+      s.spoke = true;
+      emit(s, { t: 'say', text: `压到 ${Math.round((s.goal.intent.to ?? 0) * 100)}% 要重启占内存最多的那个` });
+    }
+
+    /* ── 兜底 1：拖了仪表，模型却没问 ──
+       手势路径上模型最容易"直接动手"或"什么都不做"。前者被上面的协议拦住了，
+       后者会留下一片空白 —— 而这时用户的手还停在仪表上，等他一个回应。 */
+    if (!s.drew && s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust') {
+      const it = s.goal.intent;
+      const to = Math.round((it.to ?? 0) * 100);
+      if (!s.spoke) {
+        s.spoke = true;
+        emit(s, { t: 'say', text: `压到 ${to}% 要重启占内存最多的那个` });
+      }
+      emit(s, {
+        t: 'scene', op: 'patch',
+        ops: [{
+          id: 'ask',
+          label: `压到 ${to}%？`,
+          options: [{ id: 'yes', label: `压到 ${to}%` }, { id: 'no', label: '算了' }],
+        }],
+      });
+      emit(s, { t: 'note', message: '模型没有把问题问出来，由系统代问' });
+    }
+
+    /* ── 兜底 2：模型看了数据却没铺屏 ──
+       实测四个免费模型都会栽在这一步（详见 tools.mjs 的 defaultOverview）。
+       没有这一层，用户问一句"机器怎么卡"，最后屏幕上什么都没有。 */
+    if (!s.drew && s.lastStatus && s.goal?.kind === 'ask') {
+      const line = s.lastVoice
+        || `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`;
+      const built = defaultOverview(s.lastStatus, s.lastApps || [], line);
+      if (built) {
+        if (!s.spoke) { s.spoke = true; emit(s, { t: 'say', text: built.say }); }
+        emit(s, { t: 'scene', op: 'set', spec: built.spec });
+        emit(s, { t: 'note', message: '模型没有给出这一屏，由系统按读数兜底铺开' });
       }
     }
   } catch (e) {
@@ -285,6 +409,12 @@ const safeJSON = (v) => {
   if (typeof v !== 'string') return v || {};
   try { return JSON.parse(v); } catch { return {}; }
 };
+
+/* 工具名出现在"说的话"里 = 它在自言自语（"请调用 scene_ask ……"），不该给用户看 */
+const TOOL_WORDS = /(sys_status|app_list|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+/* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
+   实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
+const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)/;
 
 /* ───────────────────────── HTTP ───────────────────────── */
 
