@@ -201,6 +201,16 @@ kubectl apply -f agent-k8s.yaml
 `location /agent/`）。前缀不剥 —— agent 自己认 `/agent/`，这样它的接口不会和
 官方 olares-app 的 `/api/*` 抢路径。
 
+这个地址现在是**桌面壳**，不是 agent 页。agent 已经是桌面的一层
+（`shell/src/deskagent.js`，见 `docs/场界面-设计与接口.md` §11）：
+
+- 鼠标贴到底边 → 粒子下沉、边缝亮起；点击或上拖 → 场从桌面里展开
+- 双击桌面空白 → 同样展开
+- Esc → 收起，粒子散回球面
+
+`agent.html` 还留着，但它只是"把场单独拿出来看"的调试页。
+`?dev=1` 才显示观察窗/连接状态；`?apps=demo` 不带登录态也能把桌面立起来（调 UI 用）。
+
 **踩过的坑：**
 
 - `.kube` 必须排除在 tar 之外。那里面是集群客户端私钥，等于 root shell。

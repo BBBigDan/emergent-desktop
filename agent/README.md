@@ -10,6 +10,11 @@ SYS=host node agent/server.mjs           # 退回读本机 /proc（没有集群�
 零依赖，只用 Node 内建模块。**模型是真的，数据也是真的**：`sys_status` 读的是那台
 Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的是它的容器日志。
 
+**agent 不是页面，是桌面的一层。** 根路径 `/` 给的是桌面壳，agent 由
+`shell/src/deskagent.js` 挂在桌面自己的粒子场上：鼠标贴到底边、或双击桌面空白唤出，
+场就地展开（同一批粒子从环境形态凝成界面），Esc 收起、散回球面。
+`shell/agent.html` 还留着，但它只是"把场单独拿出来看"的调试页（`?dev=1` 才显示观察窗）。
+
 这一版证明的是那条链路：模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌 → 审批挂起。
 换数据源只改 `sources/`，协议一个字都不用动。
 
