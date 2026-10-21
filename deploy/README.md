@@ -41,20 +41,49 @@ Olares 的 `appns-validating-webhook` 只拦 `deployments` / `statefulsets` / `d
 > 所以 `install.sh` 在 apply 之后会显式删一次 pod —— 否则你改了模板、看到的还是旧容器的日志，
 > 那种"我明明改了"的错觉最费时间。
 
+## 镜像从哪来：GitHub Actions
+
+节点上没有 docker/nerdctl/buildah，也没有私有仓库 —— 所以代码曾经是 `tar` 到
+hostPath、重启进程生效。现在改成 CI 打镜像：runner 有 docker，ghcr 是免费仓库，
+这条路**什么都没多花**。
+
+```
+push main ──► .github/workflows/images.yml
+                ① 六份自测（history / memory / model.retry / persona / usage / forge）
+                ② 并行打三个镜像 → ghcr.io/bbigdan/emergent-desktop/{shell,agent,memory}
+                   标签：sha-<7>（回滚点）、latest（日常）
+```
+
+| 镜像 | 内容 | 为什么不合并成一个 |
+|---|---|---|
+| `/shell` | nginx:alpine + `shell/` 静态站 | 合成一个（nginx+node+python）要 350MB，每个容器都拖着另外两套运行时 |
+| `/agent` | node:22-alpine + `agent/` + `shell/` | 见左：`prompt.mjs` 要 `../shell/src/timing.js`，那张常数表不能复制一份 |
+| `/memory` | python:3.11-slim + `axolotl_rs` | wheel 是 cp311 + manylinux_2_34，**升 3.12 或换 alpine 都装不上** |
+
+三个包必须是 **public**：CI 里会用 API 翻一次（推上去默认是 private），
+然后跑一次**匿名探测**。探测失败会在 Actions 里留下 warning ——
+那种情况下 pod 会停在 `ImagePullBackOff`，`describe` 的事件里写的是 401。
+
+> `.dockerignore` 挡 `agent/.env` 和 `agent/.kube/`。build context **不认
+> `.gitignore`**，而镜像是推到公开仓库的 —— 这两个进镜像等于把模型 key 和
+> 集群 client-key 公开发出去。
+
 ## 装 / 回滚 / 卸载
 
 ```bash
-./deploy/install.sh              # 装或更新：铺代码 → 建工作负载 → 接管桌面入口
-./deploy/install.sh --revert     # 桌面切回官方，我们的 pod 留着
-./deploy/install.sh --uninstall  # 切回官方 + 删工作负载与权限（数据保留）
+./deploy/install.sh                 # 装或更新到 latest
+./deploy/install.sh --tag sha-1a2b3c4  # 装指定版本（这就是回滚）
+./deploy/install.sh --revert        # 桌面切回官方，我们的 pod 留着
+./deploy/install.sh --uninstall     # 切回官方 + 删工作负载与权限（数据保留）
 ```
 
-脚本做五件事，顺序是有原因的：
+脚本做六件事，顺序是有原因的：
 
-1. 找用户 Home（`pvc-userspace-<user>-<随机>`，**不能猜**）；
-2. 铺静态文件到 `/olares/emergent-desktop/www`、agent 到 `.../app`；
-3. 写 `emergent-desktop-env` Secret（模型 key，不写进 yaml）；
-4. apply 清单 → 删 pod → 等三容器 Ready；
+1. **先探测三个镜像能不能匿名拉**（只看 HTTP 码）。顺序反了的话，标签写错会先
+   删掉你正在跑的桌面、再卡在 `ImagePullBackOff`，而那时候能看的只剩事件里的 401；
+2. 找用户 Home（`pvc-userspace-<user>-<随机>`，**不能猜**）；
+3. 写 `emergent-desktop-env` Secret（模型 key，不写进 yaml，更不进镜像）；
+4. apply 清单 → 删 pod → 等三容器 Ready（等不到时打事件和 agent 日志）；
 5. **最后**才改 `edge-desktop` 的 selector。反过来做的表现是"桌面白屏十几秒"，
    而用户只会以为它坏了。
 
@@ -62,13 +91,14 @@ Olares 的 `appns-validating-webhook` 只拦 `deployments` / `statefulsets` / `d
 
 | | 路径 | 说明 |
 |---|---|---|
-| 静态 | `/olares/emergent-desktop/www` | 改完重传即生效（nginx 发 no-cache） |
-| 代码 | `/olares/emergent-desktop/app` | 代码是卷不是镜像，**重启才生效** |
 | 记忆/人格 | `Userspace/Home/Agent` | Files 里看得见；卸载不删 |
+| 会话/用量 | `/olares/emergent-desktop/state/<user>` | 挂进 `/app/agent/{sessions,usage}`，跨镜像版本保留 |
+| 代码/静态 | 镜像里 | 只读，跟着 tag 走 |
 
-代码不进镜像，是这条路的既定代价：节点上确实没有 docker/nerdctl/buildah，
-也没有可推的仓库。清单里有个 `check-code` initContainer，代码没铺时会直接说
-"跑一次 deploy/install.sh"，而不是甩一屏 `MODULE_NOT_FOUND`。
+**有状态的东西不进镜像。** 会话存档和 token 日账本是数据：换 tag 不该把它们
+清零，回滚也不该把它们搞乱。所以这两个目录从镜像里挂出来。
+早期的 `hostPath` 三件套（`/olares/emergent-desktop/{app,www,py}`）已经不用了，
+`install.sh` 跑完会提醒你可以删。
 
 ## 四个坑（都踩过）
 
@@ -119,7 +149,7 @@ scp /tmp/i.html root@HOST:/olares/emergent-auth/www/index.html
 
 | 点 | 做法 | 原因 |
 |---|---|---|
-| 静态文件 | hostPath `/olares/emergent-desktop/www` | 改完 `tar` 即生效，不用打镜像 |
+| 静态文件 | 打进 `/shell` 镜像（`/www`） | 回滚 = 换 tag，不再"改完 tar 上去" |
 | 只接管 `/` | nginx `try_files`，`/api` `/server` `/kapis` … 反代到 `olares-app-official:91` | 登录态、接口、其他应用完全不受影响 |
 | `/bfl/` 单独直连 bfl 网关 | 官方前端 pod 自己不代理 `/bfl`（桌面是跨域走 auth 域名 + JWT 拿遥测的），所以壳层直接 `proxy_pass` 到 `bfl` 服务 | 右下角设备状态面板的 `/bfl/monitor/v1alpha1/cluster` 能用同域 cookie 取到数据 |
 | 切换 | 改 `edge-desktop` 的 selector | 一条 patch，秒级生效，随时回滚 |
@@ -128,11 +158,19 @@ scp /tmp/i.html root@HOST:/olares/emergent-auth/www/index.html
 ## 日常迭代
 
 ```bash
-# 改前端：重传 www，浏览器刷新即可
-./deploy/install.sh          # 全量同步 + 重建 pod
-# 只改一个文件时可以直接 scp：
-scp shell/src/field.js root@HOST:/olares/emergent-desktop/www/src/
+git push                      # CI 打镜像（六份自测先跑，约 1~2 分钟）
+./deploy/install.sh           # 拉 latest + 重建 pod
 ```
+
+改前端不想等 CI 时，可以直接往 pod 里递一个文件（临时目录，pod 重启即失效）：
+
+```bash
+scp shell/src/field.js root@HOST:/tmp/field.js
+ssh root@HOST 'kubectl cp /tmp/field.js user-space-bbbigdan/$(kubectl -n user-space-bbbigdan get pod -l app=emergent-desktop -o name | head -1 | cut -d/ -f2):/www/src/field.js -c shell'
+```
+
+> 这条路只适合"看一眼效果"。**别把它当部署**：pod 一重建就回退到镜像里的版本，
+> 而那时候你会以为是"CI 没生效"。
 
 本地预览别用 `python -m http.server` —— 它不发 `Cache-Control`，ES Module 会被浏览器
 启发式缓存，改完刷新还是旧文件。用 `node auth/serve.mjs 8822`。

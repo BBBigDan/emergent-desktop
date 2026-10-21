@@ -34,6 +34,9 @@ concurrency:
 env:
   # 必须是全小写：OCI 引用里 owner 大小写不合法（仓库是 BBBigDan，镜像是 bbigdan）
   REGISTRY: ghcr.io
+  # 三段：owner/仓库/镜像名。**不能用 bbigdan/emergent-desktop-shell 那种平级命名** ——
+  # GITHUB_TOKEN 推 ghcr 时只对"仓库自己的命名空间"有写权限，平级名字会回
+  # `denied: permission_denied: The requested installation does not exist`（踩过）。
   PREFIX: ghcr.io/bbigdan/emergent-desktop
 
 jobs:
@@ -44,7 +47,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -68,7 +71,7 @@ jobs:
       matrix:
         image: [shell, agent, memory]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
@@ -91,9 +94,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.PREFIX }}-${{ matrix.image }}:${{ github.sha }}
-            ${{ env.PREFIX }}-${{ matrix.image }}:sha-${{ github.sha }}
-            ${{ env.PREFIX }}-${{ matrix.image }}:latest
+            ${{ env.PREFIX }}/${{ matrix.image }}:${{ github.sha }}
+            ${{ env.PREFIX }}/${{ matrix.image }}:sha-${{ github.sha }}
+            ${{ env.PREFIX }}/${{ matrix.image }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -117,7 +120,7 @@ jobs:
       # 匿名探测：不登录也能取到 manifest，才算"集群拉得到"。
       - name: 匿名拉取探测
         run: |
-          P="${{ env.PREFIX }}-${{ matrix.image }}"
+          P="${{ env.PREFIX }}/${{ matrix.image }}"
           R="${P#ghcr.io/}"
           TOK=$(curl -s "https://ghcr.io/token?scope=repository:$R:pull&service=ghcr.io" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" \

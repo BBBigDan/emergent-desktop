@@ -213,7 +213,7 @@ spec:
       containers:
         # ── 壳层：静态 + 把官方接口转回去 ──
         - name: shell
-          image: __IMAGE_PREFIX__-shell:__IMAGE_TAG__
+          image: __IMAGE_PREFIX__/shell:__IMAGE_TAG__
           # latest 必须 Always：标签不变而内容变了，IfNotPresent 会让节点永远跑着
           # 缓存里那份旧镜像 —— 表现是"重新装了但页面没变"。
           imagePullPolicy: Always
@@ -235,7 +235,7 @@ spec:
 
         # ── agent：粒子场的服务端 ──
         - name: agent
-          image: __IMAGE_PREFIX__-agent:__IMAGE_TAG__
+          image: __IMAGE_PREFIX__/agent:__IMAGE_TAG__
           imagePullPolicy: Always
           ports:
             - containerPort: 8788
@@ -296,7 +296,7 @@ spec:
 
         # ── 记忆侧车：真图库。wheel 是 cp311，别"顺手升一下" ──
         - name: memory
-          image: __IMAGE_PREFIX__-memory:__IMAGE_TAG__
+          image: __IMAGE_PREFIX__/memory:__IMAGE_TAG__
           imagePullPolicy: Always
           env:
             - name: PYTHONUNBUFFERED

@@ -74,7 +74,7 @@ fi
 # 而那时候能看的东西只剩事件里的 401。
 say "探测镜像（匿名，$IMAGE_TAG）"
 "${SSH[@]}" "for I in shell agent memory; do
-    R='bbigdan/emergent-desktop-'\$I
+    R='${IMAGE_PREFIX#ghcr.io/}/'\$I
     T=\$(curl -s -m 10 \"https://ghcr.io/token?scope=repository:\$R:pull&service=ghcr.io\" | sed -n 's/.*\"token\":\"\\([^\"]*\\)\".*/\\1/p')
     C=\$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H \"Authorization: Bearer \$T\" \
         -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
@@ -150,7 +150,7 @@ cat <<EOF
 
 装好了。打开桌面就是它：https://desktop.$USER_NAME.olares.com
 
-镜像：$IMAGE_PREFIX-{shell,agent,memory}:$IMAGE_TAG
+镜像：$IMAGE_PREFIX/{shell,agent,memory}:$IMAGE_TAG
 数据：
   记忆/人格  Userspace/Home/Agent        （Files 里看得见）
   会话/用量  $STATE_DIR
@@ -160,7 +160,7 @@ cat <<EOF
   ./deploy/install.sh # 拉 latest 并重建 pod
 
 回滚到某个提交：./deploy/install.sh --tag sha-<7位>
-  标签列表：gh api /user/packages/container/emergent-desktop-agent/versions --jq '.[].metadata.container.tags'
+  标签列表：gh api '/user/packages/container/emergent-desktop%2Fagent/versions' --jq '.[].metadata.container.tags'
 
 桌面回官方：./deploy/install.sh --revert
 连工作负载一起删：./deploy/install.sh --uninstall      （数据保留）
