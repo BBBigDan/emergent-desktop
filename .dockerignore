@@ -1,0 +1,33 @@
+# 构建上下文：仓库根。三份 Dockerfile 都在 deploy/docker/ 下，都用这一份忽略表。
+#
+# 为什么必须单独写这个文件：`.gitignore` 对 build context 完全不生效。
+# `agent/.env` 里是模型 key、`agent/.kube/config` 里是集群 client-key ——
+# 镜像要推到公开的 ghcr.io，这两个进镜像就等于把 key 和集群凭据公开发出去。
+# 它们已经在 `.gitignore` 里了，但那挡不住 `COPY agent/ /app/agent/`。
+
+.git
+.github
+.tmp
+dist
+docs
+prototype
+assets
+LICENSE
+
+# ── 凭据：一个字节都不能进镜像 ──
+agent/.env
+.env
+agent/.kube
+**/*.kubeconfig
+
+# ── 运行时数据（跑出来的，属于用户不属于镜像）──
+agent/sessions
+agent/usage
+agent/memory
+agent/.tools
+**/__pycache__
+**/*.pyc
+
+# ── 前端调试页：能进镜像但没用，减掉几百 KB ──
+shell/test-*.html
+**/*.map

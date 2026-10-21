@@ -19,6 +19,11 @@
 #   于是又要 NetworkPolicy 白名单（上一版为此给壳层打了 `tier: bfl` 标签去蹭平台的规则，
 #   那是冒充桌面网关）。同一个 pod 里走 127.0.0.1，这些全都不需要。
 #
+# 代码在哪：**在镜像里**（ghcr.io，由 .github/workflows/images.yml 构建）。
+# 曾经是 hostPath —— 节点上没有 docker/nerdctl/buildah，也没有可推的仓库，tar 上去是唯一的路。
+# 那条路的代价是"永远在跑一个没有版本号的东西"：改坏了没法回滚、没人知道线上是哪份代码、
+# 谁 exec 进去都能顺手改一行。现在回滚 = `install.sh --tag sha-xxxxxxx`。
+#
 # 装：bash deploy/install.sh        回滚：bash deploy/install.sh --revert
 ---
 apiVersion: v1
@@ -202,34 +207,20 @@ spec:
         # 现在的架构里 agent 在同一个 pod（127.0.0.1），根本不需要那个标签。
     spec:
       serviceAccountName: emergent-desktop
-      # 代码不在镜像里：节点上没有 docker/nerdctl/buildah，也没有可推的仓库 ——
-      # 打不了镜像。tar 到 hostPath、重启进程即生效，这是这条路的既定代价。
-      initContainers:
-        - name: check-code
-          image: docker.io/library/busybox:1.36
-          imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - |
-              if [ ! -f /app/agent/server.mjs ]; then
-                echo "代码还没铺。在仓库里跑一次：bash deploy/install.sh"
-                exit 1
-              fi
-          volumeMounts:
-            - name: app
-              mountPath: /app
+      # ghcr.io 上的三个包是 public 的（CI 里翻的，装完可以用匿名探测脚本复核），
+      # 所以不需要 imagePullSecrets。要是哪天变回 private，pod 会停在 ImagePullBackOff，
+      # `kubectl describe pod` 的事件里会写 401 —— 那时候再来加一个 pull secret。
       containers:
         # ── 壳层：静态 + 把官方接口转回去 ──
         - name: shell
-          image: docker.io/beclab/docker-nginx-headers-more:ubuntu-v0.1.0
-          imagePullPolicy: IfNotPresent
+          image: __IMAGE_PREFIX__-shell:__IMAGE_TAG__
+          # latest 必须 Always：标签不变而内容变了，IfNotPresent 会让节点永远跑着
+          # 缓存里那份旧镜像 —— 表现是"重新装了但页面没变"。
+          imagePullPolicy: Always
           ports:
             - containerPort: 91
               name: http
           volumeMounts:
-            - name: www
-              mountPath: /www
             - name: conf
               mountPath: /etc/nginx/conf.d/emergent-desktop.conf
               subPath: emergent-desktop.conf
@@ -244,19 +235,16 @@ spec:
 
         # ── agent：粒子场的服务端 ──
         - name: agent
-          image: docker.io/library/node:22-alpine
-          imagePullPolicy: IfNotPresent
-          workingDir: /app
-          # 不用 shell 包一层：node 收到 SIGTERM 才会走完 idle 落盘
-          command: ["node", "/app/agent/server.mjs"]
+          image: __IMAGE_PREFIX__-agent:__IMAGE_TAG__
+          imagePullPolicy: Always
           ports:
             - containerPort: 8788
           env:
             - name: PORT
               value: "8788"
-            # 静态文件只有一份（www），nginx 和 agent 都读它
+            # 镜像里代码在 /app，静态在 /app/shell（prompt.mjs 要 ../shell/src/timing.js）
             - name: WEB_ROOT
-              value: /www
+              value: /app/shell
             - name: SYS
               value: k8s
             # 用户 Home 直接挂在 /userspace —— 不是挂整个 userspace 再自己去找
@@ -275,25 +263,22 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-          # 模型 key 走 Secret，不写进 yaml
+          # 模型 key 走 Secret，不写进 yaml（更不能进镜像）
           envFrom:
             - secretRef:
                 name: emergent-desktop-env
                 optional: true
           volumeMounts:
-            - name: app
-              mountPath: /app
-            - name: www
-              mountPath: /www
-              readOnly: true
-            # prompt.mjs 要 `../shell/src/timing.js` —— 那张常数表一份代码三个身份
-            # （页面动画 / 提示词里的规范 / Pacer）。把同一个 hostPath 再挂到
-            # /app/shell，比复制一份 shell 到代码目录更不容易漂移。
-            - name: www
-              mountPath: /app/shell
-              readOnly: true
             - name: userspace
               mountPath: /userspace
+            # 会话存档 + token 日账本：这两个是**数据**不是代码，跟着镜像版本走会
+            # "换个 tag 记忆就对不上了"。所以从镜像里挂出来，落在节点的 state 目录。
+            - name: state
+              mountPath: /app/agent/sessions
+              subPath: sessions
+            - name: state
+              mountPath: /app/agent/usage
+              subPath: usage
           readinessProbe:
             httpGet:
               path: /agent/api/health
@@ -311,13 +296,9 @@ spec:
 
         # ── 记忆侧车：真图库。wheel 是 cp311，别"顺手升一下" ──
         - name: memory
-          image: docker.io/library/python:3.11-slim
-          imagePullPolicy: IfNotPresent
-          workingDir: /app
-          command: ["python3", "/app/agent/memsvc/server.py"]
+          image: __IMAGE_PREFIX__-memory:__IMAGE_TAG__
+          imagePullPolicy: Always
           env:
-            - name: PYTHONPATH
-              value: /py
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PORT
@@ -327,26 +308,13 @@ spec:
             - name: TZ
               value: Asia/Shanghai
           volumeMounts:
-            - name: app
-              mountPath: /app
             - name: userspace
               mountPath: /userspace
-            - name: py
-              mountPath: /py
           resources:
             requests: {cpu: 20m, memory: 64Mi}
             limits: {cpu: 500m, memory: 512Mi}
 
       volumes:
-        # 壳层静态文件 + agent 代码（不同目录，同一个根，方便一次 tar 上去）
-        - name: www
-          hostPath:
-            path: /olares/emergent-desktop/www
-            type: DirectoryOrCreate
-        - name: app
-          hostPath:
-            path: /olares/emergent-desktop/app
-            type: DirectoryOrCreate
         # 用户 Home：记忆库、人格设定、drift 记录都在这里，Files 里看得见。
         # 路径里的随机后缀不能猜，install.sh 会先用真实路径替换 __USER_HOME__ 再 apply。
         # （直接 kubectl apply 这个文件会失败，这是故意的：猜错的后果是
@@ -355,9 +323,10 @@ spec:
           hostPath:
             path: __USER_HOME__
             type: Directory
-        - name: py
+        # 会话与用量：无状态的东西才配进镜像，这两个有状态。
+        - name: state
           hostPath:
-            path: /olares/emergent-py
+            path: __STATE_DIR__
             type: DirectoryOrCreate
         - name: conf
           configMap:
