@@ -332,6 +332,7 @@ body.launching .rail-zone { display: none; }
 .ag-insp b { display: inline-block; width: 86px; color: rgba(127, 196, 255, .85); font-weight: 400; }
 .ag-insp b.tool { color: rgba(255, 178, 87, .85); }
 .ag-insp b.say { color: rgba(127, 227, 207, .8); }
+.ag-insp b.tok { color: rgba(147, 184, 216, .55); }
 .ag-insp span { color: rgba(147, 184, 216, .5); }
 .ag-insp i { color: rgba(147, 184, 216, .28); font-style: normal; }
 .ag-insp .ln.dim { opacity: .3; }
@@ -344,6 +345,19 @@ body.launching .rail-zone { display: none; }
 .ag-stat b { color: rgba(127, 211, 176, .9); font-weight: 400; }
 .ag-stat .dot { display: inline-block; width: 5px; height: 5px; border-radius: 3px; background: #7fd3b0; margin-right: 6px; vertical-align: 1px; }
 .ag-stat.off .dot { background: #ff7c93; }
+
+/* token 账本（只有 ?dev=1）。
+ * 放右下角、和观察窗（左下）对称 —— 一个是"它在干什么"，一个是"这一切花了多少"。
+ * 数字用等宽字体、右对齐：数字会跳动，不对齐的话每一轮都在抖。 */
+.ag-tok {
+  position: fixed; right: 24px; bottom: 20px; text-align: right;
+  font: 10.5px/1.7 ui-monospace, Menlo, "Cascadia Mono", monospace;
+  color: rgba(147, 184, 216, .34); pointer-events: none;
+}
+.ag-tok b { display: block; color: rgba(147, 184, 216, .62); font-weight: 400; }
+.ag-tok b.hot { color: rgba(255, 178, 87, .92); }
+.ag-tok span { display: block; }
+.ag-tok[hidden] { display: none; }
 
 .ag-hint {
   position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);

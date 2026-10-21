@@ -32,6 +32,7 @@
   #insp b { display: inline-block; width: 86px; color: rgba(127, 196, 255, 0.85); font-weight: 400; }
   #insp b.tool { color: rgba(255, 178, 87, 0.85); }
   #insp b.say { color: rgba(127, 227, 207, 0.8); }
+  #insp b.tok { color: rgba(147, 184, 216, 0.55); }
   #insp span { color: rgba(147, 184, 216, 0.5); }
   #insp i { color: rgba(147, 184, 216, 0.28); font-style: normal; }
   #insp .ln.dim { opacity: 0.3; }
@@ -44,6 +45,17 @@
   #stat b { color: rgba(127, 211, 176, 0.9); font-weight: 400; }
   #stat .dot { display: inline-block; width: 5px; height: 5px; border-radius: 3px; background: #7fd3b0; margin-right: 6px; vertical-align: 1px; }
   #stat.off .dot { background: #ff7c93; }
+
+  /* token 账本：右下一个，观察窗（左下）一个 —— 一个说"它在干什么"，
+     一个说"这一切花了多少"。数字右对齐，否则每轮都在抖。 */
+  #tok {
+    position: fixed; right: 24px; bottom: 20px; text-align: right;
+    font: 10.5px/1.7 ui-monospace, Menlo, monospace;
+    color: rgba(147, 184, 216, 0.34); pointer-events: none;
+  }
+  #tok b { display: block; color: rgba(147, 184, 216, 0.62); font-weight: 400; }
+  #tok b.hot { color: rgba(255, 178, 87, 0.92); }
+  #tok span { display: block; }
 
   #hint {
     position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
@@ -76,6 +88,7 @@
 <input id="type" autocomplete="off" spellcheck="false" aria-label="对 agent 说一句话">
 <div id="insp"></div>
 <div id="stat"><span class="dot"></span><b id="stat-txt">connecting</b></div>
+<div id="tok"></div>
 <div id="hint">回车发送 · 拖仪表 / 拖曲线 / 点元素</div>
 <div id="gate"></div>
 <div id="a11y"></div>
@@ -97,6 +110,7 @@ const inspEl = document.getElementById('insp');
 const statEl = document.getElementById('stat');
 const statTxt = document.getElementById('stat-txt');
 const typeEl = document.getElementById('type');
+const tokEl = document.getElementById('tok');
 const gateEl = document.getElementById('gate');
 const pacer = new Pacer();
 
@@ -132,8 +146,33 @@ function insp(kind, detail, cls = '') {
   [...inspEl.children].forEach((n, i, all) => n.classList.toggle('dim', i < all.length - 4));
 }
 
-let lineText = '';
-let typer = 0;
+/* ───────────────── token 账本 ─────────────────
+ * 上下文水位（到 80% 之后模型开始丢前文，看起来像"模型变笨"）、
+ * 本轮输入输出、今日累计。估算值带 `~`：按字数推出来的数不能长得像账单。 */
+const tokNum = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(2)}M`
+  : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : String(v));
+
+function renderTok(u) {
+  if (!u) return;
+  const pct = u.ctx?.pct ?? 0;
+  const tilde = (u.turn?.est || u.session?.est) ? '~' : '';
+  const money = u.price
+    ? (u.price.free ? '免费' : `¥${(u.day?.cost ?? 0).toFixed(4)}`)
+    : '单价未配置';
+  const lim = `${tokNum(u.limit || 0)}${u.limitSrc === 'default' ? '?' : ''}`;
+  const p = u.ctx?.parts;
+  const partsLine = p
+    ? `<span>系统 ${tokNum(p.sys)} · 工具 ${tokNum(p.tools)} · 历史 ${tokNum(p.hist)}</span>`
+    : '';
+  const cache = u.turn?.cached ? ` · 缓存 ${tokNum(u.turn.cached)}` : '';
+  tokEl.innerHTML =
+    `<b class="${pct >= 75 ? 'hot' : ''}">ctx ${tilde}${tokNum(u.ctx?.tokens || 0)} / ${lim} · ${pct}%</b>`
+    + partsLine
+    + `<span>本轮 ↑${tilde}${tokNum(u.turn?.in || 0)} ↓${tilde}${tokNum(u.turn?.out || 0)} · ${u.turn?.calls || 0} 步${cache}</span>`
+    + `<span>今日 ↑${tokNum(u.day?.in || 0)} ↓${tokNum(u.day?.out || 0)} · ${money}</span>`;
+}
+
+let lineText = '';let typer = 0;
 function say(txt, opt = {}) {
   /* 场的字按"字数 × 预算"占槽位，18 字是这一行能住下的上限。
      超了就截在最后一个句读处 —— 截断总比让半句话消失好。 */
@@ -224,6 +263,7 @@ function onEvent(m) {
       statEl.classList.remove('off');
       statTxt.textContent = 'ready';
       insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
+      renderTok(m.usage);
       say('服务器现在怎么样？', { silent: true });
       typeEl.value = '';
       break;
@@ -321,6 +361,11 @@ function onEvent(m) {
 
     case 'busy':
       insp('busy', '上一轮还没结束，这一步先排队');
+      break;
+
+    case 'usage':
+      renderTok(m);
+      if (m.turn?.calls && !m.final) insp('tok', `↑${m.turn.in} ↓${m.turn.out} · ctx ${m.ctx?.pct ?? 0}%`, 'tok');
       break;
 
     case 'error':

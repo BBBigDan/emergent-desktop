@@ -68,12 +68,17 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   const inspEl = el('div', 'ag-insp');
   const statEl = el('div', 'ag-stat', '<span class="dot"></span><b>connecting</b>');
   const statTxt = statEl.querySelector('b');
+  /* token 账本角标。它是**开发态**的东西，不是 agent 的表达 ——
+     用户不需要知道一次问答花了多少 token，但调提示词的人必须知道：
+     上下文涨到 80% 时，模型开始丢失前几轮的信息，而那看起来像"模型变笨"。
+     没有这个数，所有"它怎么突然不听人话了"的排查都是猜的。 */
+  const tokEl = el('div', 'ag-tok');
   const gateEl = el('div', 'ag-gate');
   const a11yEl = el('div', 'ag-a11y');
   const hintEl = el('div', 'ag-hint', '回车发送 · 拖仪表 / 拖曲线 / 点元素 · Esc 收起');
 
-  layer.append(typeEl, inspEl, statEl, gateEl, a11yEl, hintEl);
-  if (!DEV) { inspEl.hidden = true; statEl.hidden = true; hintEl.hidden = true; }
+  layer.append(typeEl, inspEl, statEl, tokEl, gateEl, a11yEl, hintEl);
+  if (!DEV) { inspEl.hidden = true; statEl.hidden = true; tokEl.hidden = true; hintEl.hidden = true; }
   document.body.appendChild(layer);
 
   /* 唤起热区：桌面常驻，只有贴着底边才存在感 */
@@ -324,6 +329,44 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     [...inspEl.children].forEach((n, i, all) => n.classList.toggle('dim', i < all.length - 4));
   }
 
+  /* ───────────────── token 账本 ─────────────────
+   *
+   * 三行，各回答一个问题：**上下文还有多少余量**（涨到 80% 之后模型开始丢前文，
+   * 而那看起来像"模型变笨"）、**刚才那一轮花了多少**、**今天一共多少**。
+   *
+   * 两个数字上的讲究：
+   *   · 数字一律走同一个缩写函数 —— "3598" 和 "32.0k" 并排会让人误判比例；
+   *   · 估算值前面加 `~`。服务端回了真实 usage 才是账单上的数，
+   *     按字数推出来的数长得一样是这个功能最坏的失败方式。 */
+  const tokNum = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(2)}M`
+    : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : String(v));
+
+  function renderTok(u) {
+    if (!DEV || !u) return;
+    const pct = u.ctx?.pct ?? 0;
+    const est = u.turn?.est || u.session?.est;
+    const tilde = est ? '~' : '';
+    const money = u.price
+      ? (u.price.free ? '免费' : `¥${(u.day?.cost ?? 0).toFixed(4)}`)
+      : '单价未配置';
+    /* 上限后面加 `?` = 这个窗口大小是**缺省值猜的**，不是查到的。
+       水位百分比全靠它当分母，猜错的话那个百分比就是假的 —— 必须看得出来。 */
+    const lim = `${tokNum(u.limit || 0)}${u.limitSrc === 'default' ? '?' : ''}`;
+    const p = u.ctx?.parts;
+    /* 构成那一行是给"想省 token"的人看的：12k 里 9k 是系统提示词，
+       那裁历史一点用都没有 —— 不知道这件事，优化就会做在最没用的地方。 */
+    const partsLine = p
+      ? `<span>系统 ${tokNum(p.sys)} · 工具 ${tokNum(p.tools)} · 历史 ${tokNum(p.hist)}</span>`
+      : '';
+    const cache = u.turn?.cached ? ` · 缓存 ${tokNum(u.turn.cached)}` : '';
+    tokEl.innerHTML =
+      `<b class="${pct >= 75 ? 'hot' : ''}">ctx ${tilde}${tokNum(u.ctx?.tokens || 0)} / ${lim} · ${pct}%</b>`
+      + partsLine
+      + `<span>本轮 ↑${tilde}${tokNum(u.turn?.in || 0)} ↓${tilde}${tokNum(u.turn?.out || 0)} · ${u.turn?.calls || 0} 步${cache}</span>`
+      + `<span>今日 ↑${tokNum(u.day?.in || 0)} ↓${tokNum(u.day?.out || 0)} · ${money}</span>`;
+    tokEl.classList.toggle('est', !!est);
+  }
+
   /* ───────────────── 与服务端 ───────────────── */
 
   /* sid 存 localStorage：刷新、收起再展开都还是同一段会话。
@@ -423,6 +466,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         statEl.classList.remove('off');
         statTxt.textContent = 'ready';
         insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
+        renderTok(m.usage);
         /* 提示语只在用户还没说话时出现 —— 它占的是"那一行"，不是额外一行 */
         if (!lineText) say('说点什么', { silent: true });
         break;
@@ -523,6 +567,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'note': insp('note', m.message); break;
       case 'busy': insp('busy', '上一轮还没结束，这一步先排队'); break;
+
+      /* 每步一次、轮末再一次。角标常驻，观察窗里只留最后一条当"过程"——
+         每步都往观察窗里加会把工具调用挤出去，而工具调用才是排障的主线。 */
+      case 'usage':
+        renderTok(m);
+        if (m.turn?.calls && !m.final) {
+          insp('tok', `↑${m.turn.in} ↓${m.turn.out} · ctx ${m.ctx?.pct ?? 0}%`, 'tok');
+        }
+        break;
 
       /* 两个新的输出通道 */
       case 'surface':

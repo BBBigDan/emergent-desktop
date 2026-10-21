@@ -29,6 +29,7 @@ import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
+import { createMeter, estTokens, ymd } from './usage.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -76,6 +77,9 @@ const sessions = new Map();
    而这一屏往往是他正在看的东西，不是可以随手丢掉的过程。
    存三样就够：对话（模型的上下文）、最后一屏（眼睛看到的）、最后的读数（兜底要用）。 */
 const SESS_DIR = path.join(HERE, 'sessions');
+/* 日账本目录。**和会话分开**：会话是"这段对话说了什么"，
+   账本是"这一天一共烧了多少"——重启会话不该让今天的账清零。 */
+const USAGE_DIR = path.join(HERE, 'usage');
 const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;   // sid 会变成文件名，先卡死形状
 
 async function loadSession(sid) {
@@ -107,6 +111,9 @@ async function saveNow(s) {
       log: (s.log || []).slice(-40),
       status: s.lastStatus || null,
       apps: s.lastApps || null,
+      /* token 账本也一起存：刷新之后"这个会话花了多少"不能从零开始。
+         存的是快照不是 meter 实例 —— 恢复时重建，避免把闭包塞进 JSON。 */
+      usage: s.meter ? s.meter.snap() : null,
     };
     await fs.writeFile(path.join(SESS_DIR, `${s.sid}.json`), JSON.stringify(data));
   } catch { /* 落盘失败不该影响对话 */ }
@@ -188,6 +195,11 @@ async function getSession(sid) {
       resumed: !!saved?.scene,
     };
     s.model = makeModel();
+    /* 账本按模型建：上下文上限和单价都是**模型**的属性，不是会话的属性。
+       落在 sessions/*.json 里的是快照，这里重建实例再灌回去 —— 刷新之后
+       "这个会话花了多少"不能从零开始算。 */
+    s.meter = await createMeter({ model: s.model.model || s.model.name, dir: USAGE_DIR });
+    s.meter.restore(saved?.usage);
     sessions.set(sid, s);
   }
   return s;
@@ -225,6 +237,36 @@ function emit(s, ev) {
     if (res.writableEnded) { s.reses.delete(res); continue; }
     res.write(line);
   }
+}
+
+/** 记一次模型调用的 token。
+ *
+ *  为什么在**调用点**记、而不是在模型适配器里记：只有这里知道两件
+ *  适配器看不见的事 —— ① 实际发出去的上下文（记忆注入、技能注入都在
+ *  `withMemory` 里拼的，适配器只收到结果）；② 这是第几步、属于哪一轮。
+ *  账要按"用户看到的那一轮"算，不是按"HTTP 请求"算。 */
+function recordUsage(s, out, msgs, schemas) {
+  if (!s.meter) return null;
+  /* 适配器没给 usage 时（mock、本地桩、某些网关）按字数估，但**标出来**：
+     估算值和账单长得一样，是这个功能最坏的失败方式。 */
+  const u = out?.usage || {
+    prompt: estTokens(JSON.stringify(msgs || [])),
+    completion: estTokens(out?.content || ''),
+    cached: 0,
+    est: true,
+  };
+  /* 上下文的构成。真实 usage 只给总数（12k），而 12k 里可能 9k 是系统提示词 ——
+     不知道这件事，"裁历史省 token"就会裁错地方。三份按字数估、最后按比例
+     对齐到真实总数（见 usage.mjs），所以比例可信、绝对值是估的。 */
+  const sysMsg = (msgs || []).find((m) => m.role === 'system');
+  const parts = {
+    sys: estTokens(sysMsg?.content || ''),
+    tools: estTokens(JSON.stringify(schemas || [])),
+    hist: estTokens(JSON.stringify((msgs || []).filter((m) => m.role !== 'system'))),
+  };
+  const snap = s.meter.add(u, { ms: out?.ms, msgs: (msgs || []).length, parts });
+  emit(s, { t: 'usage', ...snap });
+  return snap;
 }
 
 /* ───────────────────────── 说过什么 ───────────────────────── */
@@ -501,11 +543,23 @@ function healToolCalls(s) {
 
 async function runTurn(s, goal) {
   if (s.busy) { emit(s, { t: 'busy' }); return; }
+  /* 预算闸放在最前面：**不是**等这一轮跑完再记账。
+     限额的意义就是"不让它开始"，跑完再说超了，钱已经花了。
+     默认不限（TOKEN_DAY_CAP 没设），设了才拦。 */
+  if (s.meter?.overBudget()) {
+    const u = s.meter.snap();
+    speak(s, '今天的量用完了');
+    emit(s, { t: 'usage', ...u });
+    emit(s, { t: 'note', message: `今日已用 ${u.day.in + u.day.out} token，上限 ${u.cap.limit}（TOKEN_DAY_CAP）` });
+    emit(s, { t: 'idle' });
+    return;
+  }
   s.busy = true;
   s.abortCtl = new AbortController();
   let aborted = false;
   s.goal = goal;
   s.turn++;
+  s.meter?.beginTurn();
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
   s.narrated = false;       // 观察窗里还没提示过"旁白被咽掉"
   s.sets = 0;
@@ -573,10 +627,12 @@ async function runTurn(s, goal) {
       if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
       emit(s, { t: 'think', on: true, step });
       let out;
+      const reqMsgs = withMemory(s.messages, ctxNote);
+      const schemas = s.tools.schemas();
       try {
         out = await s.model.complete({
-          messages: withMemory(s.messages, ctxNote),
-          tools: s.tools.schemas(),
+          messages: reqMsgs,
+          tools: schemas,
           /* 第一轮的第一步**强制取证**。
              这不是不信任模型，是"先看再说"属于协议而不是建议：
              便宜模型很容易跳过工具、直接凭上下文编一个读数（实测过：
@@ -600,6 +656,7 @@ async function runTurn(s, goal) {
            整个场看起来在抖，像是卡住了，而不是"出错了"。 */
         emit(s, { t: 'think', on: false, step });
       }
+      recordUsage(s, out, reqMsgs, schemas);
 
       /* 空回复重试一次。
          7B 实测会偶尔吐一个空 message（没有 content，也没有 tool_calls）——
@@ -608,11 +665,14 @@ async function runTurn(s, goal) {
          把这一轮判死。只重试 step 0，免得在本该停下的地方原地打转。 */
       if (step === 0 && !(out.tool_calls || []).length && !String(out.content || '').trim()) {
         emit(s, { t: 'note', message: '模型空回复，重试一次' });
+        /* 那一次空回复**也要记账**：它同样发了整份上下文，同样计费。
+           上面那次已经记过了，这里只记重试这一次。 */
+        const retryMsgs = withMemory(s.messages, (ctxNote ? ctxNote + '\n\n' : '')
+          + '（上一次回答是空的。不要解释这件事，直接用一句话回答用户刚才的问题。）');
         try {
           out = await s.model.complete({
-            messages: withMemory(s.messages, (ctxNote ? ctxNote + '\n\n' : '')
-              + '（上一次回答是空的。不要解释这件事，直接用一句话回答用户刚才的问题。）'),
-            tools: s.tools.schemas(),
+            messages: retryMsgs,
+            tools: schemas,
             toolChoice: memHits.length ? 'auto' : 'required',
             goal: { ...goal, pendingTo: s.lastAdjustTo },
             signal: s.abortCtl.signal,
@@ -621,6 +681,7 @@ async function runTurn(s, goal) {
           if (e?.aborted || s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
           throw e;
         }
+        recordUsage(s, out, retryMsgs, schemas);
       }
 
       const calls = out.tool_calls || [];
@@ -1210,6 +1271,14 @@ async function runTurn(s, goal) {
     }
     s.busy = false;
     s.abortCtl = null;
+    /* 轮末结账。放在 idle **之前**：前端收到 idle 就会把状态条改成 ready，
+       这时候再冒一个 usage 出来，等于让那一行闪一下 —— 顺序反了会显得卡。 */
+    if (s.meter) {
+      const u = await s.meter.endTurn().catch(() => s.meter.snap());
+      /* `final` 只是给前端一个记号：轮末这份是总账，和最后一步的数字一样，
+         再往观察窗里插一行就重复了。 */
+      emit(s, { t: 'usage', ...u, final: true });
+    }
     emit(s, { t: 'idle' });
     scheduleSave(s);         // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
   }
@@ -1316,7 +1385,13 @@ const server = http.createServer(async (req, res) => {
        两个页面会互相把对方踢成 disconnected，然后各自重连，永远在打架。 */
     s.reses = s.reses || new Set();
     s.reses.add(res);
-    emit(s, { t: 'hello', sid, model: s.model.name, sys: SYS, tools: Object.keys(s.tools.all) });
+    emit(s, {
+      t: 'hello', sid, model: s.model.name, sys: SYS,
+      tools: Object.keys(s.tools.all),
+      /* 一连上就把账本交出去：刷新、换标签页、隔夜回来，用户第一眼
+         就该看到"这个会话已经用掉多少"，而不是等下一轮才发现。 */
+      usage: s.meter?.snap() || null,
+    });
     /* 重连/刷新：把上一屏原样还回去。它必须是"已经在那儿"的状态，
        不是重新长一遍 —— 用户没有发起任何事，不该看到一场动画。
        判据不是"是不是刚从磁盘读出来的"：服务还活着、会话还在内存里时刷新，
@@ -1391,6 +1466,31 @@ const server = http.createServer(async (req, res) => {
          而这件事恰恰是记忆里最需要被看见的部分（剪掉了什么、合并了什么）。 */
       if (u.searchParams.get('sweep') === '1') await memory.consolidate();
       res.end(JSON.stringify(await memory.debug(q), null, 1));
+    } catch (e) {
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
+    return;
+  }
+
+  /* token 账本。`GET /agent/api/usage?sid=` 给当前会话；
+     `?day=1` 直接读今天的日账本（不需要 sid，重启后也能查）。
+     这条路径存在的理由和 /api/memory 一样：**看不见的东西管不住** ——
+     用户问"刚才那轮花了多少"，没有入口就只能猜。 */
+  if (p === '/api/usage' && req.method === 'GET') {
+    const sid = u.searchParams.get('sid') || '';
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      let day = null;
+      try {
+        const f = path.join(USAGE_DIR, `${ymd()}.json`);
+        day = JSON.parse(await fs.readFile(f, 'utf8'));
+      } catch { /* 今天还没记过 */ }
+      const s = SID_RE.test(sid) ? await getSession(sid) : null;
+      res.end(JSON.stringify({
+        session: s?.meter?.snap() || null,
+        recent: s?.meter?.history() || [],
+        day,
+      }, null, 1));
     } catch (e) {
       res.end(JSON.stringify({ error: String(e?.message || e) }));
     }

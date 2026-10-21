@@ -18,6 +18,8 @@
  *    或者吐出半截 JSON。返回结构与 mock 严格一致，让上层的处理逻辑只有一套。
  */
 
+import { normUsage, estTokens } from './usage.mjs';
+
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
 /* 默认落在一张 ¥0 的模型上：余额为 0 的账户用收费模型会触发账户级停服，
    连免费模型一起 402。要换更强的模型，自己设 MODEL。 */
@@ -140,11 +142,22 @@ export function createOpenAIModel(o = {}) {
         }
 
         const msg = j?.choices?.[0]?.message || {};
+        const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+        /* usage 是**唯一**能信的数：它由服务端算，和我们这边的字数推算无关。
+           没有它（自建服务、某些网关、被代理改写过的响应）就按字数估，
+           但必须带 `est: true` —— 估算值和账单长得一样是这个功能最坏的失败方式。 */
+        const usage = normUsage(j?.usage) || {
+          prompt: estTokens(JSON.stringify(body.messages)) + estTokens(JSON.stringify(body.tools || [])),
+          completion: estTokens(content),
+          cached: 0,
+          est: true,
+        };
         return {
-          content: typeof msg.content === 'string' ? msg.content.trim() : '',
+          content,
           tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
           /* 长度被截断时上面的 tool_calls 可能是半截 JSON —— 上层要能看出来 */
           truncated: j?.choices?.[0]?.finish_reason === 'length',
+          usage,
           ms: Date.now() - t0,
         };
       } catch (e) {
