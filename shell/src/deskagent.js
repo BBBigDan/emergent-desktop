@@ -581,10 +581,21 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
    *
    * 这一层转换必须在客户端：模型**永远不知道画布多大**，这正是它不会算错像素的原因。
    * 顺带把缺省位置补上 —— "画个笑脸"这种事不该要求模型指定 at 和 size。 */
+  /**
+   * 把"模型的语言"翻成"painter 的语言"。
+   *
+   * 这里是整套绘画唯一一处翻译，所以它必须替 painter 兜住方言 —— 不能指望
+   * 模型记住每种图元要哪个字段名。之前 circle 就是个反例：协议告诉它写
+   * at/size，而 painter 读的是 c/r，于是**任何** circle 层都在编译时抛
+   * `Cannot read properties of undefined`，画小狗就变成"它说画好了，屏幕上什么都没有"。
+   * rect 更坏：它不抛，只是让 strokeRect 收到 undefined 宽度，安静地什么都不画。
+   */
   function denorm(spec, w, h) {
     const S = Math.min(w, h);
     const P = (a) => (Array.isArray(a) ? [a[0] * w, a[1] * h] : a);
-    const scale = (s) => (Array.isArray(s) ? [s[0] * w, s[1] * h] : (s <= 1.5 ? s * S : s));
+    /* 相对量：≤1.5 当"短边的比例"；更大的数视为已经是像素（留个后门） */
+    const len = (s) => (Array.isArray(s) ? [s[0] * w, s[1] * h] : (Math.abs(s) <= 1.5 ? s * S : s));
+
     return {
       ...spec,
       layers: (spec.layers || []).map((L) => {
@@ -592,17 +603,59 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* face / text / circle 的 at 是中心，chart / rect 的 at 是左上角 ——
            这个差别由 painter 的几何决定，不强行统一（统一了文字就会偏半个字高）。 */
         const defaultAt = L.type === 'chart' || L.type === 'rect' ? [0.08, 0.16] : [0.5, 0.48];
-        o.at = P(L.at || defaultAt);
+        o.at = P(L.at || L.c || defaultAt);
         if (L.from) o.from = P(L.from);
         if (L.to) o.to = P(L.to);
         if (Array.isArray(L.points)) o.points = L.points.map(P);
-        if (L.c) o.c = P(L.c);
-        if (L.r != null) o.r = Array.isArray(L.r) ? [L.r[0] * w, L.r[1] * h, L.r[2] * w, L.r[3] * h] : L.r * S;
-        const ds = L.type === 'chart' ? [0.84, 0.62] : (L.type === 'text' ? 0.2 : 0.46);
-        o.size = scale(L.size != null ? L.size : ds);
+        const ds = L.type === 'chart' ? [0.84, 0.62]
+          : L.type === 'text' ? 0.2
+            : L.type === 'stencil' ? 0.62 : 0.46;
+        o.size = len(L.size != null ? L.size : ds);
+
+        switch (L.type) {
+          case 'circle': {
+            /* painter 要圆心 c + 半径 r；协议给的是 at + size（size 是直径） */
+            const dia = Array.isArray(o.size) ? o.size[0] : o.size;
+            o.c = o.at;
+            o.r = L.r != null
+              ? (Array.isArray(L.r) ? L.r[0] : (Math.abs(L.r) <= 0.9 ? L.r * S : L.r))
+              : dia / 2;
+            break;
+          }
+          case 'rect': {
+            /* painter 要 [x, y, w, h]；协议给 at（左上）+ size（宽，数字）或 [w,h] */
+            let rw;
+            let rh;
+            if (Array.isArray(o.size)) { rw = o.size[0]; rh = o.size[1]; }
+            else { rw = o.size; rh = L.h != null ? len(L.h) : rw * 0.62; }
+            if (L.w != null) rw = len(L.w);
+            o.r = [o.at[0], o.at[1], rw, rh];
+            break;
+          }
+          case 'path': {
+            /* d 里的数是 0~1 的话，交给 painter 等比缩到短边并居中。
+               不在这里展开成像素：命令参数哪些是 x 哪些是 y，只有解析器分得清，
+               而 0~1 的 path 是最省事的表达"任意形状"的方式。 */
+            const nums = String(L.d || '').match(/-?\d*\.?\d+/g)?.map(Number) || [];
+            const norm = nums.length && nums.every((n) => Math.abs(n) <= 1.8);
+            if (norm) o.norm = true;
+            break;
+          }
+          default:
+            break;
+        }
         return o;
       }),
     };
+  }
+
+  /* 画不出来必须让人看到，而不是只写进检查窗口。
+     之前的失败全落在 insp 里（`?dev=1` 才显示），用户看到的是
+     "它说画好了、屏幕上什么都没有" —— 这是最难受的一种失败：界面对人撒谎。
+     说话行是这一层唯一能开口的地方，就在这里说一句。 */
+  function drawBroken(reason) {
+    insp('draw', reason);
+    say('没画出来', { instant: true });
   }
 
   function runDraw(spec) {
@@ -611,10 +664,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     const h = Math.min(600, Math.round(innerHeight - 300));
     let pack;
     try { pack = compileDraw(denorm(spec, w, h), { w, h, max: 5600 }); } catch (e) {
-      insp('draw', '编译失败：' + (e.message || e));
+      drawBroken('编译失败：' + (e.message || e));
       return;
     }
-    if (!pack.points.length) { insp('draw', '没有点可画'); return; }
+    if (!pack.points.length) { drawBroken('没有点可画'); return; }
 
     /* 画之前把 DOM 内容收掉：它正好盖在画面正中，两套东西抢同一块地方 */
     closeSurface();

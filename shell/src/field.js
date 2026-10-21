@@ -2279,17 +2279,24 @@ export class Field {
       /* ---- 涡 ----
          切向为主、径向为辅。纯径向是"吸"，点会径直飞向中心、像被吸尘器吸走；
          加一个切向分量，它们才会绕着中心卷 —— 用户看到的是"这句话被搅进去了"。
-         swirl 2.6、径向 0.25 是实测手感：再大就成漩涡贴图，再小只是"晃一下"。 */
-      for (let vi = 0; vi < this.vorts.length; vi++) {
-        const O = this.vorts[vi];
-        const dx = O.x - P[i3];
-        const dy = O.y - P[i3 + 1];
-        const d2 = dx * dx + dy * dy;
-        if (d2 > O.r2) continue;
-        const d = Math.sqrt(d2) + 0.001;
-        const pull = O.k * O.env * (1 - d / O.r) * dt;
-        V[i2] += (-dy / d) * pull * O.swirl + (dx / d) * pull * 0.25;
-        V[i2 + 1] += (dx / d) * pull * O.swirl + (dy / d) * pull * 0.25;
+         swirl 2.6、径向 0.25 是实测手感：再大就成漩涡贴图，再小只是"晃一下"。
+
+         但**已经落在画上的点不吃这股风**。这一条是实测补的：模型画完小狗之后
+         这一轮还在继续（还要说一句话、可能再调一次工具），"在想"的涡一直吹，
+         弹簧的平衡点被切向力顶偏，狗就被卷成几条螺旋臂 —— 8 秒的展示期里
+         有 6 秒是糊的。涡是给"还在球里"的点用的。 */
+      if (!isDraw) {
+        for (let vi = 0; vi < this.vorts.length; vi++) {
+          const O = this.vorts[vi];
+          const dx = O.x - P[i3];
+          const dy = O.y - P[i3 + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 > O.r2) continue;
+          const d = Math.sqrt(d2) + 0.001;
+          const pull = O.k * O.env * (1 - d / O.r) * dt;
+          V[i2] += (-dy / d) * pull * O.swirl + (dx / d) * pull * 0.25;
+          V[i2 + 1] += (dx / d) * pull * O.swirl + (dy / d) * pull * 0.25;
+        }
       }
 
       P[i3] += V[i2] * dt;

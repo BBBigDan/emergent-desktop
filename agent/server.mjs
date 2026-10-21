@@ -201,7 +201,15 @@ function pushLog(s, r, text) {
 }
 
 function speak(s, text) {
-  const t = String(text || '').trim();
+  /* 唯一的出口，所以清洗也放在这里。
+     实测 7B 会自己"插图"：`![小狗](data:image/png;base64,iVBOR…)` —— 它能画的是
+     粒子，不是位图；那串东西进说话行就是几十个乱码字符，还会把后面的话全挤掉。 */
+  const t = String(text || '')
+    .replace(/!\[[^\]]*\]\([^)]*\)?/g, '')
+    .replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
+    .replace(/https?:\/\/\S{40,}/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!t) return;
   /* 同一句话不记两次：一轮里"模型自由文本"和"兜底句"可能撞车 */
   const last = (s.log || [])[s.log.length - 1];
@@ -413,6 +421,10 @@ async function runTurn(s, goal) {
         .replace(/^["'「](.*)["'」]$/, '$1')
         .split('\n')[0]
         .replace(/^\s*[-*·]\s*/, '')
+        /* 先清掉它自己插的图，再截字数 —— 反过来的话 40 格的额度会被 base64 吃掉，
+           真正的那句话一个字都留不下。 */
+        .replace(/!\[[^\]]*\]\([^)]*\)?/g, '')
+        .replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
         .trim();
       /* 提到工具名的话是"它对自己下的指令"，不是给用户的话。
          实测原话："请调用 scene_ask 把问题问出来" —— 用户看到只会莫名其妙。 */
@@ -504,6 +516,7 @@ async function runTurn(s, goal) {
            但它们的**体积**不能进模型上下文（上面已经切成一句摘要）。 */
         if (result && result.ok && result.surface) {
           s.lastSurface = result.surface;
+          s.drew = true;          // 铺过东西了，兜底屏不该再来盖一层
           emit(s, { t: 'surface', op: 'set', spec: result.surface });
         }
         if (result && result.ok && result.closeSurface) {
@@ -511,7 +524,20 @@ async function runTurn(s, goal) {
           emit(s, { t: 'surface', op: 'close' });
         }
         if (result && result.ok && result.draw) {
+          /* 画也算"这一屏已经有内容"。不标的话，兜底屏会在画刚上去之后把仪表铺过来 ——
+             用户看到的是自己要求画的东西被一块读数顶掉。 */
+          if (!result.draw.stop) s.drew = true;
           emit(s, { t: 'draw', spec: result.draw });
+        }
+
+        /* 一行日志：Pod 里没有别的观察窗，出问题时只能靠它。
+           画/渲染树只记层数，不记内容 —— 那些可能有几十 KB。 */
+        if (result) {
+          const tag = result.error ? `err ${String(result.error).slice(0, 70)}`
+            : result.draw ? `draw ${result.draw.stop ? 'stop' : `${result.draw.layers?.length || 0}层`}`
+              : result.surface ? `surface ${result.surface.root?.type || ''}`
+                : result.op ? `scene ${result.op}` : 'ok';
+          console.log(`[tool] ${name} ${Date.now() - t0}ms ${tag}`);
         }
 
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */

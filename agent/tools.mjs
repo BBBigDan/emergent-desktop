@@ -576,19 +576,28 @@ export function makeTools(o = {}) {
   add('draw', {
     level: 'safe',
     describe: '用桌面自己的粒子画一幅画（解释类问题首选）。'
-      + '层类型：face（表情，给 mood）/ text（字）/ chart（柱状或折线，给 data）/ arrow / '
-      + 'line / polyline / circle / rect / path。坐标用 0~1 的相对值，不是像素。'
+      + '层类型：stencil（具象图形，给 name）/ face（表情，给 mood）/ text（字）/ '
+      + 'chart（柱状或折线，给 data）/ arrow / line / polyline / circle / rect / path。'
+      + '**要画具体的东西一律先看 stencil**：name 有 dog / cat / house / tree / star / '
+      + 'heart / check / cross / arrow / sun / cloud / person，图形是画好的，一定认得出。'
+      + '别拿 circle 拼、也别自己写 path 去描一只狗 —— 你描不出来。'
+      + '坐标全部是 0~1 的相对值（左上角 0,0），不是像素。'
       + '画会占用桌面，默认 8 秒后自动散开。',
     schema: {
       type: 'object',
       properties: {
         layers: {
           type: 'array',
-          description: '最多 4 层',
+          description: '最多 6 层',
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['face', 'text', 'chart', 'arrow', 'line', 'polyline', 'circle', 'rect', 'path'] },
+              type: { type: 'string', enum: ['stencil', 'face', 'text', 'chart', 'arrow', 'line', 'polyline', 'circle', 'rect', 'path'] },
+              name: {
+                type: 'string',
+                enum: ['dog', 'cat', 'house', 'tree', 'star', 'heart', 'check', 'cross', 'arrow', 'sun', 'cloud', 'person'],
+                description: 'stencil 画什么',
+              },
               mood: { type: 'string', enum: ['happy', 'calm', 'sad', 'angry', 'surprised', 'thinking'] },
               text: { type: 'string', description: 'text 层画的字，≤6 字' },
               kind: { type: 'string', description: 'chart 的形状：bars | line' },
@@ -596,9 +605,14 @@ export function makeTools(o = {}) {
               labels: { type: 'array', items: { type: 'string' }, description: 'chart 的 x 轴标签（可选）' },
               from: { type: 'array', items: { type: 'number' }, description: 'arrow/line 起点 [x,y]，0~1' },
               to: { type: 'array', items: { type: 'number' }, description: 'arrow/line 终点 [x,y]，0~1' },
-              points: { type: 'array', description: 'polyline 的点列 [[x,y],...]，0~1' },
+              points: { type: 'array', description: 'polyline 的点列 [[x,y],...]，0~1，至少 2 个' },
+              d: { type: 'string', description: 'path 的 SVG 路径，如 "M .32 .60 C .32 .44 .42 .34 .5 .34 ..."（坐标 0~1，可用 M L C Q Z）' },
+              closed: { type: 'boolean', description: 'polyline 是否收口成闭合轮廓（画身体、脸这类形状时用）' },
+              fill: { type: 'boolean', description: '实心而不是描边（可选）' },
               at: { type: 'array', items: { type: 'number' }, description: '位置 [x,y]，0~1。face/text/circle 是中心，chart/rect 是左上角。不填由系统摆' },
-              size: { type: 'number', description: '相对大小 0~1（文字是字号、表情是直径、图表的宽），不填由系统定' },
+              size: { type: 'number', description: '相对大小 0~1（文字是字号、表情/圆的直径、矩形的宽），不填由系统定' },
+              w: { type: 'number', description: 'rect 的宽（0~1，可选）' },
+              h: { type: 'number', description: 'rect 的高（0~1，可选）' },
               color: { type: 'string', description: '#rrggbb（可选）' },
             },
             required: ['type'],
@@ -611,8 +625,55 @@ export function makeTools(o = {}) {
       additionalProperties: false,
     },
     run: async ({ layers, hold }) => {
-      const L = (layers || []).slice(0, 4);
+      const L = (layers || []).slice(0, 6);
       if (!L.length) return { ok: false, error: '至少要有一层' };
+      /* 画不出来的要当场说，别让模型以为成功了。
+       *
+       * 之前这一步只看"有没有 layers"，于是 circle 缺 at、path 缺 d 全都回 ok:true，
+       * 模型照常说"画好了"，屏幕上一片空白 —— 客户端那边只有 ?dev=1 才看得见。
+       * 现在缺字段直接返回 error：模型在同一个回合里还能自己补一次。 */
+      const bad = [];
+      const isPt = (v) => Array.isArray(v) && v.length === 2 && v.every((n) => Number.isFinite(n));
+      const inRange = (v) => (isPt(v) ? v.every((n) => Math.abs(n) <= 1.6) : true);
+      L.forEach((l, i) => {
+        const n = i + 1;
+        if (!l || !l.type) { bad.push(`第 ${n} 层缺 type`); return; }
+        switch (l.type) {
+          case 'stencil':
+            if (!l.name) bad.push(`第 ${n} 层 stencil 缺 name（dog/cat/house/tree/star/heart/check/cross/arrow/sun/cloud/person）`);
+            break;
+          case 'circle':
+            if (!isPt(l.at) && !isPt(l.c)) bad.push(`第 ${n} 层 circle 缺 at:[x,y]`);
+            break;
+          case 'rect':
+            if (!isPt(l.at)) bad.push(`第 ${n} 层 rect 缺 at:[x,y]（左上角）`);
+            break;
+          case 'line':
+          case 'arrow':
+            if (!isPt(l.from) || !isPt(l.to)) bad.push(`第 ${n} 层 ${l.type} 缺 from/to`);
+            break;
+          case 'polyline':
+            if (!Array.isArray(l.points) || l.points.length < 2) bad.push(`第 ${n} 层 polyline 的 points 至少要 2 个点`);
+            else if (!l.points.every(inRange)) bad.push(`第 ${n} 层 polyline 的坐标要用 0~1`);
+            break;
+          case 'path':
+            if (typeof l.d !== 'string' || !l.d.trim()) bad.push(`第 ${n} 层 path 缺 d（SVG 路径字符串）`);
+            break;
+          case 'text':
+            if (!l.text) bad.push(`第 ${n} 层 text 缺 text`);
+            break;
+          case 'chart':
+            if (!Array.isArray(l.data) || l.data.length < 2) bad.push(`第 ${n} 层 chart 的 data 至少要 2 个数`);
+            break;
+          default:
+            break;
+        }
+        if (isPt(l.at) && !inRange(l.at)) bad.push(`第 ${n} 层 at 超出 0~1（是相对坐标，不是像素）`);
+        if (isPt(l.from) && !inRange(l.from)) bad.push(`第 ${n} 层 from 超出 0~1`);
+        if (isPt(l.to) && !inRange(l.to)) bad.push(`第 ${n} 层 to 超出 0~1`);
+      });
+      if (bad.length) return { ok: false, error: `${bad.join('；')}。补齐后重新调一次 draw。` };
+
       const h = Number(hold);
       return { ok: true, draw: { layers: L, hold: Number.isFinite(h) ? Math.min(30000, Math.max(2500, h)) : 8000 } };
     },
