@@ -260,6 +260,19 @@ export class Field {
     this.col0 = null;                        // ambient 原色快照（退出绘画时还原）
     this.wells = [];                         // 引力井（光标、被悬停的目标）—— 见 setWells
 
+    /* 全局压暗：0 = 场退到看不见，1 = 正常。它是一条连续的线而不是开关，
+       因为"退到后面"必须能半路停住（记录面板半透明时场要还能看见一点）。 */
+    this.uiFade = 1;
+    this.uiFadeTo = 1;
+
+    /* 涡：一次性的切向力，按时间衰减后自己消失。
+     *
+     * 为什么不能复用 wells：wells 每帧被 setWells 整表重写（光标一动就换一批），
+     * 涡要的是"我起的这一下，谁也別擦掉，它自己烧完"。两套寿命不同的力混在
+     * 一张表里，必然有一个被另一个覆盖 —— 实测就是"鼠标一划过，涡就没了"。
+     * 涡给的是切向加速度：点会绕着它转，而不是被吸过去。 */
+    this.vorts = [];
+
     /* --- 相干度 ---
      * 0 = 完全溶解：点还在这里、还在动，但失去了"该在哪"这件事，摊成一团噪雾。
      * 1 = 完全成形：每颗点都精确落在它该在的位置上。
@@ -1953,10 +1966,67 @@ export class Field {
     }
   }
 
+  /* ───────────── 涡（一次性切向力） ─────────────
+   *
+   * 用途：把"刚刚发生的动作"变成一股看得见的风。用户按下回车时，那句话
+   * 不该只是淡出 —— 它应该被**搅散**：点绕着它转、被甩出去，然后再被弹簧
+   * 收拾回来。这是这套界面唯一能表达"它把你的话拿走了"的方式，
+   * 因为这里没有气泡、没有"正在输入…"这种东西。
+   *
+   * @param {number} x 屏幕坐标
+   * @param {number} y
+   * @param {{r?:number,k?:number,swirl?:number,ms?:number,ease?:number}} [opt]
+   */
+  vortex(x, y, opt = {}) {
+    const cx = this.W * 0.5;
+    const cy = this.H * 0.5;
+    const r = opt.r || 520;
+    this.vorts.push({
+      x: x - cx,
+      y: cy - y,
+      r, r2: r * r,
+      k: opt.k ?? 1500,
+      swirl: opt.swirl ?? 2.6,
+      t0: this.time,
+      ms: opt.ms ?? 900,
+      ease: opt.ease ?? 1.7,          // >1 时前段更猛，收得更快
+      env: 1,
+    });
+    /* 同时打散一下相干度：纯切向力只会让点绕圈，"被搅开"还需要它自己散。
+       这一步不走 setCoherence —— 那个由"在想"状态管，会被下一帧覆盖。 */
+    if (opt.loose) this.coh = Math.min(this.coh, opt.loose);
+  }
+
+  /** 涡是否还在起作用（前端用它决定要不要恢复"在想"的相干度） */
+  get vortexing() {
+    return this.vorts.length > 0;
+  }
+
   stepShape(dt) {
     const t = this.time;
     const n = AMBIENT_N;
     const T = this.ta, P = this.pos, V = this.vel;
+
+    /* 涡的时间包络。env 乘在**力**上而不是位移上：力退到 0 之后点还带着速度
+       继续走一段，再被弹簧拉回来 —— 余韵来自这里，硬切就没有。 */
+    /* 全局压暗的趋近：6 是手感值 —— 约 0.3s 退到位，和记录面板的淡入同拍 */
+    if (Math.abs(this.uiFade - this.uiFadeTo) > 0.002) {
+      this.uiFade += (this.uiFadeTo - this.uiFade) * Math.min(1, dt * 6);
+    } else if (this.uiFade !== this.uiFadeTo) {
+      this.uiFade = this.uiFadeTo;
+    }
+
+    if (this.vorts.length) {
+      let w = 0;
+      for (let i = 0; i < this.vorts.length; i++) {
+        const v = this.vorts[i];
+        const u = (t - v.t0) / (v.ms * 0.001);
+        if (u >= 1) continue;
+        v.env = Math.pow(1 - u, v.ease);
+        this.vorts[w++] = v;
+      }
+      this.vorts.length = w;
+    }
 
     /* 绘画混合量：聚上去 0.9s，散回来 1.6s。
        指数逼近而不是线性 —— 快到目标时自然减速，不会有"啪一下到位"的硬边。 */
@@ -2199,6 +2269,22 @@ export class Field {
         }
       }
 
+      /* ---- 涡 ----
+         切向为主、径向为辅。纯径向是"吸"，点会径直飞向中心、像被吸尘器吸走；
+         加一个切向分量，它们才会绕着中心卷 —— 用户看到的是"这句话被搅进去了"。
+         swirl 2.6、径向 0.25 是实测手感：再大就成漩涡贴图，再小只是"晃一下"。 */
+      for (let vi = 0; vi < this.vorts.length; vi++) {
+        const O = this.vorts[vi];
+        const dx = O.x - P[i3];
+        const dy = O.y - P[i3 + 1];
+        const d2 = dx * dx + dy * dy;
+        if (d2 > O.r2) continue;
+        const d = Math.sqrt(d2) + 0.001;
+        const pull = O.k * O.env * (1 - d / O.r) * dt;
+        V[i2] += (-dy / d) * pull * O.swirl + (dx / d) * pull * 0.25;
+        V[i2 + 1] += (dx / d) * pull * O.swirl + (dy / d) * pull * 0.25;
+      }
+
       P[i3] += V[i2] * dt;
       P[i3 + 1] += V[i2 + 1] * dt;
 
@@ -2237,9 +2323,15 @@ export class Field {
            那些弧会从字缝里穿过去，读起来像脏屏幕。 */
         if (drawMix > 0.002) sa *= 1 - (this.drawDim ?? 0.78) * drawMix;
       }
+      /* 全局压暗：场被"推到后面"的时候用（翻记录、模态确认）。
+         它压的是**所有**点 —— 画上的字和背景的球一起退，不能只退背景：
+         只退背景的话，画面上的字会浮在雾上，反而更抢眼。 */
+      if (this.uiFade < 0.999) {
+        sa *= this.uiFade;
+        ss *= 0.86 + 0.14 * this.uiFade;
+      }
       this.alpha[i] += (sa - this.alpha[i]) * f;
       this.size[i] += (ss - this.size[i]) * f;
-
       /* 颜色：画是彩色的，ambient 只有 5 条纬度色带。
          退出作画后再缓慢褪回原色（用 col0 快照，不要重算调色板）。 */
       if (this.drawSeen) {

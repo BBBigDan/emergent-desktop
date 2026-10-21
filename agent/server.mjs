@@ -100,6 +100,9 @@ async function saveNow(s) {
       scene: s.lastSceneSpec || null,
       ops: s.postOps || null,
       line: s.lastLine || '',
+      /* 说话记录：屏幕上那一行只活一回合，用户想回头看一眼"刚才它怎么说的"
+         没有别的地方可查 —— 场里 20 格、工具调用也不该给用户看。 */
+      log: (s.log || []).slice(-40),
       status: s.lastStatus || null,
       apps: s.lastApps || null,
     };
@@ -137,6 +140,7 @@ async function getSession(sid) {
       lastSceneSpec: saved?.scene || null,
       postOps: saved?.ops || null,
       lastLine: saved?.line || '',
+      log: Array.isArray(saved?.log) ? saved.log : [],
       lastStatus: saved?.status || null,
       lastApps: saved?.apps || null,
       resumed: !!saved?.scene,
@@ -179,6 +183,34 @@ function emit(s, ev) {
     if (res.writableEnded) { s.reses.delete(res); continue; }
     res.write(line);
   }
+}
+
+/* ───────────────────────── 说过什么 ───────────────────────── */
+
+/* 场里那一行每回合都会被新的一句顶掉，于是"刚才它怎么说的"在界面上不留痕。
+ * 这里把两边说过的话按顺序记下来：屏幕不常驻，但按上键能翻回去。
+ * 它不是聊天记录 —— 没有气泡、没有角色头像，只有"这台机器最近说过什么"。 */
+const LOG_MAX = 40;
+
+function pushLog(s, r, text) {
+  s.log = s.log || [];
+  s.log.push({ r, t: String(text).slice(0, r === 'u' ? 300 : 120), ts: Date.now() });
+  if (s.log.length > LOG_MAX) s.log.splice(0, s.log.length - LOG_MAX);
+  scheduleSave(s);
+}
+
+function speak(s, text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  /* 同一句话不记两次：一轮里"模型自由文本"和"兜底句"可能撞车 */
+  const last = (s.log || [])[s.log.length - 1];
+  if (!last || last.r !== 'a' || last.t !== t) pushLog(s, 'a', t);
+  emit(s, { t: 'say', text: t });
+}
+
+function hear(s, text, r = 'u') {
+  const t = String(text || '').trim();
+  if (t) pushLog(s, r, t);
 }
 
 /* ───────────────────────── 审批门 ───────────────────────── */
@@ -278,12 +310,15 @@ async function runTurn(s, goal) {
      所以它必须是会话的一部分，不能是旁路通道。 */
   if (goal.kind === 'ask') {
     s.messages.push({ role: 'user', content: goal.text });
+    hear(s, goal.text);
     emit(s, { t: 'turn', round: s.turn, kind: 'ask' });
   } else {
     const it = goal.intent || {};
     if (it.kind === 'adjust') s.lastAdjustTo = it.to;
     const line = (INTENT_ZH[it.kind] || (() => '动了一下'))(it);
     s.messages.push({ role: 'user', content: `[手势] ${line}`, intent: it });
+    /* 手势也进记录，但它不是"一句话" —— 前端按另一种笔调排（更暗、前缀是括号） */
+    hear(s, line, 'i');
     emit(s, { t: 'turn', round: s.turn, kind: 'intent', intent: it });
   }
 
@@ -343,7 +378,7 @@ async function runTurn(s, goal) {
       /* s.spoke 必须在这里也置上：模型的自由文本同样占了那一行。
          之前只在 scene 工具的 say 里置位，于是"模型说一句 + 兜底再说一句"
          会同时出现 —— 一行字被两句话争着写，最后看到的是后一句。 */
-      if (voice) { s.spoke = true; s.lastVoice = voice; emit(s, { t: 'say', text: voice }); }
+      if (voice) { s.spoke = true; s.lastVoice = voice; speak(s, voice); }
       else if (speech && !s.narrated) {
         /* 只留第一条。实测一轮里模型会补三次旁白，每条的句式都一样，
            观察窗被刷得看不清工具调用 —— 而"它爱说旁白"这件事看一条就够了。 */
@@ -463,7 +498,7 @@ async function runTurn(s, goal) {
             s.spoke = true;
             s.lastVoice = String(result.say).slice(0, 40);
             s.lastLine = s.lastVoice;
-            emit(s, { t: 'say', text: String(result.say).slice(0, 40) });
+            speak(s, String(result.say).slice(0, 40));
           }
           if (!result.duplicate) {
             s.drew = true;
@@ -512,7 +547,7 @@ async function runTurn(s, goal) {
             s.lastSceneSpec = built.spec;
             s.lastSpecSig = JSON.stringify(built.spec.layers);
             s.postOps = [];
-            if (!s.spoke) { s.spoke = true; s.lastLine = line; emit(s, { t: 'say', text: line }); }
+            if (!s.spoke) { s.spoke = true; s.lastLine = line; speak(s, line); }
             emit(s, { t: 'scene', op: 'set', spec: built.spec });
             emit(s, { t: 'note', message: '数据到手，先铺一屏；模型随后补充' });
           }
@@ -530,7 +565,7 @@ async function runTurn(s, goal) {
     /* 手势回合里把话补上：问题已经问出去了，但那一行字不能空着 */
     if (s.drew && !s.spoke && s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust') {
       s.spoke = true;
-      emit(s, { t: 'say', text: `压到 ${Math.round((s.goal.intent.to ?? 0) * 100)}% 要重启占内存最多的那个` });
+      speak(s, `压到 ${Math.round((s.goal.intent.to ?? 0) * 100)}% 要重启占内存最多的那个`);
     }
 
     /* ── 兜底 1：拖了仪表，模型却没问 ──
@@ -541,7 +576,7 @@ async function runTurn(s, goal) {
       const to = Math.round((it.to ?? 0) * 100);
       if (!s.spoke) {
         s.spoke = true;
-        emit(s, { t: 'say', text: `压到 ${to}% 要重启占内存最多的那个` });
+        speak(s, `压到 ${to}% 要重启占内存最多的那个`);
       }
       emit(s, {
         t: 'scene', op: 'patch',
@@ -574,7 +609,7 @@ async function runTurn(s, goal) {
         { note: !s.spoke },
       );
       if (built) {
-        if (!s.spoke) { s.spoke = true; emit(s, { t: 'say', text: built.say }); }
+        if (!s.spoke) { s.spoke = true; speak(s, built.say); }
         emit(s, { t: 'scene', op: 'set', spec: built.spec });
         emit(s, { t: 'note', message: '模型没有给出这一屏，由系统按读数兜底铺开' });
       }
@@ -682,7 +717,7 @@ const server = http.createServer(async (req, res) => {
        判据不是"是不是刚从磁盘读出来的"：服务还活着、会话还在内存里时刷新，
        同样要恢复（第一版只在 resuming 时发，于是刷新后一片空白）。 */
     if (s.lastSceneSpec) {
-      emit(s, { t: 'resume', scene: s.lastSceneSpec, ops: s.postOps || null, line: s.lastLine || '' });
+      emit(s, { t: 'resume', scene: s.lastSceneSpec, ops: s.postOps || null, line: s.lastLine || '', log: (s.log || []).slice(-LOG_MAX) });
     }
 
     const ping = setInterval(() => {
@@ -715,6 +750,24 @@ const server = http.createServer(async (req, res) => {
     const s0 = sessions.get(u.searchParams.get('sid'));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(s0?.messages ?? [], null, 1));
+    return;
+  }
+
+  /* 说话记录。前端平时靠 SSE 累积，这一条是给"刚打开、还没收到 resume"
+     和"想单独看一眼"用的 —— 刷新、跨设备、换标签页都能拿到同一份。 */
+  if (p === '/api/history' && req.method === 'GET') {
+    const sid = u.searchParams.get('sid') || '';
+    if (!SID_RE.test(sid)) { res.writeHead(400).end('{"error":"bad sid"}'); return; }
+    let s;
+    try {
+      s = await getSession(sid);
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ log: (s.log || []).slice(-LOG_MAX) }));
     return;
   }
 

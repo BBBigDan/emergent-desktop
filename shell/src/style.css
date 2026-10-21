@@ -351,6 +351,57 @@ body.launching .rail-zone { display: none; }
   color: rgba(147, 184, 216, .3); pointer-events: none; text-align: center;
 }
 
+/* 记录：唯一有意不做成粒子的一块。
+ * 点阵里中文要 ~30px 才认得出，12px 的汉字必然糊成一团 —— 而记录的全部价值
+ * 就是"能读"。所以它是一片雾：没有框、没有气泡、没有分隔线，字从雾里浮出来，
+ * 上下的边缘化开（mask），像场自己沉下去的一层记忆。 */
+.ag-hist {
+  position: fixed; left: 50%; bottom: 148px; z-index: 5;
+  width: min(660px, 72vw); pointer-events: auto;
+  transform: translateX(-50%) translateY(7px);
+  opacity: 0; transition: opacity .22s ease, transform .22s ease;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 11%, #000 86%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 11%, #000 86%, transparent 100%);
+}
+.ag-hist.in { opacity: 1; transform: translateX(-50%); }
+.ag-hist[hidden] { display: none; }
+.ag-hist-in {
+  max-height: 46vh; overflow-y: auto; scrollbar-width: none;
+  padding: 24px 10px 20px;
+  background: radial-gradient(120% 95% at 50% 100%,
+    rgba(5, 9, 14, .93), rgba(5, 9, 14, .8) 62%, rgba(5, 9, 14, 0));
+  backdrop-filter: blur(3px);
+}
+.ag-hist-in::-webkit-scrollbar { width: 0; }
+
+.ag-hist .hrow { display: flex; gap: 10px; align-items: baseline; padding: 5px 8px; }
+.ag-hist .hm {
+  flex: 0 0 11px; font-size: 10px; letter-spacing: .06em;
+  color: rgba(127, 196, 255, .45);
+}
+.ag-hist .hrow.a .hm { color: rgba(127, 227, 207, .55); }
+.ag-hist .hrow.i .hm { color: rgba(147, 184, 216, .28); }
+.ag-hist p {
+  flex: 1; margin: 0; word-break: break-word;
+  font-size: 13.5px; line-height: 1.75; color: rgba(226, 238, 252, .86);
+}
+.ag-hist .hrow.u p { color: rgba(150, 186, 218, .62); }
+.ag-hist .hrow.i p { color: rgba(147, 184, 216, .4); }
+.ag-hist .ht {
+  flex: 0 0 auto; font: 9.5px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  color: rgba(147, 184, 216, .22);
+}
+
+/* 入口本身也是一个字，不是一个图标 —— 这一层不出现按钮的图形 */
+.ag-hist-btn {
+  position: fixed; z-index: 5; pointer-events: auto; cursor: pointer;
+  background: transparent; border: 0; padding: 3px 2px;
+  font: 10.5px/1 ui-monospace, Menlo, monospace; letter-spacing: .14em;
+  color: rgba(147, 184, 216, .24); transition: color .2s;
+}
+.ag-hist-btn:hover, .ag-hist-btn.on { color: rgba(190, 225, 255, .66); }
+.ag-hist-btn[hidden] { display: none; }
+
 /* 审批的兜底：当场里没有分叉可借用时，用一条 DOM 带子。
    审批是**系统的 affordance**，不受模型表达自由支配 —— 所以它允许不是粒子。 */
 .ag-gate {

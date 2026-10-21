@@ -277,7 +277,12 @@ function toggleFullscreen() {
 
 // Esc：先收 agent，再退出应用列表，再收应用栏，都没有就关最上层窗口
 const _esc = () => {
-  if (agent?.isOpen()) { agent.close(); return; }
+  /* Esc 撤掉的是"眼前最上面那一层"：记录是浮在场上的，先收它 */
+  if (agent?.isOpen()) {
+    if (agent.closeHistory?.()) return;
+    agent.close();
+    return;
+  }
   if (field.launchMode) { launch?.close(); field.setLaunchMode(0); return; }
   if (rail?.isOpen()) { rail.close(); return; }
   let top = null;

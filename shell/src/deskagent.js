@@ -40,6 +40,11 @@ function el(tag, cls, html) {
   return n;
 }
 
+/* 记录里的文字来自模型，别让它当 HTML 用（它偶尔会吐 `<` 或 `&`） */
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
 /**
  * @param {object} o
  * @param {import('./field.js').Field} o.field   桌面自己的粒子场（唯一的）
@@ -76,6 +81,92 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   const a11y = new FieldA11y(a11yEl);
   const pacer = new Pacer();
 
+  /* ───────────────── 说过什么（记录） ─────────────────
+   *
+   * 场里只有一行，新的一句会顶掉旧的一句 —— 用户想翻回去看"刚才它到底怎么说"
+   * 在界面上没有任何地方可看。这里留最近几条（服务端也存，刷新/换设备都在）。
+   *
+   * 它为什么是 DOM：点阵里中文要 ~30px 才认得出（见 auth 那一课的结论），
+   * 12~13px 的汉字点阵必然糊成一团，而记录的全部价值就是"能读"。
+   * 所以它是唯一有意不做成粒子的东西 —— 但仍然没有框、没有气泡，只是一段雾。 */
+
+  let log = [];
+  let histOpen = false;
+
+  const histEl = el('div', 'ag-hist');
+  const histIn = el('div', 'ag-hist-in');
+  histEl.appendChild(histIn);
+  histEl.hidden = true;
+
+  const histBtn = el('button', 'ag-hist-btn', '↑ 记录');
+  histBtn.type = 'button';
+  histBtn.hidden = true;
+
+  layer.append(histEl, histBtn);
+
+  function histPush(r, text) {
+    const t = String(text || '').trim();
+    if (!t) return;
+    const last = log[log.length - 1];
+    if (last && last.r === r && last.t === t) return;
+    log.push({ r, t, ts: Date.now() });
+    if (log.length > 40) log.splice(0, log.length - 40);
+    if (histOpen) renderHist();
+    histBtn.hidden = log.length < 2 || open === false;
+  }
+
+  const HHMM = (ts) => {
+    const d = new Date(ts || Date.now());
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  };
+
+  function renderHist() {
+    histIn.innerHTML = '';
+    /* 只给最近几条：这不是聊天记录，是"刚才"。再往前翻也没有上下文了。 */
+    const rows = log.slice(-10);
+    for (const e of rows) {
+      const row = el('div', `hrow ${e.r}`);
+      row.append(el('span', 'hm', e.r === 'a' ? '场' : e.r === 'i' ? '手' : '我'),
+        el('p', '', escapeHTML(e.t)),
+        el('i', 'ht', HHMM(e.ts)));
+      histIn.appendChild(row);
+    }
+    histIn.scrollTop = histIn.scrollHeight;
+  }
+
+  function openHist() {
+    if (open === false || !log.length) return;
+    histOpen = true;
+    renderHist();
+    histEl.hidden = false;
+    histBtn.classList.add('on');
+    requestAnimationFrame(() => histEl.classList.add('in'));
+    /* 翻记录时把场推到后面（uiFade），而不是撤掉它。
+       两样东西叠在一起时，谁都不该被另一个"关掉" —— 用户只是回头看一眼，
+       不是离开这一屏。压到 0.1 之后字读得清，球还在动，回来也是原位。 */
+    field.uiFadeTo = 0.1;
+  }
+
+  function closeHist() {
+    if (!histOpen) return;
+    histOpen = false;
+    histEl.classList.remove('in');
+    histBtn.classList.remove('on');
+    field.uiFadeTo = 1;
+    setTimeout(() => { if (!histOpen) histEl.hidden = true; }, 180);
+  }
+
+  histBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    histOpen ? closeHist() : openHist();
+  });
+  /* 点在雾以外就收起：没有遮罩层，就不该有"点哪儿都关不掉"的感觉 */
+  addEventListener('pointerdown', (e) => {
+    if (!histOpen) return;
+    if (e.target instanceof Element && e.target.closest('.ag-hist, .ag-hist-btn')) return;
+    closeHist();
+  });
+
   /* ───────────────── 场（桌面那一片，同一个） ───────────────── */
 
   let area = null;
@@ -93,6 +184,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        场太高会显得"吊在上半屏"，太低又会被那行字顶住。 */
     area = { w, h, x: Math.round((W - w) / 2), y: Math.max(72, Math.round((H - h) / 2 - 8)) };
     lineY = H - 116;
+    /* 记录入口贴在场的右下角外侧 —— 它属于"这一层"的控件，不悬在屏幕角落 */
+    histBtn.style.top = `${lineY - 42}px`;
+    histBtn.style.right = `${Math.max(26, W - area.x - area.w + 10)}px`;
   }
 
   function build() {
@@ -192,6 +286,17 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       statEl.classList.add('off');
       statTxt.textContent = 'disconnected';
     };
+    /* 服务端那份记录才是"真相"：刷新、换标签页、隔夜回来都还在。
+       resume 只在有上一屏时才带 log，所以这里再补一次。 */
+    fetch(`${API}/history?sid=${encodeURIComponent(sid)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (!Array.isArray(j?.log)) return;
+        log = j.log;
+        histBtn.hidden = log.length < 2;
+        if (histOpen) renderHist();
+      })
+      .catch(() => { /* 拿不到记录不影响说话 */ });
   }
 
   function disconnect() {
@@ -209,6 +314,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (thinking < 0) thinking = 0;
     /* 「在想」= 相干度下降。这不是加载动画，是同一批粒子在"还没成形"的状态 */
     if (!scene?.tr) field.setCoherence(thinking > 0 ? 0.58 : 1);
+    /* 想的这几秒，场不能"糊着不动"。给一股很弱的涡让它慢慢旋 ——
+       刚度 240 只够维持流动，不会把已经画好的东西转歪到看不清。 */
+    if (on && thinking === 1) {
+      field.vortex(innerWidth / 2, lineY - 80, { r: 1250, k: 240, swirl: 1.5, ms: 6000, ease: 1.1 });
+    }
     statEl.classList.toggle('off', thinking > 0);
     statTxt.textContent = thinking > 0 ? 'thinking' : busy ? 'running' : 'ready';
   }
@@ -232,6 +342,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'resume':
         /* 不是"重新长一遍"：用户没有发起任何事，画面应该已经在那儿 */
+        if (m.log?.length) { log = m.log.slice(-40); histBtn.hidden = false; if (histOpen) renderHist(); }
         if (m.scene) {
           clearInterval(typer);
           scene.set(m.scene);
@@ -253,6 +364,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'say':
         say(m.text);
+        histPush('a', m.text);
         insp('say', m.text, 'say');
         break;
 
@@ -340,17 +452,61 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   /* ───────────────── 输入 ───────────────── */
 
+  /* ───────────────── 交给场：把这句话搅进去 ─────────────────
+   *
+   * 按下回车之后，屏幕上原本只是"字没了、相干度降下来"。可那两件事都是
+   * **场自己的状态**，不是"它收到了"的动作：用户看到的是画面自己糊了，
+   * 而不是自己的话被拿走。
+   *
+   * 所以这里给一个真的动作：在句子的位置上起一股涡（vortex）—— 点绕着它转、
+   * 被甩出去；同时字从右往左被"吃掉"。方向感和"被处理"的因果都在这一下里。
+   */
+  let ingestTimer = 0;
+
+  function ingest(txt) {
+    clearInterval(typer);
+    clearInterval(ingestTimer);
+    const chars = Array.from(txt);
+    if (!chars.length) return;
+    /* 涡的半径跟着句子长度走：三个字的"嗯？"配 620 的涡会像在爆炸 */
+    field.vortex(innerWidth / 2, lineY - 6, {
+      r: Math.min(680, 300 + chars.length * 28),
+      k: 2100, swirl: 2.9, ms: 950,
+    });
+    let n = chars.length;
+    /* 从右往左吃：读的方向是左到右，最后消失的应该是最开头那个字 */
+    ingestTimer = setInterval(() => {
+      n -= 1;
+      if (n <= 0) {
+        clearInterval(ingestTimer);
+        line.set('', { force: true });
+        return;
+      }
+      line.set(chars.slice(0, n).join(''), { force: true });
+    }, Math.max(24, 300 / chars.length));
+  }
+
   function submit() {
     const text = typeEl.value.trim();
     if (!text) return;
     say(text);
     insp('你', text);
+    histPush('u', text);
     send({ t: 'ask', text });
     typeEl.value = '';
+    ingest(text);
+    /* 正在看记录时又问了一句：把记录收起来（但不把旧那一屏翻回来 —— 
+       新的回合马上会重铺）。 */
+    closeHist();
+    /* 这句话已经被场吃掉了：别让下一次 reassertLine 把它写回来 */
+    lineText = '';
   }
 
   typeEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
+    /* ↑ 看刚才说过什么（输入框空着才让位：里面有字时 ↑ 是"我要改这句话"） */
+    if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing) { e.preventDefault(); openHist(); }
+    if (e.key === 'ArrowDown' && histOpen) { e.preventDefault(); closeHist(); }
   });
   typeEl.addEventListener('input', () => {
     /* 输入回显必须是瞬时的：逐字生长是"它刚想好"的语法，用在打字回显上就成了卡顿 */
@@ -401,6 +557,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         return;
       }
       if (i.target) insp('hand', describe(i));
+      histPush('i', describe(i));
       send({ t: 'intent', intent: i });
     },
   });
@@ -458,6 +615,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.rimTo = 0;
     gt.enabled = true;
     onOpenChange?.(true);
+    histBtn.hidden = log.length < 2;
 
     connect();
     /* 相干度回升要跨过 set 那一帧，否则 set 里那次 slotBegin 会把它顶回去 */
@@ -489,7 +647,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        回到球面环境形态。相干度先压低一点，散的过程才有"化开"而不是"淡出"。 */
     field.setCoherence(0.3);
     field.setWells([]);
+    /* 涡必须清掉：它是"一次性的力"，留着就会在收起之后继续搅 —— 
+       而用户已经离开这一层了，桌面球没有理由还在转。 */
+    field.vorts.length = 0;
     field.clearDraw();
+    closeHist();
+    histBtn.hidden = true;
+    clearInterval(ingestTimer);
     field.setStiff(2.0);
     field.rimTo = 1;                    // 窗口边缘跟着场一起回来
     gt.enabled = false;
@@ -582,6 +746,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     isOpen: () => open,
     open: openAgent,
     close: closeAgent,
+    /** Esc 的分级：先收记录，再收这一层。返回 true 表示"这一下被吃掉了" */
+    closeHistory: () => {
+      if (!histOpen) return false;
+      closeHist();
+      return true;
+    },
+    history: () => (histOpen ? log.slice(-10) : null),
     toggle,
     ask: (t) => { typeEl.value = t; submit(); },
     /* 自测：走真实的手势通道（和用户按下去完全同一条路），不是直接调 scene */
