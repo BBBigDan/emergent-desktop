@@ -29,6 +29,9 @@ const DEV = new URLSearchParams(location.search).has('dev');
 
 /** 服务端的错误原文 → 一句人能读的短话（场里每行只有 20 格宽） */
 function friendly(msg = '') {
+  /* 429 要在"模型出错了"之前判：它看起来像故障，其实是"问太快了"，
+     而且用户唯一该做的事就是等 —— 说清楚比说"出错了"有用得多。 */
+  if (/429|限流|太多请求|rate.?limit/i.test(msg)) return '模型那边限流了，等会儿再问';
   if (/402|balance|余额/i.test(msg)) return '模型账户没余额';
   if (/401|unauthor|invalid.*key/i.test(msg)) return '模型 key 不对';
   if (/超时|timeout/i.test(msg)) return '模型没响应';

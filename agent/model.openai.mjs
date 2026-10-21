@@ -52,6 +52,19 @@ function cleanMessages(messages) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 429 之后该等多久。
+ *
+ *  免费模型的限流窗口通常是"每分钟 N 次"，不是"过 500ms 就好"——
+ *  所以原来的 500ms×2 重试等于没重试（实测连撞四次 429，每次都在 1.5 秒内放弃）。
+ *  优先听服务端的 `Retry-After`；没给就按 1s / 3s / 7s 退避，再加 0~400ms 抖动
+ *  （多个连接同时被限流时，不要整齐地一起回来）。
+ */
+function waitFor(res, n) {
+  const ra = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(ra) && ra > 0) return Math.min(30_000, ra * 1000);
+  return Math.min(15_000, 1000 * (2 ** n - 1)) + Math.floor(Math.random() * 400);
+}
+
 export function createOpenAIModel(o = {}) {
   const baseURL = (o.baseURL || process.env.MODEL_BASE || DEFAULT_BASE).replace(/\/+$/, '');
   const apiKey = o.apiKey || process.env.MODEL_KEY || '';
@@ -95,6 +108,10 @@ export function createOpenAIModel(o = {}) {
     const deadline = AbortSignal.timeout(timeoutMs);
     const sig = signal ? AbortSignal.any([deadline, signal]) : deadline;
     let lastErr;
+    /* 429 单独计数：它值得多等几次，而且不该占普通重试的额度。
+       一共试 3 次（等 1s、3s、7s），仍不行就抛一个带 `limited` 的错误，
+       让上层说一句人话（"被限流了"），而不是把 429 原文糊到用户脸上。 */
+    let limited = 0;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const t0 = Date.now();
@@ -114,6 +131,21 @@ export function createOpenAIModel(o = {}) {
 
         if (!r.ok) {
           const detail = (j?.error?.message || j?.message || text || '').slice(0, 300);
+          /* 限流：先等，再试。这一条要在 4xx 的"请求错了"判定之前 ——
+             429 是 4xx，但它是唯一一个**等一下就会好**的 4xx。 */
+          if (r.status === 429) {
+            limited++;
+            const wait = waitFor(r, limited);
+            const err = new Error(`模型限流（429）：${detail || '请求太频繁'}`);
+            err.status = 429;
+            err.limited = true;
+            err.waitMs = wait;
+            if (limited > 2) throw err;
+            console.warn(`[model] 被限流，${Math.round(wait / 1000)}s 后重试（第 ${limited} 次）`);
+            await sleep(wait);
+            attempt--;          // 不占普通重试额度，由 limited 计数兜底
+            continue;
+          }
           /* 有的服务端不支持 tool_choice=required（或换了模型后不支持）。
              这不是"请求错了"，是"这个能力没有"——降级成 auto 再试一次，
              否则整个 agent 会因为一个可选参数而完全不可用。 */
@@ -132,7 +164,7 @@ export function createOpenAIModel(o = {}) {
             continue;
           }
           /* 4xx（除 429）是请求本身的问题，重试只会重复同一个错误 */
-          const retryable = r.status === 429 || r.status >= 500;
+          const retryable = r.status >= 500;
           const err = new Error(`模型接口 ${r.status}：${detail || '(无返回内容)'}`);
           err.status = r.status;
           if (!retryable) throw err;

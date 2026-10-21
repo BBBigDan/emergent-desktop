@@ -205,6 +205,7 @@ function reassertLine() {
 
 /** 把服务端的错误原文压成一句人能读的短话（场里每行只有 20 格的宽度） */
 function friendly(msg = '') {
+  if (/429|限流|太多请求|rate.?limit/i.test(msg)) return '模型那边限流了，等会儿再问';
   if (/402|balance|余额/i.test(msg)) return '模型账户没余额';
   if (/401|unauthor|invalid.*key/i.test(msg)) return '模型 key 不对';
   if (/超时|timeout/i.test(msg)) return '模型没响应';

@@ -30,6 +30,7 @@ import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
+import { trimHistory } from './history.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -75,6 +76,10 @@ const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : '
  * 判据写在代码里（看到 tool_* / skill_save 被调用），不靠模型自己声明。 */
 const MAX_STEPS = Number(process.env.MAX_STEPS || 5);
 const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 8);
+/* 上下文满窗自收的水位（见 history.mjs）。78% 动手，收到 45% ——
+   留出滞回，否则每轮都会裁一点点，而"每轮都变"对前缀缓存是最坏的事。 */
+const CTX_TRIM_AT = Number(process.env.CTX_TRIM_AT || 0.78);
+const CTX_TRIM_TO = Number(process.env.CTX_TRIM_TO || 0.45);
 const APPROVAL_MS = 90_000;
 
 /* ───────────────────────── 会话 ───────────────────────── */
@@ -273,9 +278,11 @@ function emit(s, ev) {
 function recordUsage(s, out, msgs, schemas) {
   if (!s.meter) return null;
   /* 适配器没给 usage 时（mock、本地桩、某些网关）按字数估，但**标出来**：
-     估算值和账单长得一样，是这个功能最坏的失败方式。 */
+     估算值和账单长得一样，是这个功能最坏的失败方式。
+     **工具表必须算进去**：它每次请求都发，估算漏掉它会让水位偏低三分之三 ——
+     而水位正是"该不该裁历史"的唯一依据。 */
   const u = out?.usage || {
-    prompt: estTokens(JSON.stringify(msgs || [])),
+    prompt: estTokens(JSON.stringify(msgs || [])) + estTokens(JSON.stringify(schemas || [])),
     completion: estTokens(out?.content || ''),
     cached: 0,
     est: true,
@@ -605,6 +612,27 @@ async function runTurn(s, goal) {
   s.goal = goal;
   s.turn++;
   s.meter?.beginTurn();
+
+  /* 上下文满窗自收：用**上一轮结束时**量到的水位，在**这一轮开始前**裁。
+     放在这里而不是"请求失败后重试"，是因为满窗的失败发生在工具跑到一半，
+     用户看到的是"做了一半不动了" —— 比一开始就拒绝还难理解。 */
+  {
+    const snap = s.meter?.snap();
+    const trim = snap && trimHistory(s.messages, {
+      used: snap.ctx.tokens, limit: snap.limit, parts: snap.ctx.parts,
+      at: CTX_TRIM_AT, to: CTX_TRIM_TO,
+    });
+    if (trim) {
+      s.messages = trim.messages;
+      const pct = Math.round((trim.before / snap.limit) * 100);
+      emit(s, {
+        t: 'note',
+        message: trim.cramped
+          ? `上下文 ${pct}%：系统提示和工具表本身就把窗口占满了，历史已清到最少`
+          : `上下文 ${pct}%：丢了最早 ${trim.dropped} 条消息（更早的事靠 memory_recall）`,
+      });
+    }
+  }
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
   s.narrated = false;       // 观察窗里还没提示过"旁白被咽掉"
   s.sets = 0;
@@ -1495,8 +1523,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  /* 调试用：把会话消息原样吐出来。M0 阶段排障全靠它，生产要关掉。 */
+  /* 调试用：把会话消息原样吐出来（**含系统提示词和记忆注入**）。
+     排障时它是最快的一条路，但线上不能开着 —— 它把"这台东西知道什么"整份交出去。
+     所以默认关：要看就 `DEBUG=1 node agent/server.mjs`。 */
   if (p === '/api/debug' && req.method === 'GET') {
+    if (process.env.DEBUG !== '1') {
+      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' })
+        .end('debug 接口默认关闭：设 DEBUG=1 启动再看');
+      return;
+    }
     const s0 = sessions.get(u.searchParams.get('sid'));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(s0?.messages ?? [], null, 1));
