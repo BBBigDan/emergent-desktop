@@ -26,8 +26,9 @@ USER_NAME="${OLARES_USER:-bbbigdan}"
 NS="user-space-$USER_NAME"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-# 镜像前缀（不含 -shell/-agent/-memory）。默认 Docker Hub，public 仓库，集群匿名拉。
-IMAGE_PREFIX="${IMAGE_PREFIX:-docker.io/${DOCKERHUB_USER:-bbigdan}/emergent-desktop}"
+# 镜像前缀（不含 -shell/-agent/-memory）。默认 Docker Hub 上 bbigdan 的 public 仓库，
+# 集群匿名拉得到，不需要 imagePullSecret。换仓库时只改这一个环境变量。
+IMAGE_PREFIX="${IMAGE_PREFIX:-docker.io/bbigdan/emergent-desktop}"
 IMAGE_TAG="latest"
 STATE_DIR="/olares/emergent-desktop/state/$USER_NAME"
 
@@ -178,7 +179,7 @@ cat <<EOF
   git push            # CI 打镜像（三份并行，约 1~2 分钟）
   ./deploy/install.sh # 拉 latest 并重建 pod
 
-回滚到某个提交：./deploy/install.sh --tag sha-<7位>
+回滚到某个提交：./deploy/install.sh --tag sha-1a2b3c4
   标签列表：Hub 仓库的 Tags 页，或 Actions 日志里那行 sha-xxxxxxxx
 
 桌面回官方：./deploy/install.sh --revert
