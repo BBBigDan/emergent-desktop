@@ -418,7 +418,11 @@ export class FieldScene {
         color: '#93b8d8', align: 'center', font: FONT, label: `gc-${spec.id}`,
       });
     }
-    layer.num.set(`${Math.round(v * 100)}%`);
+    /* 小于 0.5% 的不要写成 "0%"。
+       真数据里这个情况很常见：n8n 占 2.4%，navidrome 占 0.17%。
+       两个 0% 并排，看起来像"这两个应用没在跑"—— 而它们其实在跑，
+       只是小。四舍五入到 0 是在用显示精度撒谎。 */
+    layer.num.set(v > 0 && v < 0.005 ? '<1%' : `${Math.round(v * 100)}%`);
     layer.cap.set(spec.label || '');
     layer.detail = true;
     return layer;
@@ -512,10 +516,18 @@ export class FieldScene {
   _trace(spec, i, a) {
     const f = this.field;
     const N = 280;
-    const x0 = a.x + 70;
-    const x1 = a.x + a.w - 70;
-    const yTop = a.y + 244;
-    const yBase = a.y + 408;
+    /* 曲线铺满整个区域的宽度（只留 30px 的边）。
+       原来留 70，实测在 1600 宽的屏上曲线只占 680px，两边大片空着 ——
+       而"一整小时的走势"本来就该横向拉满，它是时间的形状，
+       横向的每一格都对应一分钟。 */
+    const x0 = a.x + 30;
+    const x1 = a.x + a.w - 30;
+    /* 曲线区域从 244 下移到 276：仪表圆的底边在 a.y+202，圆里的
+       "CPU / 内存" 那行字到 a.y+210 左右。原来 label 放在 a.y+214，
+       实测正好压在仪表下面（"CPU 一小时" 贴着第一个圆的下沿）。
+       留 40px 的呼吸，标签才不会看起来是属于某个仪表的。 */
+    const yTop = a.y + 276;
+    const yBase = a.y + 430;
 
     const layer = this.layers.get(spec.id) || {};
     layer.spec = spec;
@@ -524,7 +536,9 @@ export class FieldScene {
     layer.anchor = { x: (x0 + x1) / 2, y: yTop - 34 };
     /* 横向拖 = 平移观察窗口。**这是唯一一种本地就能执行的手势**：
        它改的是"看哪一段"，不是"事实是什么"。 */
-    layer.hot = { type: 'box', x0, x1, y0: yTop - 46, y1: yBase + 26, gestures: ['pan'] };
+    /* hot 区的上沿不能压到仪表的圆（圆的命中半径 88，圆心 a.y+150，底 a.y+238）。
+       两个 hot 区重叠时，命中谁取决于遍历顺序 —— 那是不该由巧合决定的事。 */
+    layer.hot = { type: 'box', x0, x1, y0: yTop - 34, y1: yBase + 26, gestures: ['pan'] };
     if (!layer.win) layer.win = Array.isArray(spec.win) ? spec.win.slice(0, 2) : [0, 1];
     this.layers.set(spec.id, layer);
 
@@ -551,6 +565,13 @@ export class FieldScene {
       layer.now = new ParticleText({
         field: f, alloc: this.alloc, x: x1, y: yTop - 30, size: 20, max: 6,
         color: COL.ink, align: 'right', font: FONT_LAT, label: `trn-${spec.id}`,
+      });
+      /* 峰值的标注。有真曲线之后它才成立 —— 之前 mock 的曲线是手写的，
+         标"峰值"只是标在我自己编的那个数上。真数据里它是"这一小时最高到这"，
+         是用户扫一眼就想知道的那个数。 */
+      layer.peak = new ParticleText({
+        field: f, alloc: this.alloc, x: x0, y: yTop, size: 16, max: 6,
+        color: '#cfe4ff', align: 'center', font: FONT_LAT, label: `trp-${spec.id}`,
       });
     }
     layer.label.set(spec.label || '');
@@ -832,7 +853,28 @@ export class FieldScene {
     const older = w[1] < 0.999;
     layer.label?.set(fit(`${spec.label || ''}${older ? ' ←' : ''}`, 14));
     const idx = Math.min(data.length - 1, Math.round(w[1] * (data.length - 1)));
-    layer.now?.set(`${Math.round((data[idx] ?? 0) * 100)}%`);
+    const now = data[idx] ?? 0;
+    layer.now?.set(`${Math.round(now * 100)}%`);
+
+    /* 峰值只在窗口里找。拖到某一段时，标的是**那一段**的最高点 ——
+       否则用户看着一段平的曲线，旁边却写着别处的峰。 */
+    if (!layer.peak) return;
+    const M = data.length;
+    if (M < 4 || !layer.xs) { layer.peak.set(''); return; }
+    const i0 = Math.max(0, Math.floor(w[0] * (M - 1)));
+    const i1 = Math.min(M - 1, Math.ceil(w[1] * (M - 1)));
+    let mi = i0;
+    for (let i = i0; i <= i1; i++) if (data[i] > data[mi]) mi = i;
+    const peak = data[mi];
+    /* 峰不高于当下 8% 就不标：那时"现在"本身已经是最高，标了只是重复。 */
+    if (peak < now + 0.08) { layer.peak.set(''); return; }
+    const s = w[1] > w[0] ? (mi / (M - 1) - w[0]) / (w[1] - w[0]) : 0;
+    const k = Math.max(0, Math.min(layer.N - 1, Math.round(s * (layer.N - 1))));
+    layer.peak.x = layer.xs[k];
+    layer.peak.y = Math.max(layer.box.yTop + 2, layer.ys[k] - 20);
+    /* "峰" 而不是 "↑"：点阵字里的箭头只有三个点，16px 下读起来像 "1"，
+       于是 "↑68%" 被看成 "168%"。中文在这里反而更清楚。 */
+    layer.peak.set(`峰${Math.round(peak * 100)}%`, { force: true });
   }
 }
 

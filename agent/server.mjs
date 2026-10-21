@@ -46,9 +46,11 @@ async function loadEnv(file) {
 await loadEnv(path.join(HERE, '.env'));
 
 const PORT = Number(process.env.PORT || 8788);
-const SYS = process.env.SYS || 'host';            // host | mock —— 只决定"数据从哪来"
+const SYS = process.env.SYS || 'k8s';            // k8s | host | mock —— 只决定"数据从哪来"
 /* 模型与数据源是**两件事**：SYS=mock + 真模型，能在可复现的假数据上调提示词；
-   SYS=host + mock 模型，能在真数据上验工具。混成一个开关就没法分开排障。 */
+   SYS=host + mock 模型，能在真数据上验工具。混成一个开关就没法分开排障。
+   k8s 是默认值：这台东西存在的意义就是管那台 Olares。没有集群凭据时
+   tools.mjs 会打一行警告并退回本机读数，不会静默。 */
 /* 默认用**免费**模型。这不是省钱，是"零余额账户"这条现实：
    硅基流动的规则是「现金余额 < 0 → 账户级停服」，而停服是账户级的 ——
    收费模型欠的不到一分钱，会把 ¥0 的免费模型一起带走（2026-10-21 实测踩过）。
@@ -139,6 +141,31 @@ async function getSession(sid) {
     sessions.set(sid, s);
   }
   return s;
+}
+
+/* 兜底屏要的那条曲线。
+ * CPU 比内存更适合做"这台机器忙不忙"的背景 —— 内存在这个集群上是条直线
+ * （40% ~ 42%，一天都不怎么动），画出来什么都看不出来；CPU 有 14%~67% 的起伏。
+ * 取不到就返回 null，兜底屏退化成三个仪表，不影响别的。 */
+/* "这一屏比上一屏少东西吗"。
+ * 只有真正**新增了一个问题时**才允许变少 —— 因为问句本身就是新信息，
+ * 为了给问句腾地方而收掉一格仪表是合理的。 */
+function shrinks(next, prev) {
+  const count = (s, k) => (s.layers || []).filter((l) => l.kind === k).length;
+  const nextN = (next.layers || []).length;
+  const prevN = (prev.layers || []).length;
+  if (nextN >= prevN) return false;
+  const newAsk = count(next, 'fork') > count(prev, 'fork');
+  const newNote = count(next, 'condense') > count(prev, 'condense');
+  return !newAsk && !newNote;
+}
+
+async function trendSeries(tools) {
+  if (!tools.series) return null;
+  try {
+    const data = await tools.series('cpu', { minutes: 60, points: 60 });
+    return data.length >= 2 ? { label: 'CPU 一小时', data, axis: [0, 1] } : null;
+  } catch { return null; }
 }
 
 function emit(s, ev) {
@@ -237,6 +264,7 @@ async function runTurn(s, goal) {
   s.goal = goal;
   s.turn++;
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
+  s.narrated = false;       // 观察窗里还没提示过"旁白被咽掉"
   s.sets = 0;
   s.lastSpecSig = null;
   s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
@@ -293,10 +321,14 @@ async function runTurn(s, goal) {
         .trim();
       /* 提到工具名的话是"它对自己下的指令"，不是给用户的话。
          实测原话："请调用 scene_ask 把问题问出来" —— 用户看到只会莫名其妙。 */
+      /* 也不要 JSON 残片。实测 7B 会把本该是参数的东西写进 content：
+         `{"reading":"CPU 21% · 内存 41% · 磁盘 37%","` —— 屏幕上就是这串鬼东西。
+         凡是像 JSON 开头的，一律不算说话。 */
+      const looksLikeJSON = /^[[{]\s*"?\w+"?\s*:/.test(rawSpeech.replace(/[「」]/g, '"'));
       /* 手势回合干脆不要它说话：这一行该说"代价"，而代价（要重启谁）是系统知道的事，
          模型只会复述用户动作或复述自己的计划。要它表达的地方是 scene_ask 的问题本身。 */
       const isAdjust = s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust';
-      const speech = (isAdjust || TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech))
+      const speech = (isAdjust || looksLikeJSON || TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech))
         ? '' : rawSpeech.slice(0, 40);
       /* 一轮只说一句话。
          scene_show 的 reading 已经替它说过话了；之后模型再补一段
@@ -304,8 +336,16 @@ async function runTurn(s, goal) {
          场里只有一行，多说的每一句都要挤掉真正要看的东西 —— 所以后面的都咽掉，
          但在观察窗留一条，免得以后查"它到底说了什么"时一头雾水。 */
       const voice = speech && !s.spoke ? speech : '';
-      if (voice) emit(s, { t: 'say', text: voice });
-      else if (speech) emit(s, { t: 'note', message: `旁白已省略：${speech.slice(0, 24)}` });
+      /* s.spoke 必须在这里也置上：模型的自由文本同样占了那一行。
+         之前只在 scene 工具的 say 里置位，于是"模型说一句 + 兜底再说一句"
+         会同时出现 —— 一行字被两句话争着写，最后看到的是后一句。 */
+      if (voice) { s.spoke = true; s.lastVoice = voice; emit(s, { t: 'say', text: voice }); }
+      else if (speech && !s.narrated) {
+        /* 只留第一条。实测一轮里模型会补三次旁白，每条的句式都一样，
+           观察窗被刷得看不清工具调用 —— 而"它爱说旁白"这件事看一条就够了。 */
+        s.narrated = true;
+        emit(s, { t: 'note', message: `旁白已咽掉：${speech.slice(0, 24)}` });
+      }
 
       if (!calls.length) {
         if (voice) s.messages.push({ role: 'assistant', content: voice });
@@ -366,18 +406,51 @@ async function runTurn(s, goal) {
 
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */
         if (result && result.ok && result.op) {
+          /* 曲线要延续。
+           *
+           * 实测：系统先铺的兜底屏带了一条 CPU 曲线，模型随后用 scene_show
+           * 重铺一屏（它只想换个 reading），参数里没有 trend —— 于是曲线那一层
+           * 直接消失，用户看到的是"已经在那儿的东西被溶解掉了"。
+           * 这比一开始就没有曲线更糟：它像是界面在丢东西。
+           *
+           * 所以 scene_show 默认继承上一屏的曲线。模型真的不要曲线时，
+           * 用 scene_set 明确给一屏没有 trace 的 spec。 */
+          if (name === 'scene_show' && result.op === 'set' && result.spec && s.lastSceneSpec) {
+            const prev = s.lastSceneSpec.layers?.find((l) => l.kind === 'trace');
+            const has = result.spec.layers.some((l) => l.kind === 'trace');
+            if (prev && !has) result.spec = { ...result.spec, layers: [...result.spec.layers, prev] };
+          }
           /* 同一屏连铺两遍 = 模型在原地打转（实测：它会为了"更完整"再铺一次，
              屏幕上就是同一屏反复溶解重组）。判重放在服务端而不是提示词里：
              "做过没有"是状态问题，模型看不见自己的历史，服务端看得见。 */
           if (result.op === 'set' && result.spec) {
             const sig = JSON.stringify(result.spec.layers);
             s.sets = (s.sets || 0) + 1;
+            /* 一轮只铺一次。
+             *
+             * 实测：模型铺完"两仪表 + 曲线"后，会再铺一次"三仪表 + 曲线"
+             * （它觉得更完整）。屏上看到的是**同一屏又溶解重组了一遍** ——
+             * 对用户来说什么都没变，只是闪了一下。
+             *
+             * 判"完全一样"不够（这次多了一个 gauge 就绕过去了），
+             * 改成按次数：一轮一次。要换屏是下一个回合的事。 */
+            /* 但"次数"这条对**系统铺的首屏**不适用 —— 模型覆盖首屏是设计好的。
+               （首屏不占 s.sets，所以这里 s.sets 已经是模型自己的次数。） */
             if (sig === s.lastSpecSig) {
               result.duplicate = true;
               result.hint = '这一屏和现在屏幕上的一样，不要再铺一次';
-            } else if (s.sets > 2) {
+            } else if (s.sets > 1) {
               result.duplicate = true;
-              result.hint = '这一轮已经铺过两屏了，停在这里，把决定权交给用户';
+              result.hint = '这一轮已经铺过一屏了。屏幕上已经是你要表达的东西，'
+                + '多铺一次只会让它重新溶解一遍。停在这里，把决定权交给用户。';
+            } else if (s.painted && s.lastSceneSpec && shrinks(result.spec, s.lastSceneSpec)) {
+              /* 屏不能越铺越少。
+                 实测：系统首屏是"三仪表 + 曲线"，模型覆盖时只给"两仪表 + 曲线"，
+                 磁盘那格就凭空消失了。用户看到的是**界面在丢东西**，
+                 而模型以为自己"重新组织了信息"。 */
+              result.duplicate = true;
+              result.hint = '这一屏比现在屏幕上的内容更少，铺上去等于把东西擦掉。'
+                + '要么给出更多信息，要么就别动它。';
             } else {
               s.lastSpecSig = sig;
             }
@@ -410,24 +483,32 @@ async function runTurn(s, goal) {
 
         /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
            模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */
-        if (name === 'sys_status' && result?.cpu != null) s.lastStatus = result;
-        if (name === 'app_list' && Array.isArray(result?.apps)) s.lastApps = result.apps;
+        if (name === 'sys_status' && result?.cpu != null) { s.lastStatus = result; s.statusTurn = s.turn; }
+        if (name === 'app_list' && Array.isArray(result?.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
 
         /* ── 渐进首屏 ──
            数据到手（1~2 秒）就先按真实读数铺开，不等模型想完整屏（4~9 秒）。
            用户看到的是"屏在长"，而不是"盯着一片抖动的粒子等它想"。
            模型后面自己铺的那一屏会盖掉它 —— 那才是最终形态。 */
-        if (!s.painted && !s.drew && s.goal?.kind === 'ask' && s.lastStatus && s.lastApps) {
+        /* 只要**本轮**读到了 status 就够铺了。不必等 app_list ——
+           实测模型经常只调 sys_status 就开始说话，卡着等 app_list
+           会让首屏白白晚 1.5 秒。应用列表是"补一句谁在吃"，不是首屏的前提。
+           但必须是本轮的：上一轮留下的 CPU 读数在"我装了哪些应用"这种问题里
+           完全不相干，铺上去等于答非所问。 */
+        if (!s.painted && !s.drew && s.goal?.kind === 'ask' && s.statusTurn === s.turn) {
           const line = `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`;
-          const built = defaultOverview(s.lastStatus, s.lastApps, line);
+          const built = defaultOverview(s.lastStatus, s.lastApps || [], line, await trendSeries(s.tools), { note: false });
           if (built) {
             s.painted = true;
             s.drew = true;
-            s.sets = 1;
+            /* 注意这里**不占** s.sets 的额度。
+               这一屏是系统铺的，模型还没发言；如果它占了额度，模型随后
+               想铺的那一屏就会被判成"重复"而拦掉 —— 屏会永远停在兜底版。
+               实测踩过：模型想补一句结论，结果被拦，用户看到的是没有结论的屏。 */
             s.lastSceneSpec = built.spec;
             s.lastSpecSig = JSON.stringify(built.spec.layers);
             s.postOps = [];
-            if (!s.spoke) { s.lastLine = line; emit(s, { t: 'say', text: line }); }
+            if (!s.spoke) { s.spoke = true; s.lastLine = line; emit(s, { t: 'say', text: line }); }
             emit(s, { t: 'scene', op: 'set', spec: built.spec });
             emit(s, { t: 'note', message: '数据到手，先铺一屏；模型随后补充' });
           }
@@ -472,10 +553,22 @@ async function runTurn(s, goal) {
     /* ── 兜底 2：模型看了数据却没铺屏 ──
        实测四个免费模型都会栽在这一步（详见 tools.mjs 的 defaultOverview）。
        没有这一层，用户问一句"机器怎么卡"，最后屏幕上什么都没有。 */
-    if (!s.drew && s.lastStatus && s.goal?.kind === 'ask') {
+    /* 兜底也只认**本轮**取到的数据。跨回合沿用的读数用在这类"先铺一下"的场合
+       会答非所问：问"装了哪些应用"，屏幕上却是上一轮的 CPU 曲线。 */
+    const freshStatus = s.statusTurn === s.turn;
+    const freshApps = s.appsTurn === s.turn;
+    if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') {
       const line = s.lastVoice
-        || `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`;
-      const built = defaultOverview(s.lastStatus, s.lastApps || [], line);
+        || (freshStatus
+          ? `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`
+          : `${s.lastApps.length} 个应用在跑`);
+      /* 曲线只在有**本轮**节点读数时才配。应用列表那类问题如果也挂一条 CPU 曲线，
+         屏幕上就是"三个应用 + 一条不相干的 CPU 走势"，比没有更让人困惑。 */
+      const built = defaultOverview(
+        freshStatus ? s.lastStatus : {}, s.lastApps || [], line,
+        freshStatus ? await trendSeries(s.tools) : null,
+        { note: !s.spoke },
+      );
       if (built) {
         if (!s.spoke) { s.spoke = true; emit(s, { t: 'say', text: built.say }); }
         emit(s, { t: 'scene', op: 'set', spec: built.spec });
@@ -500,7 +593,15 @@ const safeJSON = (v) => {
 const TOOL_WORDS = /(sys_status|app_list|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
-const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)/;
+/* 这几类话都不是"给用户看的一行"，是模型在自言自语：
+   · "[手势] 用户把..." —— 复述输入
+   · "我们先把... / 用户希望..." —— 复述计划
+   · "机器的 CPU、内存和磁盘使用情况如下：" —— **导语**
+     最典型的坏句子：一个字的信息量都没有，却把整行占满，
+     真正的读数（23%）反而被挤掉。实测它会稳定地这么写，
+     因为训练数据里的助手都这么开头。以"如下 / 以下"收尾、
+     或"情况 / 状态 / 信息"打头再接"如下"的，一律不算说话。 */
+const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)|(如下|以下|有|包括)[：:]?$|(情况|状态|信息|数据|结果|应用|监控)[^。]{0,8}(如下|以下)/;
 
 /* ───────────────────────── HTTP ───────────────────────── */
 

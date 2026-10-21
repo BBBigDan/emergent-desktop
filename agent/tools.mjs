@@ -18,6 +18,7 @@ import {
   SPEC_SCHEMA, OPS_SCHEMA, PULSES,
   normalizeSpec, normalizeOps, normalizePulse,
 } from './scene.schema.mjs';
+import { createK8s } from './sources/k8s.mjs';
 
 const GB = 1024 ** 3;
 
@@ -108,7 +109,10 @@ function expandShow(a) {
     layers.push({ id: `g${i + 1}`, kind: 'gauge', label: g.label, value: g.value });
   });
   if (a.trace && Array.isArray(a.trace.data) && a.trace.data.length >= 2) {
-    layers.push({ id: 'tr', kind: 'trace', label: a.trace.label, data: a.trace.data });
+    layers.push({
+      id: 'tr', kind: 'trace', label: a.trace.label, data: a.trace.data,
+      ...(Array.isArray(a.trace.axis) ? { axis: a.trace.axis } : {}),
+    });
   }
   if (a.note) layers.push({ id: 'note', kind: 'condense', text: a.note });
 
@@ -143,11 +147,34 @@ function expandShow(a) {
  * + 一个可选的问题）本来就是系统的 affordance，不是每个回合都要重新发明的表达。
  * 模型想表达更多时，它自己调 scene_show 覆盖掉这一屏。
  */
-export function defaultOverview(status = {}, apps = [], reading = '') {
-  const gauges = [{ label: 'CPU', value: status.cpu ?? 0 }, { label: '内存', value: status.mem ?? 0 }];
-  if (status.disk != null) gauges.push({ label: '磁盘', value: status.disk });
+export function defaultOverview(status = {}, apps = [], reading = '', trend = null, o = {}) {
+  let gauges = [];
+  let note;
+
+  if (status.cpu != null) {
+    gauges = [{ label: 'CPU', value: status.cpu }, { label: '内存', value: status.mem }];
+    if (status.disk != null) gauges.push({ label: '磁盘', value: status.disk });
+  } else if ((apps || []).length) {
+    /* 只有应用数据、没有节点读数 —— "我装了哪些应用"就是这种情况。
+       这时仪表该量什么？量**每个应用占了多少内存**：
+       圆环大小=占比，标签=应用名。这是编码器能表达的、最接近答案的形状。
+       （不能拿"装了 3 个"去填一个 0~1 的仪表，那不是比例。） */
+    gauges = apps.slice(0, 3).map((a) => ({ label: String(a.name).slice(0, 4), value: a.memPct ?? 0 }));
+    /* 这里**不要**再加一句 note。
+       兜底屏的 reading 本身就会以 say 的形式说出来（"3 个应用在跑"），
+       再挂一个内容相同的 condense，屏幕上就是同一句话出现两次 ——
+       一行在底部、一行在场中间。实测看起来像渲染重影，其实是冗余。 */
+  }
+
   const bad = (apps || []).find((a) => a.state === 'restarting');
   const args = { reading, gauges };
+  if (note) args.note = note;
+  /* 兜底屏也要有一条真曲线。
+   *
+   * 用户问"怎么有点卡"，三个此刻的读数其实回答不了 —— 卡是个随时间的问题。
+   * 而这条曲线**本来就已经取到了**（Prometheus 里一直有），
+   * 没有理由因为模型这一轮没想起来画 trend 就不给。 */
+  if (trend && Array.isArray(trend.data) && trend.data.length >= 2) args.trace = trend;
   if (bad) {
     args.ask = `要看看 ${bad.name} 吗`;
     args.yes = '看看日志';
@@ -163,16 +190,52 @@ export function buildShow(args) {
   return r.spec ? { spec: r.spec, say: args?.reading || '' } : null;
 }
 
-export function makeTools(o = {}) {  const source = o.source || 'host';
+export function makeTools(o = {}) {
+  const source = o.source || 'host';
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
 
+  /* 真实集群采集器。构造失败不致命 —— 退回本机读数，
+     但一定要在日志里说出来：静默降级会让人以为"集群数据就是这样的"。 */
+  let cluster = null;
+  if (source === 'k8s') {
+    try {
+      cluster = createK8s({ ttl: o.ttl ?? 5000 });
+      console.log('[source] 集群采集器就绪：' + cluster.info());
+    } catch (e) {
+      console.warn('[source] 集群采集器不可用，退回本机读数：' + e.message);
+    }
+  }
+
   add('sys_status', {
     level: 'safe',
-    describe: '读一次系统状态：CPU、内存、磁盘、网络。返回 0~1 的比例，不是百分数。',
+    describe: '读一次系统状态：CPU、内存、磁盘的真实占用，以及谁在吃内存。'
+      + '返回 0~1 的比例，不是百分数。',
     schema: { type: 'object', properties: {}, additionalProperties: false },
     run: async () => {
       if (source === 'mock') return { ...MOCK_STATUS };
+
+      if (cluster) {
+        const s = await cluster.nodeMetrics();
+        const totalMB = (s.memTotal || 15.6) * 1024;
+        /* top 只给前 5 条、名字去后缀：模型要的是"谁在吃"，不是集群清单。
+           给全量只会让它照着念一遍 pod 名字。
+           **memPct 必须给**：实测模型拿到 memMB=382 之后，会自己"换算"成
+           value:0.382 塞进仪表 —— 屏幕上显示 38%，而它其实只占 2.4%。
+           单位对不上时模型不会问，它会直接除个 1000。 */
+        return {
+          cpu: s.cpu, mem: s.mem, disk: s.disk,
+          memTotal: s.memTotal, memUsed: s.memUsed, memFree: s.memFree,
+          top: s.top.slice(0, 5).map((r) => ({
+            name: r.name,
+            memMB: r.memMB,
+            memPct: +(r.memMB / totalMB).toFixed(3),
+            cpu: +r.cpu.toFixed(3),
+          })),
+          src: 'olares',
+        };
+      }
+
       const s = hostStatus();
       let disk = 0.48;
       try {
@@ -185,9 +248,32 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
 
   add('app_list', {
     level: 'safe',
-    describe: '列出这台机器上装了的应用，以及各自的状态、占用、备注。',
-    schema: { type: 'object', properties: {}, additionalProperties: false },
-    run: async () => ({ apps: MOCK_APPS }),
+    describe: '列出用户装了的应用，以及各自的状态、占用时长、吃多少内存。'
+      + '不含 Olares 自己的系统组件。',
+    schema: {
+      type: 'object',
+      properties: {
+        includeSystem: { type: 'boolean', description: '连系统组件一起看，缺省 false' },
+      },
+      additionalProperties: false,
+    },
+    run: async ({ includeSystem } = {}) => {
+      if (!cluster) return { apps: MOCK_APPS };
+      const r = await cluster.apps({ includeSystem: !!includeSystem });
+      const st = await cluster.nodeMetrics().catch(() => null);
+      const totalMB = (st?.memTotal || 15.6) * 1024;
+      /* 只把"是什么状态、吃多少"给模型；ns / pod / owner 是给 logs 工具解析用的，
+         模型看了会照抄进 label，把一屏塞满 k8s 术语。
+         memPct 是相对总内存的比例 —— 见 sys_status 里那段注释。 */
+      return {
+        apps: r.apps.map((a) => ({
+          name: a.name, state: a.state, ready: a.ready,
+          restarts: a.restarts, memMB: a.memMB,
+          memPct: a.memMB ? +(a.memMB / totalMB).toFixed(3) : 0,
+          upH: a.upH,
+        })),
+      };
+    },
   });
 
   add('fs_scan', {
@@ -202,11 +288,18 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
       required: ['path'],
       additionalProperties: false,
     },
-    run: async ({ path }) => ({
-      path,
-      files: MOCK_DISK.filter((f) => f.path.startsWith(path) || path === '~')
-        .sort((a, b) => b.size - a.size),
-    }),
+    run: async ({ path }) => {
+      /* 真实集群上没有做目录级扫描：文件都在 PVC 里，要读得进 pod 或走 Files 的 API。
+         这里如实报，不要拿假文件列表糊弄 —— 用户会照着去删。 */
+      if (cluster) {
+        return { error: '还没接目录扫描：真集群上文件在 PVC 里，需要走 Files 应用或进 pod 执行 du' };
+      }
+      return {
+        path,
+        files: MOCK_DISK.filter((f) => f.path.startsWith(path) || path === '~')
+          .sort((a, b) => b.size - a.size),
+      };
+    },
   });
 
   add('logs_tail', {
@@ -218,7 +311,10 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
       required: ['app'],
       additionalProperties: false,
     },
-    run: async ({ app }) => ({ app, lines: MOCK_LOGS[app] || ['(no logs)'] }),
+    run: async ({ app, lines }) => {
+      if (!cluster) return { app, lines: MOCK_LOGS[app] || ['(no logs)'] };
+      return cluster.logs(app, { lines: Math.min(120, lines || 40) });
+    },
   });
 
   add('mem_trim', {
@@ -231,6 +327,17 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
       additionalProperties: false,
     },
     run: async ({ to }) => {
+      /* 接了真集群之后这里必须诚实：真机上"把内存压到某个比例"没有对应的系统动作，
+         能做的只有重启应用，而重启**不保证**压到目标值。
+         拿 mock 的算数糊弄过去，用户会真的以为内存被压下去了。 */
+      if (cluster) {
+        const s = await cluster.nodeMetrics();
+        return {
+          error: `真实集群上还没接"降内存"动作。当前 ${(s.mem * 100).toFixed(0)}%，`
+            + `能做的只有重启应用（如 n8n），但重启不保证压到你给的目标值。`,
+          now: s.mem,
+        };
+      }
       const from = MOCK_STATUS.mem;
       return { from, to, freedGB: +((from - to) * MOCK_STATUS.memTotal).toFixed(1), restarted: 'n8n' };
     },
@@ -267,13 +374,18 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
         },
         trace: {
           type: 'object',
-          description: '一段随时间变化的曲线（可选）',
+          description: '一段随时间变化的曲线（可选）。**优先用 trend，别自己编 data**',
           properties: {
             label: { type: 'string', description: '≤12 字' },
             data: { type: 'array', items: { type: 'number' }, description: '2~280 个 0~1 的数，左旧右新' },
           },
           required: ['label', 'data'],
           additionalProperties: false,
+        },
+        trend: {
+          type: 'string',
+          enum: ['cpu', 'mem', 'disk'],
+          description: '要看哪个指标最近一小时的走势。填了它由系统取真实曲线，你不用给 data',
         },
         note: { type: 'string', description: '一句结论，≤20 字（可选）' },
         ask: { type: 'string', description: '要问用户的那句话，≤14 字（可选）。填了它就必须同时填 yes 和 no' },
@@ -294,6 +406,32 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
       if (a.gauges != null && !Array.isArray(a.gauges)) {
         return { error: 'gauges 要是数组：[{"label":"CPU","value":0.04}]' };
       }
+
+      /* trend → 真曲线。
+       *
+       * 为什么不让模型自己填 data：一条 60 点的曲线，它要么编（编出来的形状
+       * 看起来很像真的，这是最坏的情况），要么占掉几百 token 还抄错。
+       * 而"曲线长什么样"和"几何长什么样"是同一类东西 —— 属于渲染层，
+       * 不属于语义层。模型只需要说**看哪个指标**。
+       * 和"id 不给模型起、kind 不给模型选"是同一条原则。 */
+      if (a.trend && !a.trace) {
+        if (!cluster) {
+          return { error: '当前没有接集群，trend 取不到真实曲线。想画曲线就直接给 trace.data' };
+        }
+        try {
+          const data = await cluster.series(a.trend, { minutes: 60, points: 60 });
+          if (data.length >= 2) {
+            const name = { cpu: 'CPU', mem: '内存', disk: '磁盘' }[a.trend] || a.trend;
+            /* axis 固定 0~100%：这是**百分比负载**，不是随便一条曲线。
+               自适应标度会把 40%→41% 画成剧烈波动，看起来像出事了；
+               而屏幕上三个仪表写的就是百分比，两者必须能对上。 */
+            a = { ...a, trace: { label: `${name} 一小时`, data, axis: [0, 1] } };
+          }
+        } catch (e) {
+          return { error: `取 ${a.trend} 的走势失败：${e.message}` };
+        }
+      }
+
       const r = normalizeSpec(expandShow(a));
       if (!r.spec) return { ok: false, error: '这一屏什么都没有：至少要给 reading / gauges / note / ask 里的一个' };
       return {
@@ -379,6 +517,8 @@ export function makeTools(o = {}) {  const source = o.source || 'host';
 
   return {
     all: T,
+    /** 兜底屏要一条真曲线时用。没有集群就返回 null，调用方自己决定退化成什么。 */
+    series: cluster ? (metric, o2) => cluster.series(metric, o2) : null,
     /** 给模型看的 tools 数组（OpenAI 兼容形状，换真模型不用改） */
     schemas() {
       return Object.values(T).map((t) => ({

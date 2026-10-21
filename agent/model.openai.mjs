@@ -55,7 +55,7 @@ export function createOpenAIModel(o = {}) {
   const apiKey = o.apiKey || process.env.MODEL_KEY || '';
   const model = o.model || process.env.MODEL || DEFAULT_MODEL;
   const temperature = Number(o.temperature ?? process.env.MODEL_TEMP ?? 0.3);
-  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 900);
+  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 1200);
   const timeoutMs = Number(o.timeoutMs ?? process.env.MODEL_TIMEOUT ?? 45_000);
   const retries = Number(o.retries ?? 2);
 

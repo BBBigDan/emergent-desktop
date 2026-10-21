@@ -1,15 +1,17 @@
-# emergent-agent · M0 协议 + M1 真模型
+# emergent-agent · 协议 + 真模型 + 真集群
 
 ```
-node agent/server.mjs                    # 读 agent/.env，默认硅基流动
+node agent/server.mjs                    # 读 agent/.env，默认硅基流动 + 直连 Olares
 MODEL=mock node agent/server.mjs         # 不联网，用假模型跑协议
 SYS=mock node agent/server.mjs           # 工具返回固定假数据（截图 / 自测要可复现）
+SYS=host node agent/server.mjs           # 退回读本机 /proc（没有集群凭据时自动退回）
 ```
 
-零依赖，只用 Node 内建模块。**模型已经接真了，工具还是假的**（k8s / 文件系统待接）。
+零依赖，只用 Node 内建模块。**模型是真的，数据也是真的**：`sys_status` 读的是那台
+Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的是它的容器日志。
 
 这一版证明的是那条链路：模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌 → 审批挂起。
-换真工具只改 `tools.mjs` 里的 `run()`，协议一个字都不用动。
+换数据源只改 `sources/`，协议一个字都不用动。
 
 ## 三个文件分掉了三件事
 
@@ -24,6 +26,27 @@ SYS=mock node agent/server.mjs           # 工具返回固定假数据（截图 
 界面上看不出是谁的错，只会觉得这系统不准。所以校验层做两件事：**挡住**，然后**如实回报**
 （`dropped` / `adjusted` 作为工具结果回给模型，否则它会在同一个错误上重复八次）。
 
+## 数据从哪来（`sources/k8s.mjs`）
+
+不调 `kubectl`，直接用 `node:https` 打 k8s API。三个理由：零依赖（kubectl 是 60MB 二进制，
+而这个仓库的约定是部署时什么都不用装）、一条链路够用（API 的 service proxy 让我们用一个
+HTTPS 端点就能访问集群内任何 Service，Prometheus 就是靠它）、同一份代码在两种部署下都能跑。
+
+| 要什么 | 从哪读 |
+|---|---|
+| 此刻的 CPU / 内存 / 磁盘 | Prometheus 瞬时查询（node-exporter 的 15s 采样） |
+| 这一小时的走势 | Prometheus `query_range`（60 点） |
+| 谁在吃内存 | `container_memory_working_set_bytes`（**不是** `kubectl top` —— 这个集群没装 metrics-server，实测 `top` 直接报 "Metrics API not available"） |
+| 应用是什么状态 | k8s API 的 deployment / pod 对象（Prometheus 不知道"应用"这个概念） |
+| 日志 | `.../pods/<pod>/log?container=<c>`，先滤掉 linkerd-proxy 这类 sidecar |
+
+**凭据**按"越靠内越优先"找：in-cluster 的 serviceaccount → `KUBECONFIG` / `agent/.kube/config`。
+k3s 写的 kubeconfig 里 `server` 是 `127.0.0.1:6443`（那是集群内视角），从外面用时
+用 `KUBE_SERVER=https://<公网IP>:6443` 覆盖。
+
+> `agent/.kube/` 已在 `.gitignore` 里。那里面是**客户端私钥**，
+> 推上去等于把整台机器的 root shell 交出去。
+
 ## 配置
 
 `agent/.env`（已在 `.gitignore` 里，不会提交）：
@@ -32,11 +55,13 @@ SYS=mock node agent/server.mjs           # 工具返回固定假数据（截图 
 MODEL_KEY=sk-...                          # 必填（MODEL=mock 时不需要）
 MODEL=Qwen/Qwen2.5-7B-Instruct            # 默认落在 ¥0 那一列；mock = 不联网
 MODEL_BASE=https://api.siliconflow.cn/v1  # 换厂商只改这一行
-SYS=host                                  # host 读本机真数字 / mock 用固定假数据
+SYS=k8s                                   # k8s 读集群 / host 读本机 / mock 用固定假数据
+# OLARES_USER=bbbigdan                    # 不填就从命名空间后缀自动推断
+# PROM_NS=kubesphere-monitoring-system    # Prometheus 在哪个命名空间
 ```
 
 `SYS` 和 `MODEL` 是**两件事**，刻意分开：`SYS=mock MODEL=<真模型>` 能在可复现的假数据上调
-提示词，`SYS=host MODEL=mock` 能在真数据上验工具。混成一个开关就没法分开排障。
+提示词，`SYS=k8s MODEL=mock` 能在真数据上验工具。混成一个开关就没法分开排障。
 
 ### 硅基流动的实测记录（2026-10-21）
 
@@ -202,15 +227,21 @@ SSE 是 HTTP/1.1 上最省事的流式方案，反代只要 `proxy_buffering off
 | 重复调用检测 | 同一组 `name:args` 连着来 2 次就停 | 多跑的那几次会把同一个动画重播八遍，用户看到的是"东西在抽"，不是"在思考" |
 | `APPROVAL_MS` | 90s | 超时按拒绝处理，不无限挂着 |
 
-## 还没做（M2 该换掉的东西）
+## 还没做
 
-1. **工具**：`sys_status` / `app_list` / `fs_scan` 的 `run()` 换成真的 k8s API 和真实文件系统。
-   `MOCK_*` 常量全部删掉。**schema 不用改。**
-2. **流式 token**：现在 `say` 是一整句到达。真模型要按 SSE 分块推，前端得支持"同一行字追加"。
-3. **鉴权**：`/api/*` 在 `nginx.conf` 里没校验。要接 authelia 的 forward-auth
+1. **目录扫描**：`fs_scan` 在 `SYS=k8s` 下直接返回一句"还没接"。真集群的文件在 PVC 里，
+   要读得进 pod 执行 `du`，或者走 Files 应用的 API。**没有拿假文件列表糊弄** ——
+   用户会照着它去删东西。
+2. **写操作**：`mem_trim` 在真集群上同样只返回"没接"。真机上"把内存压到某个比例"
+   没有对应的系统动作，能做的只有重启应用，而重启**不保证**压到目标值。
+   接之前要先想清楚"降内存"到底该是什么原子动作（`rollout restart`？scale 到 0？），
+   不要为了链路完整去假装成功。
+3. **单 pod 内存取不到时**：`kubectl top` 不可用（没装 metrics-server），
+   所以应用内存只能靠 Prometheus 的 `container_memory_working_set_bytes`。
+   这台机器上它好用；换集群如果没有 node-exporter / cAdvisor，应用列表会没有内存数。
+4. **流式 token**：现在 `say` 是一整句到达。真模型要按 SSE 分块推，前端得支持"同一行字追加"
+   （现在的"逐字生长"是渲染动画，不是真流式）。
+5. **鉴权**：`/api/*` 在 `nginx.conf` 里没校验。要接 authelia 的 forward-auth
    （`authelia-backend-svc:9091/api/verify`，无 cookie 返 401，已实测）。
-4. **审计**：每次工具调用落 `~/Agent/audit/*.jsonl`，返回值脱敏（抹 JWT / Bearer 形状）。
-5. **`/api/debug` 要关掉**：它现在把整个会话消息原样吐出来（含系统提示词），只该在 dev 开。
-6. **会话持久化**：内存 Map，进程重启就没了。M2 先落 jsonl，M3 再接记忆层。
-7. **提示词还没经过真模型检验**：写它的依据是源码里的上限和 `timing.js` 的常数，
-   但没有一轮真实对话验证过"模型会不会照着做"。余额恢复后第一件事就是跑这条。
+6. **审计**：每次工具调用落 `~/Agent/audit/*.jsonl`，返回值脱敏（抹 JWT / Bearer 形状）。
+7. **`/api/debug` 要关掉**：它现在把整个会话消息原样吐出来（含系统提示词），只该在 dev 开。

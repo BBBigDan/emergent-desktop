@@ -26,5 +26,10 @@ Thumbs.db
 agent/.env
 .env
 
+# kubeconfig 里有集群的客户端私钥（client-key-data）。
+# 它等价于 root 在这台机器上的 shell —— 推上去等于把机器交出去。
+agent/.kube/
+*.kubeconfig
+
 # ---- 会话存档（本地跑出来的对话与最后一屏）----
 agent/sessions/
