@@ -177,6 +177,20 @@ export function openGraph(file) {
       stmt('update nodes set weight = ? where id = ?').run(weight, id);
     },
 
+    /* 批量版。巩固一次要给几千个节点打分数 —— 一个个 write 在网络存储上
+       就是几千次往返，批量是必须的（SQLite 这版只是顺手对齐接口）。 */
+    setWeights(items) {
+      const st = stmt('update nodes set weight = ? where id = ?');
+      for (const { id, weight } of items) st.run(weight, id);
+      return items.length;
+    },
+
+    setCommunities(items) {
+      const st = stmt('update nodes set community = ? where id = ?');
+      for (const { id, community } of items) st.run(community, id);
+      return items.length;
+    },
+
     /* ── 读 ── */
 
     getNode(id) { return row2node(stmt('select * from nodes where id = ?').get(id)); },

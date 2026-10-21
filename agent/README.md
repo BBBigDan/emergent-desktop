@@ -33,7 +33,7 @@ Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的�
 
 ## 长期记忆（M2）
 
-`memory.mjs` + `sources/graph.mjs`，零依赖（`node:sqlite`）。它做三件事：
+`memory.mjs`（抽取 / 回忆 / 巩固）+ 一个**图存储**。它做三件事：
 
 1. **抽取**：一轮问答结束后，让主模型把"值得长期记住"的东西写成 1~3 条事实
    （偏好 / 做过的事 / 因果 / 认得的东西）；读数、寒暄、计划都不记。
@@ -42,24 +42,40 @@ Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的�
 3. **巩固**：每 6 轮（或 6 小时）算一次五信号，剪掉没人再碰的，把反复同框的实体
    塌缩成摘要节点，拍一张快照。
 
+存储有两份实现，**方法完全一样**（上层不知道下面是谁）：
+
+| 实现 | 用在哪 | 是什么 |
+|---|---|---|
+| `sources/graph.axolotl.mjs` | 集群（默认） | HTTP 调侧车 `memsvc/server.py` → Rust 图引擎 axolotl，`.axeb` |
+| `sources/graph.mjs` | 本地开发 / 自测 | `node:sqlite`，零依赖备胎 |
+
+```
+MEMORY_STORE=axolotl   # 集群默认；侧车不在就**停用记忆**，不退回 SQLite（防记忆分叉）
+MEMORY_STORE=sqlite    # 本地跑：node agent/server.mjs（没有 Linux wheel 也能测逻辑）
+MEMORY_STORE=auto      # 先试侧车，失败退回 SQLite（默认值）
+```
+
 | 位置 | 内容 |
 |---|---|
-| `~/Agent/memory/memory.db` | 图：fact / entity / community 三类节点 + `about` / `covers` 边 |
-| `~/Agent/memory/snapshots/` | `VACUUM INTO` 快照，留最近 5 份 |
+| `~/Agent/memory/memory.axeb` | 图：fact / entity / community 三类节点 + `about` 边（axolotl 二进制） |
+| `~/Agent/memory/memory.db` | SQLite 版（迁移后改名 `.migrated`） |
+| `~/Agent/memory/snapshots/` | 快照，留最近 5 份 |
 | `GET /agent/api/memory?q=n8n` | 当前 stats + 一次回忆 —— **唯一可观测入口** |
 | `GET /agent/api/memory?sweep=1` | 顺手做一次巩固（剪枝 / 社群合并 / 快照），返回报告 |
 
-环境变量：`MEMORY=0` 整个关掉；`MEMORY_DIR=/path` 指定目录
-（默认落在用户的 `~/Agent/memory`，用户在 Files 里看得见；挂载不可用时退回 `agent/memory/`）。
+环境变量：`MEMORY=0` 关掉；`MEMORY_DIR=/path` 指定目录；`MEMORY_URL` 侧车地址（默认
+`http://127.0.0.1:7801`）。
 
 工具：`memory_recall`（查）/ `memory_stats`（看有什么）/ `memory_forget`（忘，danger 过审批）。
-抽取失败只丢那一轮，不影响对话；记忆库打不开就退化成无记忆模式，不连累主循环。
+抽取失败只丢那一轮；侧车不可用时记忆停用，桌面照常（**不会**偷偷退回 SQLite）。
 
-自测（不需要模型，也不需要集群）：
+自测（不需要模型、不需要集群、不需要侧车）：
 
 ```
-node agent/memory.test.mjs
+node agent/memory.test.mjs        # 用 SQLite 那份跑全部逻辑
 ```
+
+侧车的接口、wheel 怎么重建、怎么排障：见 `deploy/README.md` 的"记忆侧车（axolotl）"。
 
 ## 数据从哪来（`sources/k8s.mjs`）
 

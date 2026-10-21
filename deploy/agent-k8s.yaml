@@ -110,6 +110,12 @@ spec:
         # 现在 detectUserSuffix 会验证它，对不上就退回统计推断（见 k8s.mjs）
         - name: OLARES_USER
           value: bbbigdan
+        # 记忆的存储在侧车（axolotl 图库）。显式写死 axolotl：侧车没起来时
+        # **不要**退回 SQLite —— 两份库同时活着等于记忆分叉，比暂时失忆糟。
+        - name: MEMORY_STORE
+          value: axolotl
+        - name: MEMORY_URL
+          value: http://127.0.0.1:7801
         - name: TZ
           value: Asia/Shanghai
         # 用来记住"这轮说过什么"之类的 SID 前缀，不参与业务
@@ -143,11 +149,59 @@ spec:
           memory: 512Mi
       securityContext:
         allowPrivilegeEscalation: false
+
+    # ── 记忆侧车：真图库 ──
+    # 文档 §6.4 的形态，只是没用自建镜像：基础镜像直接是 python:3.11-slim，
+    # axolotl 的 wheel 装在 /olares/emergent-py（hostPath），PYTHONPATH 指过去。
+    # 这样重建记忆服务不用打镜像、不用推仓库，改 server.py 就生效。
+    # wheel 是 cp311，所以这里必须是 3.11，别"顺手升一下"。
+    - name: memory
+      image: docker.io/library/python:3.11-slim
+      imagePullPolicy: IfNotPresent
+      workingDir: /app
+      command: ["python3", "/app/agent/memsvc/server.py"]
+      ports:
+        - containerPort: 7801
+      env:
+        - name: PYTHONPATH
+          value: /py
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PORT
+          value: "7801"
+        # 图文件落在用户的 ~/Agent/memory/memory.axeb（按 pvc-userspace-* 前缀找）
+        - name: AX_USERSPACE
+          value: /userspace
+        - name: TZ
+          value: Asia/Shanghai
+      volumeMounts:
+        - name: app
+          mountPath: /app
+        - name: userspace
+          mountPath: /userspace
+        - name: py
+          mountPath: /py
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+
   volumes:
     - name: app
       hostPath:
         # 代码 + .env + sessions/ 都在这一个目录下，rsync 一次全到位
         path: /olares/emergent-agent/app
+        type: DirectoryOrCreate
+    # axolotl 的 wheel（pip --target 装进来的）。和代码分开：它是构建产物，
+    # 不该混进 tar 同步的目录里被反复覆盖。
+    - name: py
+      hostPath:
+        path: /olares/emergent-py
         type: DirectoryOrCreate
     - name: userspace
       hostPath:

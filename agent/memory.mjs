@@ -208,8 +208,10 @@ function cleanFact(f) {
 export function createMemory(o = {}) {
   const enabled = o.enabled !== false && process.env.MEMORY !== '0';
   const custom = o.dir || process.env.MEMORY_DIR || '';
+  const storeMode = String(o.store || process.env.MEMORY_STORE || 'auto').toLowerCase();
   let dir = '';
   let g = null;
+  let storeKind = '';
   let extractor = o.extractor || null;
   let turnsSince = 0;
   let queue = Promise.resolve();
@@ -236,25 +238,57 @@ export function createMemory(o = {}) {
     return path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory');
   }
 
+  /**
+   * 选存储。默认 auto：先连 axolotl 侧车，连不上退回 SQLite。
+   *
+   * 这个降级是故意的：侧车崩了，用户该失去的是"记忆"，不是"桌面"。
+   * 但显式写了 MEMORY_STORE=axolotl 时就不许降级 —— 那种情况下静默退回
+   * 才是最坏的：你以为在调真图库，其实在调备胎，两边行为不一样，查一天。
+   */
+  async function openStore() {
+    if (storeMode !== 'sqlite') {
+      try {
+        const { openAxolotl } = await import('./sources/graph.axolotl.mjs');
+        const s = await openAxolotl({});
+        storeKind = 'axolotl';
+        return s;
+      } catch (e) {
+        if (storeMode === 'axolotl') throw new Error(`axolotl 侧车不可用：${e.message}`);
+        console.warn('[memory] axolotl 侧车不可用，退回 SQLite：' + e.message);
+      }
+    }
+    storeKind = 'sqlite';
+    return openGraph(path.join(dir, 'memory.db'));
+  }
+
   async function start() {
     if (!enabled) { console.log('[memory] 已关闭（MEMORY=0）'); return false; }
     dir = await resolveDir();
     await fs.mkdir(dir, { recursive: true });
     await fs.mkdir(path.join(dir, 'snapshots'), { recursive: true });
     try {
-      g = openGraph(path.join(dir, 'memory.db'));
+      g = await openStore();
     } catch (e) {
-      /* 库坏了不能连累主循环：挪走、重开。记忆可以丢，桌面不能打不开。 */
-      console.warn('[memory] 打不开记忆库，另起一个：' + e.message);
-      try { await fs.rename(path.join(dir, 'memory.db'), path.join(dir, `memory.broken-${Date.now()}.db`)); } catch { /* 没文件 */ }
+      /* 显式要求 axolotl 时失败就**不要**退回 SQLite：两份库同时活着等于
+         记忆分叉，之后"它怎么忘了刚才那句"会查到你怀疑人生。宁可这一轮没记忆。 */
+      if (storeMode === 'axolotl') {
+        console.error('[memory] axolotl 侧车不可用，记忆停用（桌面照常）：' + e.message);
+        return false;
+      }
+      /* 库坏了：按 SQLite 重开一个，别让整台桌面跟着罢工 */
+      console.warn('[memory] 打不开记忆库，改用 SQLite：' + e.message);
+      storeKind = 'sqlite';
+      try {
+        await fs.rename(path.join(dir, 'memory.db'), path.join(dir, `memory.broken-${Date.now()}.db`));
+      } catch { /* 没文件 */ }
       g = openGraph(path.join(dir, 'memory.db'));
     }
-    const s0 = stats();
-    console.log(`[memory] ${dir} · ${s0.facts} 条记忆 / ${s0.entities} 个实体 / ${s0.communities} 个社群`);
+    const s0 = await stats();
+    console.log(`[memory] ${storeKind} · ${dir} · ${s0.facts} 条记忆 / ${s0.entities} 个实体 / ${s0.communities} 个社群`);
     /* 上次巩固太久以前（比如关机三天）就补一次，但别挡启动 */
-    const last = Number(g.meta.get('lastSweep') || 0);
+    const last = Number((await g.meta.get('lastSweep')) || 0);
     if (s0.facts && Date.now() - last > SWEEP_EVERY) {
-      setTimeout(() => { try { consolidate(); } catch (e) { console.warn('[memory] 启动巩固失败：' + e.message); } }, 4000);
+      setTimeout(() => { consolidate().catch((e) => console.warn('[memory] 启动巩固失败：' + e.message)); }, 4000);
     }
     return true;
   }
@@ -279,12 +313,12 @@ export function createMemory(o = {}) {
   }
 
   /** 定向回忆：先按这句话打分，再沿 about 边走一跳（"同一个东西的其它记忆"）。 */
-  function recall(query, k = 5) {
+  async function recall(query, k = 5) {
     if (!ok()) return { facts: [], entities: [], total: 0 };
     const ts = nowTs();
     const terms = termsOf(query);
-    const deg = g.degreeMap();
-    const facts = g.nodes('fact');
+    const deg = await g.degreeMap();
+    const facts = await g.nodes('fact');
     const base = new Map(facts.map((f) => [f.id, f]));
 
     const seed = facts
@@ -296,16 +330,16 @@ export function createMemory(o = {}) {
        而人回答这类问题靠的是"关于 n8n 我还知道什么"。 */
     const ids = new Set(seed.map((x) => x.f.id));
     const ents = new Map();
-    for (const e of g.edges([...ids])) {
+    for (const e of await g.edges([...ids])) {
       if (e.type !== 'about') continue;
       if (ids.has(e.src)) {
-        const n = g.getNode(e.dst);
+        const n = await g.getNode(e.dst);
         if (n && n.kind === 'entity') ents.set(n.id, n);
       }
     }
     const extra = [];
     if (ents.size) {
-      for (const e of g.edges([...ents.keys()])) {
+      for (const e of await g.edges([...ents.keys()])) {
         if (e.type !== 'about' || ids.has(e.src)) continue;
         const f = base.get(e.src);
         if (f) extra.push({ f, s: score(f, terms, deg, ts) * 0.45 });
@@ -316,31 +350,32 @@ export function createMemory(o = {}) {
     /* 只把真正有命中的留下：没有命中的"最近的一条"在"这个问题"上就是噪音。
        唯一的例外是查询本身没给出任何词（比如"你记得什么"），那时按新鲜度排。 */
     const picked = terms.length ? ranked.filter((x) => x.s > 0.55) : ranked;
-    const out = picked.map(({ f, s }) => {
+    const out = [];
+    for (const { f, s } of picked) {
       const about = [];
-      for (const e of g.edges([f.id])) {
+      for (const e of await g.edges([f.id])) {
         if (e.type === 'about' && e.src === f.id) {
-          const n = g.getNode(e.dst);
+          const n = await g.getNode(e.dst);
           if (n) about.push(n.props?.display || n.label);
         }
       }
-      return { id: f.id, text: f.label, kind: f.props?.kind || 'fact', when: whenText(f.lastTs), about, score: +s.toFixed(2) };
-    });
-    for (const r of out) g.touch(r.id);
+      out.push({ id: f.id, text: f.label, kind: f.props?.kind || 'fact', when: whenText(f.lastTs), about, score: +s.toFixed(2) });
+    }
+    for (const r of out) await g.touch(r.id);
     return { facts: out, entities: [...ents.values()].map((n) => n.props?.display || n.label), total: out.length };
   }
 
   /** 最近发生的事。用户问"昨天我让你做了什么"时，命中靠的不是关键词而是时间。 */
-  function recent(n = 4) {
+  async function recent(n = 4) {
     if (!ok()) return [];
-    return g.nodes('fact', n).map((f) => ({
+    return (await g.nodes('fact', n)).map((f) => ({
       id: f.id, text: f.label, kind: f.props?.kind || 'fact', when: whenText(f.lastTs), about: [], score: 0,
     }));
   }
 
-  function digest() {
+  async function digest() {
     if (!ok()) return '';
-    const s = stats();
+    const s = await stats();
     if (!s.facts) return '';
     const themes = s.themes.slice(0, 4).map((t) => `${t.label}（${t.n}）`).join('、');
     return `你已经有 ${s.facts} 条长期记忆，${s.entities} 个实体${themes ? `，主要在：${themes}` : ''}。`
@@ -348,28 +383,28 @@ export function createMemory(o = {}) {
   }
 
   /**
-   * 每轮开始时拼给模型看的那一段。**它是临时的**：只加在这一轮的请求里，
+   * 每轮开始时拼给模型看的那一段。它是临时的：只加在这一轮的请求里，
    * 不写进会话历史 —— 否则历史会越来越长，而且下次回忆到的东西永远停在第一次那份。
    */
-  function context(query = '') {
+  async function context(query = '') {
     if (!ok()) return { text: '', hits: [] };
     const q = String(query || '');
     const lines = [];
-    const d = digest();
+    const d = await digest();
     if (!d) return { text: '', hits: [] };
     lines.push('## 你记得的事');
     lines.push('（长期记忆，来自以前的会话。数字会过时：跟这一轮工具读到的不一致时，以工具为准。）');
 
-    let hits = q ? recall(q, 5).facts : [];
+    let hits = q ? (await recall(q, 5)).facts : [];
     /* 时间问句：关键词命中不了"昨天"，但用户要的就是"昨天"。 */
     if (!hits.length && /(昨天|前天|上次|之前|以前|最近|这几天|记得|做过|说过|聊过)/.test(q)) {
-      hits = recent(4);
+      hits = await recent(4);
     }
     for (const h of hits) {
       lines.push(`- ${h.when} · ${h.text}${h.about.length ? `（${h.about.join('、')}）` : ''}`);
     }
     lines.push(d);
-    /* 命中列表一起给出去：模型没说话时，服务端要能用**同一批**记忆兜底铺一屏，
+    /* 命中列表一起给出去：模型没说话时，服务端要能用同一批记忆兜底铺一屏，
        而不是再查一次（再查会重复累加 access，回忆的信号就被污染了）。 */
     return { text: lines.join('\n'), hits };
   }
@@ -377,27 +412,28 @@ export function createMemory(o = {}) {
   /* ── 写 ── */
 
   /** 实体节点：按标签查，没有就建。display 保留原始大小写，label 归一化后当键。 */
-  function ensureEntity(label, ts) {
-    return g.nodeByLabel('entity', label) || g.upsertNode({
+  async function ensureEntity(label, ts) {
+    return (await g.nodeByLabel('entity', label)) || (await g.upsertNode({
       id: entityId(label), kind: 'entity', label: norm(label), props: { display: label }, ts,
-    });
+    }));
   }
 
-  function linkEntity(factNode, label, ts) {
-    g.upsertEdge({ src: factNode.id, dst: ensureEntity(label, ts).id, type: 'about', ts });
+  async function linkEntity(factNode, label, ts) {
+    const e = await ensureEntity(label, ts);
+    await g.upsertEdge({ src: factNode.id, dst: e.id, type: 'about', ts });
   }
 
   /** 一条事实落图：精确去重（id 由文本决定）+ 近似去重（2-gram Jaccard）。 */
-  function remember(fact, src, ts = nowTs()) {
+  async function remember(fact, src, ts = nowTs()) {
     const text = fact.text;
     let target = factId(text);
-    let prev = g.getNode(target);
+    let prev = await g.getNode(target);
 
     if (!prev) {
       /* 近似去重：同一个意思换个说法，不该在回忆里出现两遍。
          只跟最近 300 条比 —— 覆盖全量是 O(n²)，而这个量级上没有必要精确。 */
       const g1 = grams(text);
-      const cand = g.nodes('fact', 300);
+      const cand = await g.nodes('fact', 300);
       let best = null;
       let bestJ = 0;
       for (const c of cand) {
@@ -407,38 +443,38 @@ export function createMemory(o = {}) {
       if (best && bestJ >= 0.75) { target = best.id; prev = best; }
     }
 
-    const node = g.upsertNode({
+    const node = await g.upsertNode({
       id: target, kind: 'fact', label: text,
       props: { kind: fact.kind, about: fact.about }, valence: fact.valence, src, ts,
     });
 
     for (const label of [...fact.about, ...partsOf(text).filter((p) => !fact.about.includes(p))]) {
-      linkEntity(node, label, ts);
+      await linkEntity(node, label, ts);
     }
     return { node, reinforced: !!prev };
   }
 
-  /** 一轮结束：把这段对话交给模型抽几条事实。**后台跑**，不挡下一轮。 */
+  /** 一轮结束：把这段对话交给模型抽几条事实。后台跑，不挡下一轮。 */
   function afterTurn(t) {
     if (!ok() || !extractor) return Promise.resolve(0);
     const text = buildTranscript(t);
     if (!text) return Promise.resolve(0);
     const key = `t:${t.sid}:${t.turn}`;
-    if (g.meta.get(key)) return Promise.resolve(0);   // 同一轮只抽一次（重启/重放都安全）
 
     pending++;
     const job = queue.then(async () => {
+      if (await g.meta.get(key)) return 0;   // 同一轮只抽一次（重启/重放都安全）
       const raw = await extractor(text);
       const facts = parseFacts(raw).map(cleanFact).filter(Boolean).slice(0, 3);
-      if (!facts.length) { g.meta.set(key, { at: nowTs(), facts: 0 }); return 0; }
+      if (!facts.length) { await g.meta.set(key, { at: nowTs(), facts: 0 }); return 0; }
       const src = `${t.sid}#${t.turn}`;
       const ts = nowTs();
       let n = 0;
-      for (const f of facts) { remember(f, src, ts); n++; }
-      g.meta.set(key, { at: ts, facts: n });
+      for (const f of facts) { await remember(f, src, ts); n++; }
+      await g.meta.set(key, { at: ts, facts: n });
       turnsSince += 1;
-      const last = Number(g.meta.get('lastSweep') || 0);
-      if (turnsSince >= CONSOLIDATE_EVERY || ts - last > SWEEP_EVERY) consolidate();
+      const last = Number((await g.meta.get('lastSweep')) || 0);
+      if (turnsSince >= CONSOLIDATE_EVERY || ts - last > SWEEP_EVERY) await consolidate();
       return n;
     }).catch((e) => {
       /* 记忆坏了不能连累对话：抽错了就是这一轮没记住，下一轮照常 */
@@ -450,17 +486,17 @@ export function createMemory(o = {}) {
     return job;
   }
 
-  /** 巩固：打分 → 剪枝 → 社群合并 → 快照。所有数字都写进 meta，`memory_stats` 读它。 */
-  function consolidate() {
+  /** 巩固：打分 → 剪枝 → 社群合并 → 快照。所有数字都写进 meta，memory_stats 读它。 */
+  async function consolidate() {
     if (!ok()) return null;
     const ts = nowTs();
-    g.sweepEdges();
-    const deg = g.degreeMap();
-    const facts = g.nodes('fact');
-    const ents = g.nodes('entity');
+    await g.sweepEdges();
+    const deg = await g.degreeMap();
+    const facts = await g.nodes('fact');
+    const ents = await g.nodes('entity');
     const factById = new Map(facts.map((f) => [f.id, f]));
 
-    for (const n of [...facts, ...ents]) g.setWeight(n.id, +score(n, [], deg, ts).toFixed(3));
+    await g.setWeights([...facts, ...ents].map((n) => ({ id: n.id, weight: +score(n, [], deg, ts).toFixed(3) })));
 
     /* 剪枝的判据要同时满足四条。只看分数会剪掉"很久以前但很重要"的事，
        只看时间会剪掉"三个月前但每周都提"的事。 */
@@ -476,10 +512,10 @@ export function createMemory(o = {}) {
       const rest = facts.filter((f) => !dead.has(f.id)).sort((a, b) => a.weight - b.weight);
       doomed.push(...rest.slice(0, alive - KEEP_MAX));
     }
-    if (doomed.length) g.softDelete(doomed.map((f) => f.id));
+    if (doomed.length) await g.softDelete(doomed.map((f) => f.id));
 
     /* ── 社群合并 ──
-     * 两个实体在**同一条记忆**里一起出现过，就连一条边；反复一起出现（≥2 次）才成团。
+     * 两个实体在同一条记忆里一起出现过，就连一条边；反复一起出现（≥2 次）才成团。
      * 门槛设 2 是有意的：一次同框是巧合（"n8n 和 Downloads 都提到了"），
      * 两次同框才是一个人的真实关注点。
      * 团够大（≥4 个事实）就塌缩成一个摘要节点 —— 回忆时先给摘要，细节还留在下面。 */
@@ -487,7 +523,7 @@ export function createMemory(o = {}) {
     const pair = new Map();
     const factsOf = new Map();      // 实体 → 提到它的事实
     const aboutOf = new Map();      // 事实 → 它提到的实体
-    for (const e of g.edges()) {
+    for (const e of await g.edges()) {
       if (e.type !== 'about') continue;
       if (!aboutOf.has(e.src)) aboutOf.set(e.src, new Set());
       aboutOf.get(e.src).add(e.dst);
@@ -498,10 +534,10 @@ export function createMemory(o = {}) {
     for (const f of facts) {
       const have = aboutOf.get(f.id) || new Set();
       for (const label of partsOf(f.label)) {
-        const e = g.nodeByLabel('entity', label);
+        const e = await g.nodeByLabel('entity', label);
         if (e && have.has(e.id)) continue;
-        const ent = e || ensureEntity(label, ts);
-        g.upsertEdge({ src: f.id, dst: ent.id, type: 'about', ts });
+        const ent = e || await ensureEntity(label, ts);
+        await g.upsertEdge({ src: f.id, dst: ent.id, type: 'about', ts });
         have.add(ent.id);
         entById.set(ent.id, ent);
         relinked++;
@@ -543,6 +579,7 @@ export function createMemory(o = {}) {
     }
 
     const madeIds = new Set();
+    const memberOf = [];
     let covered = 0;
     for (const [, ids] of groups) {
       if (ids.length < 2) continue;
@@ -557,27 +594,30 @@ export function createMemory(o = {}) {
         .filter(Boolean)
         .sort((a, b) => b.weight - a.weight)
         .slice(0, 3);
-      g.putNode({
+      await g.putNode({
         id: cid, kind: 'community',
         label: `关于 ${labels.slice(0, 2).join('、')} 的记忆`,
         props: { entities: labels, members, sample: top.map((f) => f.label) },
         weight: 0.5 + Math.min(0.5, members.length / 20),
         ts,
       });
-      for (const id of members) g.setCommunity(id, cid);
+      for (const id of members) memberOf.push({ id, community: cid });
       madeIds.add(cid);
       covered += members.length;
     }
+    if (memberOf.length) await g.setCommunities(memberOf);
     /* 团散了，摘要也得跟着散 —— 不然用户会看到"关于 A、B 的记忆"，
        点开里面全是早就不相关的东西。 */
-    for (const c of g.nodes('community')) if (!madeIds.has(c.id)) g.softDelete([c.id]);
+    const stale = (await g.nodes('community')).filter((c) => !madeIds.has(c.id)).map((c) => c.id);
+    if (stale.length) await g.softDelete(stale);
 
+    const finalStats = await g.stats();
     const report = {
       at: ts, pruned: doomed.length, communities: madeIds.size, covered, relinked,
-      facts: g.stats().facts, edges: g.stats().edges,
+      facts: finalStats.facts, edges: finalStats.edges,
     };
-    g.meta.set('lastSweep', ts);
-    g.meta.set('lastReport', report);
+    await g.meta.set('lastSweep', ts);
+    await g.meta.set('lastReport', report);
     turnsSince = 0;
     snapshot().catch(() => {});
     console.log(`[memory] 巩固：剪掉 ${report.pruned} 条，${report.communities} 个社群覆盖 ${report.covered} 条`);
@@ -591,15 +631,15 @@ export function createMemory(o = {}) {
     const d = new Date();
     const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
       + `-${String(d.getHours()).padStart(2, '0')}${String(d.getMinutes()).padStart(2, '0')}${String(d.getSeconds()).padStart(2, '0')}`;
-    /* VACUUM INTO 遇到同名文件会直接报错，而"同一秒巩固两次"是真实会发生的
-       （启动补一次 + 刚好攒够轮次）。加个序号，别让快照把自己绊倒。 */
-    let target = path.join(dirS, `${stamp}.db`);
+    /* 同一秒拍两张是真实会发生的（启动补一次 + 刚好攒够轮次），加序号别把自己绊倒。 */
+    const ext = storeKind === 'axolotl' ? '.axeb' : '.db';
+    let target = path.join(dirS, `${stamp}${ext}`);
     for (let i = 1; ; i++) {
       try { await fs.access(target); } catch { break; }
-      target = path.join(dirS, `${stamp}-${i}.db`);
+      target = path.join(dirS, `${stamp}-${i}${ext}`);
     }
-    g.snapshot(target);
-    const files = (await fs.readdir(dirS)).filter((f) => f.endsWith('.db')).sort();
+    await g.snapshot(target);
+    const files = (await fs.readdir(dirS)).filter((f) => f.endsWith(ext)).sort();
     for (const f of files.slice(0, Math.max(0, files.length - SNAPSHOTS))) {
       await fs.unlink(path.join(dirS, f)).catch(() => {});
     }
@@ -607,28 +647,30 @@ export function createMemory(o = {}) {
   }
 
   /* 快照排队：巩固结束时后台拍一张，用户也可能正好手动拍一张。
-     两个 VACUUM 撞在同一个文件上会直接报错（实测），串行化最省事。 */
+     两个快照撞在同一个文件上会直接报错（实测），串行化最省事。 */
   function snapshot() {
     snapChain = snapChain.then(doSnapshot, doSnapshot);
     return snapChain;
   }
 
   /** 忘掉。软删，能捞回来 —— 用户说"忘掉这件事"时不该真的不可逆。 */
-  function forget(query) {
+  async function forget(query) {
     if (!ok()) return { forgotten: [] };
-    const hits = recall(query, 3).facts.filter((f) => f.score >= 1);
+    const hits = (await recall(query, 3)).facts.filter((f) => f.score >= 1);
     if (!hits.length) return { forgotten: [] };
-    g.softDelete(hits.map((h) => h.id));
+    await g.softDelete(hits.map((h) => h.id));
     return { forgotten: hits.map((h) => h.text) };
   }
 
-  function stats() {
+  async function stats() {
     if (!ok()) return { facts: 0, entities: 0, communities: 0, edges: 0, pruned: 0, themes: [], recent: [], last: null };
-    const s = g.stats();
+    const s = await g.stats();
     const counts = new Map();
-    for (const e of g.edges()) {
+    const cache = new Map();
+    for (const e of await g.edges()) {
       if (e.type !== 'about') continue;
-      const n = g.getNode(e.dst);
+      let n = cache.get(e.dst);
+      if (n === undefined) { n = await g.getNode(e.dst); cache.set(e.dst, n); }
       if (!n || n.kind !== 'entity') continue;
       const key = n.props?.display || n.label;
       const cur = counts.get(key) || { label: key, n: 0, last: 0 };
@@ -640,8 +682,8 @@ export function createMemory(o = {}) {
       ...s,
       themes: [...counts.values()].sort((a, b) => b.n - a.n).slice(0, 6)
         .map((t) => ({ label: t.label, n: t.n, last: whenText(t.last) })),
-      recent: g.nodes('fact', 5).map((f) => ({ text: f.label, when: whenText(f.lastTs) })),
-      last: g.meta.get('lastReport') || null,
+      recent: (await g.nodes('fact', 5)).map((f) => ({ text: f.label, when: whenText(f.lastTs) })),
+      last: (await g.meta.get('lastReport')) || null,
       turns: turnsSince,
     };
   }
@@ -649,15 +691,19 @@ export function createMemory(o = {}) {
   /** 等后台抽取跑完。给测试和优雅停机用 —— 平时没人等它。 */
   async function drain() { await queue; }
 
-  function stop() { if (g) { try { g.close(); } catch { /* ignore */ } } }
+  async function stop() {
+    if (!g) return;
+    try { await g.close(); } catch { /* 已经关了 */ }
+  }
 
   return {
     start, stop, drain, enabled,
     get dir() { return dir; },
+    get store() { return storeKind; },
     setExtractor(fn) { extractor = fn; },
     context, recall, recent, digest, stats, consolidate, remember, forget, afterTurn, snapshot,
     /** 只给调试端点用 */
-    debug(q) { return { dir, stats: stats(), recall: q ? recall(q, 5) : null }; },
+    async debug(q) { return { store: storeKind, dir, stats: await stats(), recall: q ? await recall(q, 5) : null }; },
   };
 }
 

@@ -631,15 +631,23 @@ spec → 离屏 canvas 2D（逻辑尺寸 = 绘制区）
 | 容器 | 说明 |
 |---|---|
 | `agent` | Node 22；带 kubectl / git / curl / jq / ripgrep / python3 + `python-docx` `python-pptx` `openpyxl` |
-| `memory` | Python 3.12 + `axolotl_rs`（Linux CPU 构建，见下）+ lobster-memory；uvicorn 监听 127.0.0.1:7801 |
+| `memory` | **Python 3.11**（wheel 是 cp311）+ `axolotl_rs`；`agent/memsvc/server.py` 监听 127.0.0.1:7801 |
 
-**memory 镜像怎么构建**：多阶段 —— 第一阶段用 `rust:1-bookworm` 装 `python3-dev` + `maturin`，对打过 §6.2 三处补丁的源码跑 `maturin build --release --features python-bindings`；第二阶段 `python:3.12-slim` 只装 wheel 和 lobster-memory。这样镜像里不带 Rust 工具链（省 ~1.2GB），重建记忆服务也不用重编 Rust。
+**memory 镜像怎么构建 —— 实际做法比原计划简单：不打自建镜像。**
+基础镜像直接用 `python:3.11-slim`，wheel 用 `pip install --target` 装到宿主机
+`/olares/emergent-py`（hostPath 挂成 `/py`，`PYTHONPATH=/py`）。于是：
+改 `server.py` 只是 tar 一次 + 重建 pod，不用装 Docker、不用推仓库；
+Rust 工具链只在**重建 wheel** 时用一次（`/root/axbuild.yaml` 那个 `rust:1-bookworm` pod）。
+完整步骤与排障见 `deploy/README.md` 的"记忆侧车（axolotl）"。
 
-实测产物：`axolotl_rs-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl`，457KB。注意 `manylinux_2_34` 意味着基础镜像的 glibc ≥ 2.34（bookworm / noble 都满足）。
+实测产物：`axolotl_rs-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl`，466KB（补了
+`vertices()` / `edges()` 两个枚举之后）。`manylinux_2_34` 要求 glibc ≥ 2.34
+（bookworm / noble 都满足）。**lobster-memory 没有搬进来** —— 它的上层逻辑在
+`agent/memory.mjs` 里按同样的语义重写了一遍，原因见 §17。
 
 | 项 | 值 |
 |---|---|
-| 资源 | agent request 200m/512Mi，limit 1500m/1.5Gi；memory request 100m/256Mi，limit 1000m/1Gi |
+| 资源 | agent request 20m/64Mi，limit 800m/512Mi；memory request 20m/64Mi，limit 500m/512Mi（实测 7 条记忆的内存容器常驻约 40Mi） |
 | 卷 | Home → `/home/olares`（rw）；`~/Agent/{workspace,tools,skills,memory,audit,trash,drawings}` |
 | 网络 | nginx `location ^~ /agent/` → agent:8080；WS 不缓冲 |
 | 鉴权 | `/agent/` 转发 `Cookie` 打 authelia 的 forward-auth 接口（`/api/verify`），200 时读 `Remote-User`；未见 cookie 401 —— 见下 |
@@ -799,6 +807,62 @@ M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么�
 **落盘与可观察**：`~/Agent/memory/memory.db`（用户在 Files 里看得见）+
 `snapshots/`；没挂用户目录时退回 `agent/memory/`。`GET /agent/api/memory?q=n8n`
 是唯一可观测入口 —— 平时用户看不到记忆，出问题时至少能问它"你记了什么"。
+
+### 接上真图库（同日，用户提出）
+
+> "sql 模拟的跟真实的还是有很大区别，后面调试会白白浪费很多时间。"
+
+这句话是对的，而且比"性能"更要命的是**语义**：SQL 那版是我自己定的规矩，
+真引擎的规矩不一样（顶点 id 是 u64、add_vertex 对已存在 id 是更新而不是报错、
+边可以有平行边、删除只在 InMemory 模式支持、持久化是整图落盘）。越晚接，
+上层就要为这些差别改越多东西。
+
+**三处改动：**
+
+1. **Rust 绑定补两个枚举**（`deploy/axolotl-py-bindings.patch`）。原绑定只能
+   "知道 id 才能查"，于是上层必须自己维护一份 id 目录 —— 一份会和图本身漂移的
+   目录。补 `vertices()` / `edges()` 之后，图的全部状态都能从 `.axeb` 读回来。
+2. **侧车** `agent/memsvc/server.py`（Python 3.11 + `axolotl_rs`）。接口是
+   `POST /call {op, args}`，op 与 `sources/graph.mjs` 的方法一一对应，
+   上层 `memory.mjs` 不知道自己下面换了引擎。
+3. **全链路 async**。网络存储本来就是异步的：`recall/context/stats/remember/
+   consolidate` 全部改成 await，SQLite 那份 `await` 一个普通值同样成立 ——
+   两条存储共用一套调用。
+
+**真引擎暴露出来的差别**（这些是模拟不出来的）：
+
+| 事 | 真引擎的规矩 | 我们怎么处理 |
+|---|---|---|
+| 顶点 id | `u64` | 字符串 id 取 sha1 前 8 字节；原名存在属性 `sid` 里，撞了读回时能发现 |
+| 改属性 | `add_vertex` 对已存在 id 是**更新** | 计数器（freq/access/weight）可以原地改，不用删了重建 |
+| 边权重累加 | 没有原地更新，`add_edge` 会追加平行边 | 先 `remove_edge` 再按新总重加（我们一对顶点只有一种边） |
+| 软删 | `delete_vertex` 只在 InMemory 支持 | 本来就只做软删（属性 `alive=0`），正好不碰这条限制 |
+| 持久化 | `save_to` 整图写盘，无自动 flush | 侧车空闲 2.5s 落盘一次，写临时文件再 rename；SIGTERM 同步落盘 |
+
+**迁移**：侧车第一次启动、图还是空的时候，从旧的 `memory.db` 把节点/边/meta
+搬进 `.axeb`，然后把旧库改名 `.migrated`。改名是必须的 —— 留着它，哪天 `.axeb`
+被清空就会**再迁一次**，等于把删掉的记忆复活。
+
+**五条真机坑**（都是第一次部署当场踩的）：
+
+1. 同 pod 两个容器**并行启动**，agent 比侧车早 1~2 秒 → 必须重试（现在等 8 秒）。
+   等不到就**停用记忆**，不退回 SQLite：两份库同时活着等于记忆分叉。
+2. `degreeMap` 走 JSON 就没有 Map → 适配器里 `new Map(Object.entries(...))` 转回来，
+   别让调用方猜"这次拿到的是 Map 还是对象"。
+3. `tools.mjs` 里三个记忆工具漏了 `await` → `memory_recall` 直接 err，
+   模型只能说"我记不清了"。**改异步接口必须把所有调用点一起改**。
+4. 巩固要给每个节点写权重、给每个成员写社群 id：逐条 HTTP 就是几千次往返 →
+   加了 `setWeights` / `setCommunities` 两个批量 op。
+5. 图的顶点 id 是数字，上层说的是 `f:<hash>` / `e:<hash>` —— 翻译只能在
+   `server.py` 的边界上做一次，`all_edges()` 统一返回字符串 id。
+
+**验收（真集群）**：迁移后 `23 节点 / 13 边 / 7 条记忆 / 1 个社群`；
+说"我给 Navidrome 建了个歌单叫「周末」" → 写进 `.axeb` →
+`kubectl delete pod` 重建 → 新会话问"我给 Navidrome 建的那个歌单叫什么"
+→ 答"叫「周末」，放在收藏里"。`memory.axeb` 11.8KB，`snapshots/` 里有快照。
+
+**现在的默认**：`MEMORY_STORE=axolotl`。SQLite 那份保留为**显式**备胎
+（`MEMORY_STORE=sqlite`，本地开发与自测用，因为 Linux wheel 在本机装不上）。
 
 ---
 

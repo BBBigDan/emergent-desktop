@@ -1184,8 +1184,8 @@ const server = http.createServer(async (req, res) => {
     try {
       /* `?sweep=1` 立刻做一次巩固。验收要用：等 6 轮才能看到"社群在合并"，
          而这件事恰恰是记忆里最需要被看见的部分（剪掉了什么、合并了什么）。 */
-      if (u.searchParams.get('sweep') === '1') memory.consolidate();
-      res.end(JSON.stringify(memory.debug(q), null, 1));
+      if (u.searchParams.get('sweep') === '1') await memory.consolidate();
+      res.end(JSON.stringify(await memory.debug(q), null, 1));
     } catch (e) {
       res.end(JSON.stringify({ error: String(e?.message || e) }));
     }
@@ -1238,7 +1238,7 @@ try {
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, async () => {
     try { await Promise.race([memory.drain(), new Promise((r) => setTimeout(r, 3000))]); } catch { /* 不等了 */ }
-    memory.stop();
+    await memory.stop();
     process.exit(0);
   });
 }

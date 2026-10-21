@@ -233,3 +233,75 @@ agent 是桌面的一层（`shell/src/deskagent.js`，见 `docs/场界面-设计
 - ConfigMap 是 subPath 挂载，改完**必须重建 Pod**：`kubectl exec nginx -s reload` 没用，
   容器里那份文件根本不会更新。
 - `WEB_ROOT` 要指到 `/app/shell`（装页面的那层）。指错了页面能开但 `./src/*.js` 全 404。
+
+## 记忆侧车（axolotl）
+
+agent pod 现在是**两个容器**：`agent`（Node）+ `memory`（Python 3.11 + axolotl）。
+
+```
+浏览器 → /agent/api/*  →  agent:8788  ──127.0.0.1:7801──▶  memory:7801 (memsvc)
+                                                              └─ .axeb（~/Agent/memory）
+```
+
+| 项 | 值 |
+|---|---|
+| 镜像 | `python:3.11-slim`（**别升 3.12**，wheel 是 cp311） |
+| 代码 | `/app/agent/memsvc/server.py`（跟着 tar 一起同步） |
+| 图库 | `/olares/emergent-py`（hostPath）里的 `axolotl_rs`，靠 `PYTHONPATH=/py` 加载 |
+| 数据 | `~/Agent/memory/memory.axeb` + `snapshots/`；旧的 `memory.db` 首次启动迁入后改名 `.migrated` |
+| agent 侧 | `MEMORY_STORE=axolotl` `MEMORY_URL=http://127.0.0.1:7801` |
+
+**为什么不打自建镜像**：wheel 是构建产物，放在 hostPath 里就能用；改 `server.py`
+只需 tar 一次 + 重建 pod，不用装 Docker、不用推仓库。这跟壳层的思路一致。
+
+### 重建 wheel（改了 Rust 绑定才需要）
+
+axolotl 的 Python 绑定补过一处：原版只能"知道 id 才能查"，补了 `vertices()` / `edges()`
+两个全量枚举（补丁见 `deploy/axolotl-py-bindings.patch`），否则上层得自己维护一份
+会和图漂移的 id 目录。
+
+```bash
+# 1. 源码（已打过 deploy/axolotl-linux.patch + axolotl-py-bindings.patch）在
+#    宿主机 /olares/emergent-build/prototype-rust
+# 2. 用构建 pod（rust:1-bookworm）编：
+kubectl apply -f /root/axbuild.yaml
+kubectl exec -n user-space-bbbigdan axbuild -- bash -c '
+  export PATH=/usr/local/cargo/bin:$PATH
+  which maturin || (apt-get update -qq && apt-get install -y -qq python3 python3-dev python3-pip &&
+                    pip3 install --break-system-packages -q maturin)
+  cd /src/prototype-rust && cargo build --release --features python-bindings &&
+  maturin build --release --features python-bindings --out /src/dist'
+# 3. 装进 hostPath（pip --target，不污染系统 Python）：
+cp /olares/emergent-build/dist/axolotl_rs-*.whl /olares/emergent-py/
+kubectl run pyinst -n user-space-bbbigdan --image=python:3.11-slim --restart=Never \
+  --overrides='{"spec":{"volumes":[{"name":"py","hostPath":{"path":"/olares/emergent-py"}}],
+  "containers":[{"name":"pyinst","image":"python:3.11-slim",
+  "command":["pip","install","--no-index","--target","/py","/py/axolotl_rs-0.1.0-cp311-cp311-manylinux_2_34_x86_64.whl"],
+  "volumeMounts":[{"name":"py","mountPath":"/py"}]}]}}'
+```
+
+有缓存时 `cargo build` 约 30s，冷编译约 2 分钟。
+
+### 日常更新
+
+```bash
+# 只改了 server.py / agent 代码：tar + 重建 pod（两个容器一起重启，图会先落盘）
+tar czf - --exclude=agent/.env --exclude=agent/sessions agent |
+  ssh root@HOST 'tar xzf - -C /olares/emergent-agent/app'
+ssh root@HOST 'kubectl delete pod emergent-agent -n user-space-bbbigdan --wait && \
+               kubectl apply -f /root/agent-k8s.yaml'
+```
+
+**排障**
+
+```bash
+kubectl logs -n user-space-bbbigdan emergent-agent -c memory   # 侧车：开了哪个图、节点数
+kubectl logs -n user-space-bbbigdan emergent-agent -c agent    # [memory] axolotl · … · N 条记忆
+curl localhost:9788/agent/api/memory?q=n8n                     # 端口转发后：stats + 一次回忆
+curl localhost:9788/agent/api/memory?sweep=1                    # 立刻巩固一次
+kubectl exec -n user-space-bbbigdan emergent-agent -c memory -- ls -l /userspace/*/Home/Agent/memory
+```
+
+- **两个容器是并行起的**，agent 会等侧车最多 8 秒（实测差 1~2 秒）。等不到就停用记忆，
+  桌面照常 —— 但**不会**退回 SQLite（两份库同时活着等于记忆分叉）。
+- 侧车每 2.5 秒空闲落盘一次（`save_to` 临时文件 + rename），SIGTERM 时同步落盘再退。

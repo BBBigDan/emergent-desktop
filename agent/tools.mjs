@@ -539,7 +539,7 @@ export function makeTools(o = {}) {
     run: async ({ query, k } = {}) => {
       if (!memory) return noMem();
       const n = Math.min(8, Math.max(1, Number(k) || 5));
-      const r = memory.recall(String(query || ''), n);
+      const r = await memory.recall(String(query || ''), n);
       if (!r.facts.length) return { ok: true, found: 0, note: '记忆里没有相关的东西。不要编。' };
       return {
         ok: true,
@@ -556,7 +556,7 @@ export function makeTools(o = {}) {
     schema: { type: 'object', properties: {}, additionalProperties: false },
     run: async () => {
       if (!memory) return noMem();
-      const s = memory.stats();
+      const s = await memory.stats();
       /* 只回可读的那部分。节点 id、权重这些是给巩固用的，进上下文只是噪音。 */
       return {
         ok: true,
@@ -582,7 +582,7 @@ export function makeTools(o = {}) {
     },
     run: async ({ query }) => {
       if (!memory) return noMem();
-      const r = memory.forget(String(query || ''));
+      const r = await memory.forget(String(query || ''));
       if (!r.forgotten.length) return { ok: true, forgotten: [], note: '没找到对应的记忆' };
       return { ok: true, forgotten: r.forgotten };
     },

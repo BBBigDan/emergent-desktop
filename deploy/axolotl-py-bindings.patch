@@ -1,0 +1,44 @@
+--- a/src/py_bindings.rs
++++ b/src/py_bindings.rs
+@@ -407,6 +407,41 @@
+         Ok((vertices, py_edges))
+     }
+ 
++    /* ── 全量枚举（记忆层要的） ──
++     *
++     * 上一版的绑定只有"知道 id 才能查"，于是上面那层只能自己再存一份 id 目录 ——
++     * 一份会和图本身漂移的目录。加了这两个之后，图的**全部状态**都能从 .axeb 读回来，
++     * 不需要任何旁路索引。个人记忆这个量级（几万节点）全量扫是毫秒级。
++     */
++
++    /// vertices() → [(id, props), ...]
++    fn vertices<'py>(&self, py: Python<'py>) -> PyResult<Vec<(u64, Bound<'py, PyDict>)>> {
++        let db = self.db.lock().unwrap();
++        let mut out: Vec<(u64, Bound<'py, PyDict>)> = Vec::new();
++        for (id, props) in db.iter_vertices() {
++            let d = PyDict::new(py);
++            for (k, v) in &props {
++                d.set_item(k, prop_to_py(py, v))?;
++            }
++            out.push((id, d));
++        }
++        Ok(out)
++    }
++
++    /// edges() → [(from, to, weight, props), ...]
++    fn edges<'py>(&self, py: Python<'py>) -> PyResult<Vec<(u64, u64, f64, Bound<'py, PyDict>)>> {
++        let db = self.db.lock().unwrap();
++        let mut out: Vec<(u64, u64, f64, Bound<'py, PyDict>)> = Vec::new();
++        for (from, to, w, props) in db.iter_edges() {
++            let d = PyDict::new(py);
++            for (k, v) in &props {
++                d.set_item(k, prop_to_py(py, v))?;
++            }
++            out.push((from, to, w, d));
++        }
++        Ok(out)
++    }
++
+     /// find_paths(path_length, max_results=100) → [[vertex_id, ...], ...]
+     fn find_paths(&self, path_length: usize, max_results: Option<usize>) -> Vec<Vec<u64>> {
+         let db = self.db.lock().unwrap();
