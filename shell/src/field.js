@@ -191,6 +191,13 @@ const REVEAL_A = 0.72;  // 撑到这个比例才开始让 iframe 析出
 /* 关窗：散 → 就近 6 条小流 → 小流汇成一条大流 → 被中心的团吸收 */
 const CLOSE_MS = 2400;
 
+/* 场作为界面时，未被占用的环境点还留多亮。
+ *
+ * 这个数只能有一个出处：deskagent 唤出时用它，scene 每铺一屏也会用它 ——
+ * 原来两处各写一个（0.84 / 0.62），于是"唤出时球退下去了，模型一画屏又亮回来"，
+ * 看起来像画面自己闪了一下。 */
+export const UI_ENV_DIM = 0.84;
+
 export class Field {
   constructor(canvas) {
     this.canvas = canvas;

@@ -25,6 +25,7 @@
 import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { FONT, FONT_LAT } from './draw.js';
 import { TIMING } from './timing.js';
+import { UI_ENV_DIM } from './field.js';
 
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -151,9 +152,9 @@ export class FieldScene {
     /* dim 是"没被占用的环境粒子"还留多亮。
      *
      * 原来是 0.97：桌面球面和场几乎一样亮，两套点阵叠在一起，分不清哪层是界面。
-     * 场展开时桌面本该让位 —— 0.62 让球退成很淡的底噪，它还在（用户知道桌面没走），
-     * 但不再和仪表抢注意力。 */
-    f.slotBegin({ dim: 0.62, dot: 0.95 });
+     * 场展开时桌面本该让位 —— 让球退成很淡的底噪，它还在（用户知道桌面没走），
+     * 但不再和仪表抢注意力。具体数值见 field.js 的 UI_ENV_DIM（只能有一个出处）。 */
+    f.slotBegin({ dim: UI_ENV_DIM, dot: 0.95 });
 
     const list = (spec.layers || []).filter((x) => x && x.kind);
     /* 只有 focus 那一个进 L2（凝聚成字），其余只给形状 —— 这是注意力分层，

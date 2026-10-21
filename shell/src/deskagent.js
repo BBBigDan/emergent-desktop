@@ -16,6 +16,7 @@
  */
 
 import { FieldScene } from './scene.js';
+import { UI_ENV_DIM } from './field.js';
 import { ParticleText, SlotAllocator } from './pui.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
@@ -596,7 +597,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
      * 加法混合、中心叠着上千颗 —— 剩余的亮度依然盖在场上面，读数"45%"正好
      * 落在球心那片密点里，看着像透过一层星尘看字。0.84 之后球才真的退回
      * "桌面还在那儿"的底噪，而场是这屏唯一亮的东西。 */
-    field.slotBegin({ dim: 0.84, dot: 0.95 });
+    field.slotBegin({ dim: UI_ENV_DIM, dot: 0.95 });
 
     /* 从底部长出来：先让粒子"还没成形"，set 之后再把相干度拉回来。
        这不是入场动画 —— 是 §4.6 的相变语法，用户看到的是"桌面正在变成它"。 */
