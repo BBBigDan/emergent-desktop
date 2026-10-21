@@ -33,6 +33,7 @@
   #insp b.tool { color: rgba(255, 178, 87, 0.85); }
   #insp b.say { color: rgba(127, 227, 207, 0.8); }
   #insp b.tok { color: rgba(147, 184, 216, 0.55); }
+  #insp b.persona { color: rgba(196, 168, 255, 0.8); }
   #insp span { color: rgba(147, 184, 216, 0.5); }
   #insp i { color: rgba(147, 184, 216, 0.28); font-style: normal; }
   #insp .ln.dim { opacity: 0.3; }
@@ -362,6 +363,14 @@ function onEvent(m) {
 
     case 'busy':
       insp('busy', '上一轮还没结束，这一步先排队');
+      break;
+
+    case 'persona':
+      if (m.items?.length) {
+        insp('persona', m.items.map((x) => `#${String(x.id).replace(/^i/, '')} ${x.text}`).join(' · '), 'persona');
+      } else if (m.trace) {
+        insp('persona', `它提到了 ${m.trace.ids.map((x) => `#${String(x).replace(/^i/, '')}`).join(' ')}`, 'persona');
+      }
       break;
 
     case 'usage':

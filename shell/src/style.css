@@ -333,6 +333,8 @@ body.launching .rail-zone { display: none; }
 .ag-insp b.tool { color: rgba(255, 178, 87, .85); }
 .ag-insp b.say { color: rgba(127, 227, 207, .8); }
 .ag-insp b.tok { color: rgba(147, 184, 216, .55); }
+/* 人格层注入：比工具日志更淡一点 —— 它是"背景"，不是主线 */
+.ag-insp b.persona { color: rgba(196, 168, 255, .8); }
 .ag-insp span { color: rgba(147, 184, 216, .5); }
 .ag-insp i { color: rgba(147, 184, 216, .28); font-style: normal; }
 .ag-insp .ln.dim { opacity: .3; }

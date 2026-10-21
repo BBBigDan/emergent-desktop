@@ -31,6 +31,7 @@ import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
 import { trimHistory } from './history.mjs';
+import { createPersona, traceRefs } from './persona.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -174,6 +175,23 @@ const memory = createMemory({
  * 和记忆一样是可降级的：没挂上用户目录就只有内置工具，对话照常。 */
 /* TOOLBOX_HOME 只给本地调试用：没有 /userspace 时也能把工具落到一个干净的目录里 */
 const forge = createForge({ home: process.env.TOOLBOX_HOME || '' });
+
+/* ───────────────────────── 人格层（M5） ─────────────────────────
+ * 两件事：**它记得自己做过什么**（种子），以及**偶尔说一句与当下无关的旧事**（漂移）。
+ *
+ * 事实种子（记忆库里已经落地的旧事）每轮刷一次，缓存放在这里：
+ * 它必须是**与当前问题无关**的那一批，所以不能直接用 memory.context 的命中结果
+ * —— 命中的恰恰是"相关"的，会被正交判据全部挡掉，漂移就永远没有材料。
+ */
+let factPool = [];
+const persona = createPersona({
+  on: process.env.PERSONA !== 'off',
+  /* 跟记忆落在同一个目录：它在 Files 里必须看得见。
+     踩过：集群上记忆在 /userspace/pvc-xxx/Home/Agent/memory，人格却写进了 /root 下，
+     那是个容器内的私有目录 —— pod 一删全没，用户也永远翻不到它在记什么。 */
+  dir: () => memory.dir || '',
+  recallFacts: (n) => factPool.slice(0, n),
+});
 
 function withMemory(messages, note) {
   if (!note) return messages;
@@ -332,6 +350,17 @@ function speak(s, text) {
   const last = (s.log || [])[s.log.length - 1];
   if (!last || last.r !== 'a' || last.t !== t) pushLog(s, 'a', t);
   s.lastSpoken = t;
+  /* 反向核对：这一轮注入的旧事，有哪些真的被说出来了。
+     模型自己带编号是不保险的（7B 实测内容说对、编号没带），所以这里核一遍：
+     说到了就把编号留下 —— 那句"我记得…"从此有出处，而不是一句无法核对的口气。 */
+  if (s.driftItems?.length && !s.traced) {
+    const ids = traceRefs(t, s.driftItems);
+    if (ids.length) {
+      s.traced = ids;
+      emit(s, { t: 'persona', trace: { ids, said: t } });
+      console.log(`[persona] 它提到了 ${ids.join(' ')}`);
+    }
+  }
   emit(s, { t: 'say', text: t });
 }
 
@@ -640,6 +669,7 @@ async function runTurn(s, goal) {
   s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
+  s.traced = null;          // 这一轮它有没有把注入的旧事说出来（说了就记下编号）
   s.lastSpoken = '';
   s.pendingNext = '';     // 上一件工具留下的"下一步"（只用来推模型一把）
   s.forgeStep = false;    // 这一轮有没有动造工具的那几个（决定步数上限，见 MAX_STEPS）
@@ -657,6 +687,22 @@ async function runTurn(s, goal) {
     console.warn('[memory] 取上下文失败：' + e.message);
   }
   if (memHits.length) console.log(`[memory] 注入 ${memNote.length} 字，命中 ${memHits.length} 条`);
+
+  /* 事实种子的原料：**最近发生的事**，不是这一问的命中。
+     这一步也是漂移唯一可能失败的地方 —— 记忆库空的时候它没什么可说的，
+     那时它就该闭嘴，而不是把读数包装成"回忆"。 */
+  try {
+    factPool = await memory.recent(8);
+  } catch (e) {
+    factPool = [];
+    console.warn('[persona] 取旧事失败：' + e.message);
+  }
+  /* 漂移：抽 1~2 条与本问正交的旧事。返回空是常态 —— 每轮都说旧事就成了祥林嫂。 */
+  const driftNote = persona.drift(goal.kind === 'ask' ? goal.text : '', { turn: s.turn });
+  s.driftItems = driftNote.items;
+  if (driftNote.items.length) {
+    emit(s, { t: 'persona', items: driftNote.items.map((r) => ({ id: r.id, text: r.text })) });
+  }
 
   /* 技能（用户教过的做法）和工具表。两样都每轮刷新一次：
      "以后就这么办"和"装起来吧"都在某一轮里说完，下一轮就该生效 —— 
@@ -677,7 +723,11 @@ async function runTurn(s, goal) {
      判据在代码里（coldAllow），不靠模型自觉 —— 它连 needs.net 都填不对。 */
   const allow = coldAllow(goal);
   const guideNote = allow.has('forge') ? FORGE_GUIDE : '';
-  const ctxNote = [memNote, skillNote, guideNote].filter(Boolean).join('\n\n');
+  /* 身份段在**每次请求**里都出现（它是"你是谁"，不是"这轮用得上什么"）；
+     漂移段只在真的抽到东西时才出现。两段都走 ctxNote，不写进历史 ——
+     写进历史的话，同一句话会在每一轮的上下文里留一份副本。 */
+  const ctxNote = [persona.promptText(), memNote, driftNote.text, skillNote, guideNote]
+    .filter(Boolean).join('\n\n');
 
 
   /* 意图也要变成一条 user 消息进历史 —— 真模型靠上下文理解"用户刚才做了什么"，
@@ -955,7 +1005,18 @@ async function runTurn(s, goal) {
              只在回合结束时交给记忆抽取：审计日志是"真实发生过的事"，
              而真实发生过的事才是 L0 记忆该有的种子。 */
           if (s.acts.length < 12) {
-            s.acts.push({ name, brief: JSON.stringify(args ?? {}).slice(0, 70), note: summarize(result) });
+            /* ok/denied 一起带上：人格层只收"造成了后果的动作"。
+               被拒的、报错的调用没有改变任何东西，记下来只会在下一轮变成
+               "我试过但失败了"——那是日志，不是经历。 */
+            s.acts.push({
+              name,
+              brief: JSON.stringify(args ?? {}).slice(0, 70),
+              note: summarize(result),
+              /* 工具不一定带 ok 字段（k8s_restart 返回的是 {app, restarted, note}）——
+                 所以判"成功"看的是**没被拒、没报错**，而不是有没有 ok:true。 */
+              ok: !result?.denied && !result?.error && result?.ok !== false,
+              denied: !!result?.denied,
+            });
           }
         }
 
@@ -1363,6 +1424,12 @@ async function runTurn(s, goal) {
         actions: s.acts || [],
       }).catch(() => {});
     }
+    /* 种子只在这一轮真的动了世界时才写（重启/挪文件/装了工具）。
+       失败与被拒的调用在 acts 里就带着 ok:false，进来也没用。 */
+    const made = persona.afterTurn({ sid: s.sid, turn: s.turn, actions: s.acts || [] });
+    if (made.length) {
+      emit(s, { t: 'note', message: `记下了：${made.map((x) => x.text).join('；')}` });
+    }
     s.busy = false;
     s.abortCtl = null;
     /* 轮末结账。放在 idle **之前**：前端收到 idle 就会把状态条改成 ready，
@@ -1573,6 +1640,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* 人格层面板。`GET /agent/api/persona` —— 验收标准就压在这条路径上：
+     "它会说'我今天看到…'，且能指出那条信息是哪来的" —— 说不出编号、
+     或者编号在记录里查不到，这条验收就是没通过，而不是"感觉还行"。 */
+  if (p === '/api/persona' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      res.end(JSON.stringify({ ...persona.stats(), debug: u.searchParams.get('all') === '1' ? persona.debug() : undefined }, null, 1));
+    } catch (e) {
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
+    return;
+  }
+
   /* token 账本。`GET /agent/api/usage?sid=` 给当前会话；
      `?day=1` 直接读今天的日账本（不需要 sid，重启后也能查）。
      这条路径存在的理由和 /api/memory 一样：**看不见的东西管不住** ——
@@ -1637,6 +1717,14 @@ try {
   await memory.start();
 } catch (e) {
   console.warn('[memory] 启动失败，退化为无记忆模式：' + e.message);
+}
+
+/* 人格层同理：它起不来就当没有这个人格（不注入身份、不漂移），
+   而不是让整个服务打不开。 */
+try {
+  await persona.start();
+} catch (e) {
+  console.warn('[persona] 启动失败，人格层关闭：' + e.message);
 }
 
 /* 停机时把后台抽取跑完再走。kubectl delete pod 给的是 SIGTERM，

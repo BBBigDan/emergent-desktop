@@ -179,7 +179,7 @@ export function parseFacts(raw) {
 }
 
 /** 一条事实的形状检查。"看起来像读数"的一律不要 —— 它比空记忆更坏。 */
-function cleanFact(f) {
+export function cleanFact(f) {
   if (!f || typeof f !== 'object') return null;
   let text = String(f.text || '').replace(/^["'「](.*)["'」]$/, '$1').replace(/\s+/g, ' ').trim();
   if (text.length < 5 || text.length > 60) return null;
@@ -187,8 +187,15 @@ function cleanFact(f) {
      记下来只会污染回忆 —— 而且它看起来"很事实"，最容易被当真。
      判据不看开头，看**整句**：带百分比且没有任何"会持续下去"的动作/偏好词，就是读数。 */
   const pct = (text.match(/\d+(\.\d+)?\s*%/g) || []).length;
-  const durable = /(挪|改|加|删|放|设|要求|喜欢|不希望|不想|需要|应该|不要|记得|提醒|装|换|写|保存|用)/.test(text);
+  /* 动作词用双字，不用单字："占用"里的"用"会让读数过关（踩过）。
+     这张表和 persona.mjs 的 DURABLE 必须一致 —— 同一句话在记忆侧收进来、
+     在人格侧又说成"我做过的事"，两边判据不一样时就是这么分裂的。 */
+  const durable = /(挪|删除|装了|装好|装上|换成|写到|写了|保存|重启|调整|调到|调成|调过|配置|关闭|打开|创建|移动|加了|加进|放到|放回|设成|设为|改到|改成|要求|喜欢|不希望|不想|需要|应该|不要|记得|提醒)/.test(text);
   if (pct && !durable) return null;
+  /* 抽取失败的残渣。实测 7B 会把「我做了 → 工具返回」这种自己的旁白当成一条事实交上来，
+     而且形状检查全都通过（长度够、没有百分比）。它比空记忆更坏：
+     人格层会把它当"我做过的事"说出来，用户看到一句无意义的自述还带着编号。 */
+  if (/→|\{"|工具返回|^\s*(我|助手|模型)(做了|试了|调用了|先看)/.test(text)) return null;
   const about = (Array.isArray(f.about) ? f.about : [])
     .map((x) => String(x || '').trim())
     .filter((x) => x.length >= 1 && x.length <= 20 && !GENERIC.has(norm(x)))
@@ -359,6 +366,10 @@ export function createMemory(o = {}) {
           if (n) about.push(n.props?.display || n.label);
         }
       }
+      /* 老账本里的脏数据也要挡：以前版本进过库的读数（"n8n 占用 60% 内存"）、
+         抽取残渣，现在还会被 recall 命中。不在这里再筛一遍，
+         它们会一直出现在"你记得的事"里，而用户看到的是一句过期的读数。 */
+      if (!cleanFact({ text: f.label, about: [], kind: f.props?.kind })) continue;
       out.push({ id: f.id, text: f.label, kind: f.props?.kind || 'fact', when: whenText(f.lastTs), about, score: +s.toFixed(2) });
     }
     for (const r of out) await g.touch(r.id);

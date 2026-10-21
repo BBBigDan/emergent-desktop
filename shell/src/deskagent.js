@@ -571,6 +571,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       case 'note': insp('note', m.message); break;
       case 'busy': insp('busy', '上一轮还没结束，这一步先排队'); break;
 
+      /* 人格层注入了旧事。这一行是验收用的：屏幕上它说「重启过 n8n（#41）」，
+         这里就得看得见 #41 确实是被注入的，而不是它编的编号。 */
+      case 'persona':
+        if (m.items?.length) {
+          insp('persona', m.items.map((x) => `#${String(x.id).replace(/^i/, '')} ${x.text}`).join(' · '), 'persona');
+        } else if (m.trace) {
+          insp('persona', `它提到了 ${m.trace.ids.map((x) => `#${String(x).replace(/^i/, '')}`).join(' ')}`, 'persona');
+        }
+        break;
+
       /* 每步一次、轮末再一次。角标常驻，观察窗里只留最后一条当"过程"——
          每步都往观察窗里加会把工具调用挤出去，而工具调用才是排障的主线。 */
       case 'usage':

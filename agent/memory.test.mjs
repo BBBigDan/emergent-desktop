@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-import { createMemory, parseFacts } from './memory.mjs';
+import { createMemory, parseFacts, cleanFact } from './memory.mjs';
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'em-mem-'));
 let failed = 0;
@@ -93,6 +93,13 @@ const snap = await m.snapshot();
 ok(!!snap, '快照写出来了', snap);
 const st = await fs.stat(snap);
 ok(st.size > 0, '快照不是空文件', `${st.size}B`);
+
+console.log('\n[6] 形状检查（什么不该被当成事实）');
+ok(cleanFact({ text: '内存是 41%' }) === null, '读数不是事实（每轮都变）');
+ok(cleanFact({ text: '把内存上限调到 60%' }) !== null, '带动作词的百分比是事实（"调到 60%"是持续的配置）');
+ok(cleanFact({ text: '我做了 → 工具返回' }) === null,
+  '抽取失败的残渣不收（实测 7B 会把自己的旁白当成事实交上来）');
+ok(cleanFact({ text: 'n8n 的端口是 5678' }) !== null, '正常事实照收');
 
 await m.stop();
 await fs.rm(tmp, { recursive: true, force: true });
