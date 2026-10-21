@@ -1,0 +1,27 @@
+name: probe-ghcr
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 三种命名各推一次
+        run: |
+          docker pull -q alpine:3.20
+          for N in \
+            "ghcr.io/bbigdan/emergent-desktop:probe-a" \
+            "ghcr.io/bbigdan/emergent-desktop/probe:probe-b" \
+            "ghcr.io/bbigdan/probe-c:probe-c" ; do
+            docker tag alpine:3.20 "$N"
+            if docker push "$N" >/tmp/o 2>&1; then echo "OK   $N"; else echo "FAIL $N :: $(tail -1 /tmp/o)"; fi
+          done
+          echo "--- token 身份 ---"
+          TOK=$(docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<< "$(echo "${{ secrets.GITHUB_TOKEN }}")" >/dev/null 2>&1; cat ~/.docker/config.json | head -c 0; echo)
+          echo "actor=$GITHUB_ACTOR repo_owner=$GITHUB_REPOSITORY_OWNER"
