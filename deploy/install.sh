@@ -80,8 +80,11 @@ say "探测镜像（匿名，$IMAGE_TAG）"
 #   其它       —— 同一个主机上的 /token 端点（ghcr 就是这样）
 # 探测脚本用 heredoc 发到远端跑：本地不展开任何 $，省掉三层反斜杠。
 REG="${IMAGE_PREFIX%%/*}"
-REPO="${IMAGE_PREFIX#*/}"
-PROBE=$(sed -e "s|@REG@|$REG|g" -e "s|@REPO@|$REPO|g" -e "s|@TAG@|$IMAGE_TAG|g" <<'EOS'
+# 注意别叫 REPO：上面的 REPO 是仓库根目录，被覆盖一次就会让
+# `[ -f "$REPO/agent/.env" ]` 永远为假 —— 表现是"部署成功，但 Secret 从没更新"，
+# 而输出里那句"没有 agent/.env"看起来像是你自己没建文件。（踩过）
+REG_REPO="${IMAGE_PREFIX#*/}"
+PROBE=$(sed -e "s|@REG@|$REG|g" -e "s|@REPO@|$REG_REPO|g" -e "s|@TAG@|$IMAGE_TAG|g" <<'EOS'
 for I in shell agent memory; do
   R="@REPO@-$I"
   if [ "@REG@" = "docker.io" ]; then
@@ -152,8 +155,8 @@ say "重建 pod（让新模板 + 新镜像生效）"
 
 # kubectl 的 `rollout status` 不认 ReplicaSet（只认 deploy/sts/ds），
 # 所以这里自己等：pod 出现 + 三个容器都 Ready。
-say "等就绪（最多 120s）"
-"${SSH[@]}" "for i in \$(seq 1 60); do
+say "等就绪（最多 180s）"
+"${SSH[@]}" "for i in \$(seq 1 90); do
     R=\$(kubectl -n $NS get pod -l app=emergent-desktop -o jsonpath='{.items[0].status.containerStatuses[*].ready}' 2>/dev/null)
     case \"\$R\" in 'true true true') echo ready; exit 0;; esac
     sleep 2

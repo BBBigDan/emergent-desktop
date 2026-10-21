@@ -123,6 +123,19 @@ CI 最后会跑一次匿名探测，拉不到就在 Actions 里留 warning。
 4. **两套并存会写坏记忆库。** `memory.axeb` 只能有一个进程写。换安装方式之前，
    先把旧的那套停掉（`--uninstall` 或删旧工作负载）。
 
+## 两个只有真跑镜像才会撞到的坑（都撞了）
+
+1. **memory 的 readinessProbe 必须是 `exec`，不能用 `httpGet`。**
+   侧车只绑 `127.0.0.1:7801`（它只服务同 pod 的 agent），而 kubelet 的 httpGet
+   是从**节点**打 `podIP:7801` 的 —— 探不通。表现极具误导性：容器 `running`、
+   日志说 `listening`、pod 永远 `2/3`，`describe` 里连个错都没有。
+   现在用 `python3 -c "urllib...('/health')"`，在容器内部打回环。
+
+2. **`latest` 是可变标签，重拉时可能碰到边界。** 第一次自愈测试时，同一个
+   `latest` 有一瞬间拉到了上一版 manifest，agent 起来 2 秒就崩（`memory.ok is
+   not a function`），kubelet 重启后拉到新 manifest 又好了。冷启动高峰期别用
+   `latest` 验收 —— **要确定就 `--tag sha-1a2b3c4`**，那是不可变的。
+
 ## 回滚
 
 ```bash

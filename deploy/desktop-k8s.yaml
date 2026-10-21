@@ -313,12 +313,20 @@ spec:
           # 侧车有 3/3 的意义：没这个探针，python 还在加载图的时候 pod 已经报 Ready，
           # 而那时 agent 连上去只会得到 fetch failed。有了它，"三容器 Ready"
           # 才真的等于"记忆能用了" —— install.sh 等的就是这一刻。
+          #
+          # **必须是 exec，不能是 httpGet。** kubelet 的 httpGet 是从节点打
+          # podIP:7801，而这个服务只绑 127.0.0.1（它只给同 pod 的 agent 用）。
+          # 写成 httpGet 的表现是：容器 running、日志说 listening、pod 永远 2/3。
           readinessProbe:
-            httpGet:
-              path: /health
-              port: 7801
+            exec:
+              command:
+                - python3
+                - -c
+                - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:7801/health', timeout=3).status == 200 else 1)
             initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests: {cpu: 20m, memory: 64Mi}
             limits: {cpu: 500m, memory: 512Mi}
