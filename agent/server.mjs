@@ -1,14 +1,15 @@
 /**
- * emergent-agent · M0 基座（mock 形态）
+ * emergent-agent · 基座（M0 协议 + M1 真模型）
  *
  * 跑起来：
- *   node agent/server.mjs              # → http://127.0.0.1:8788/shell/agent.html
- *   SYS=mock node agent/server.mjs     # 工具返回固定假数据（截图要可复现）
+ *   node agent/server.mjs              # 读 agent/.env，默认硅基流动
+ *   MODEL=mock node agent/server.mjs   # 不联网，用假模型跑协议
+ *   SYS=mock MODEL=<任意模型> node agent/server.mjs
+ *                                      # 真模型 + 可复现的假数据（调提示词用）
  *
- * 这一版**没有接真模型**，也没有接 k8s。它的目标只有一个：
- * 把「模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌 → 审批挂起」
- * 这条链路跑通，从而**把协议定下来**。之后换真模型只改 model.*.mjs，
- * 换真工具只改 tools.mjs 的 run()，协议一个字不用动。
+ * 这一版接上了真模型（OpenAI 兼容），工具还是假的（k8s / 文件系统待接）。
+ * 它证明的是那条链路：**模型发工具调用 → 工具执行 → 场景指令下发 →
+ * 手势意图回灌 → 审批挂起**。换真工具只改 tools.mjs 的 run()，协议一个字不用动。
  *
  * 为什么下行用 SSE 而不是 WebSocket：这条链路上真正需要"流"的只有服务端 → 客户端
  * （一条工具的执行要分 run/ok 两次，模型的话要逐句来）。上行是低频率的点击和输入，
@@ -24,12 +25,32 @@ import url from 'node:url';
 
 import { makeTools } from './tools.mjs';
 import { createMockModel } from './model.mock.mjs';
+import { createOpenAIModel } from './model.openai.mjs';
+import { buildSystemPrompt } from './prompt.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根：dev 模式下同时服务 shell/
+
+/* .env 只给本地调试用：key 不进仓库（.gitignore 里有 agent/.env）。
+   自己读而不用 dotenv，是为了保持"零依赖"——这个服务将来要直接丢进 k8s。 */
+async function loadEnv(file) {
+  try {
+    const txt = await fs.readFile(file, 'utf8');
+    for (const line of txt.split('\n')) {
+      const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line);
+      if (!m || line.trim().startsWith('#')) continue;
+      if (process.env[m[1]] == null) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    }
+  } catch { /* 没有 .env 就用纯环境变量 */ }
+}
+await loadEnv(path.join(HERE, '.env'));
+
 const PORT = Number(process.env.PORT || 8788);
-const SYS = process.env.SYS || 'host';            // host | mock
-const MAX_STEPS = 8;                              // 一轮最多几次模型往返（防跑飞）
+const SYS = process.env.SYS || 'host';            // host | mock —— 只决定"数据从哪来"
+/* 模型与数据源是**两件事**：SYS=mock + 真模型，能在可复现的假数据上调提示词；
+   SYS=host + mock 模型，能在真数据上验工具。混成一个开关就没法分开排障。 */
+const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? 'deepseek-ai/DeepSeek-V4-Flash' : 'mock');
+const MAX_STEPS = Number(process.env.MAX_STEPS || 8);
 const APPROVAL_MS = 90_000;
 
 /* ───────────────────────── 会话 ───────────────────────── */
@@ -37,20 +58,34 @@ const APPROVAL_MS = 90_000;
 /** @type {Map<string, any>} */
 const sessions = new Map();
 
+function makeModel() {
+  if (MODEL_ID === 'mock') return createMockModel();
+  try {
+    return createOpenAIModel({ model: MODEL_ID });
+  } catch (e) {
+    /* 配错了不要静默退回 mock：那会让人以为"模型变笨了"，其实是一直没连上 */
+    console.error('[model]', e.message);
+    throw e;
+  }
+}
+
 function getSession(sid) {
   let s = sessions.get(sid);
   if (!s) {
     s = {
       sid,
-      messages: [],
+      /* 系统提示词是会话的第一条消息，进历史。这样 /api/debug 能直接看到
+         模型当时到底被喂了什么 —— 调提示词全靠这个。 */
+      messages: [{ role: 'system', content: buildSystemPrompt() }],
       res: null,
       tools: makeTools({ source: SYS }),
-      model: createMockModel(),
+      model: null,
       pending: null,        // 审批挂起：{id, resolve}
       busy: false,
       turn: 0,
       lastAdjustTo: null,
     };
+    s.model = makeModel();
     sessions.set(sid, s);
   }
   return s;
@@ -130,7 +165,10 @@ const summarize = (r) => {
   if (r == null) return '';
   if (r.denied) return '已拒绝';
   if (r.error) return r.error;
-  if (r.op) return `scene.${r.op}`;
+  /* 被校验层丢掉的字段是个信号：模型说的和画出来的不是一回事。
+     不显示出来，界面上"少了半个仪表"就永远查不到原因。 */
+  const cut = Array.isArray(r.dropped) && r.dropped.length ? ` · 丢 ${r.dropped.length}` : '';
+  if (r.op) return `scene.${r.op}${cut}`;
   if (r.apps) return `${r.apps.length} 个应用`;
   if (r.files) return `${r.files.length} 个文件`;
   if (r.freedGB != null) return `释放 ${r.freedGB} GB`;
@@ -163,12 +201,19 @@ async function runTurn(s, goal) {
     let repeats = 0;
     for (let step = 0; step < MAX_STEPS; step++) {
       emit(s, { t: 'think', on: true, step });
-      const out = await s.model.complete({
-        messages: s.messages,
-        tools: s.tools.schemas(),
-        goal: { ...goal, pendingTo: s.lastAdjustTo },
-      });
-      emit(s, { t: 'think', on: false, step });
+      let out;
+      try {
+        out = await s.model.complete({
+          messages: s.messages,
+          tools: s.tools.schemas(),
+          goal: { ...goal, pendingTo: s.lastAdjustTo },
+        });
+      } finally {
+        /* 必须放 finally：模型超时或 402 时 await 会抛，写在后面的
+           think:off 就永远发不出去 —— 前端会一直停在"低相干度"，
+           整个场看起来在抖，像是卡住了，而不是"出错了"。 */
+        emit(s, { t: 'think', on: false, step });
+      }
 
       const calls = out.tool_calls || [];
       if (out.content) emit(s, { t: 'say', text: out.content });
@@ -272,7 +317,16 @@ const server = http.createServer(async (req, res) => {
   /* ── 下行事件流 ── */
   if (p === '/api/events' && req.method === 'GET') {
     const sid = u.searchParams.get('sid') || crypto.randomUUID();
-    const s = getSession(sid);
+    let s;
+    try {
+      s = getSession(sid);
+    } catch (e) {
+      /* 模型配错（缺 key、模型名拼错）时，错误必须回到界面上，
+         而不是只在服务端控制台留一行 —— 否则前端只会一直"正在连接"。 */
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform',
@@ -343,5 +397,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`emergent-agent (mock)  http://127.0.0.1:${PORT}/shell/agent.html   sys=${SYS}`);
+  console.log(`emergent-agent  http://127.0.0.1:${PORT}/shell/agent.html`);
+  console.log(`  model=${MODEL_ID}  data=${SYS}  base=${process.env.MODEL_BASE || 'https://api.siliconflow.cn/v1'}`);
+  if (MODEL_ID !== 'mock' && !process.env.MODEL_KEY) {
+    console.warn('  ⚠ 没有 MODEL_KEY，连上后会报错。在 agent/.env 里写 MODEL_KEY=sk-...');
+  }
 });

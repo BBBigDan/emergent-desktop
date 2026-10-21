@@ -1,15 +1,66 @@
-# emergent-agent · M0 基座
+# emergent-agent · M0 协议 + M1 真模型
 
 ```
-node agent/server.mjs          # → http://127.0.0.1:8788/shell/agent.html
-SYS=mock node agent/server.mjs # 工具返回固定假数据（截图 / 自测要可复现）
+node agent/server.mjs                    # 读 agent/.env，默认硅基流动
+MODEL=mock node agent/server.mjs         # 不联网，用假模型跑协议
+SYS=mock node agent/server.mjs           # 工具返回固定假数据（截图 / 自测要可复现）
 ```
 
-零依赖，只用 Node 内建模块。**没有接真模型，也没有接 k8s** —— 这一版的目标只有一个：
-把「模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌 → 审批挂起」这条链路跑通，
-从而**把协议定下来**。
+零依赖，只用 Node 内建模块。**模型已经接真了，工具还是假的**（k8s / 文件系统待接）。
 
-之后换真模型只改 `model.*.mjs`，换真工具只改 `tools.mjs` 里的 `run()`，协议一个字都不用动。
+这一版证明的是那条链路：模型发工具调用 → 工具执行 → 场景指令下发 → 手势意图回灌 → 审批挂起。
+换真工具只改 `tools.mjs` 里的 `run()`，协议一个字都不用动。
+
+## 三个文件分掉了三件事
+
+| 文件 | 管什么 | 换它意味着 |
+|---|---|---|
+| `model.openai.mjs` | 怎么跟模型说话（OpenAI 兼容） | 换厂商 / 换模型 |
+| `prompt.mjs` | 模型知道什么（场语法、说话纪律、手势语义） | 调"它怎么想" |
+| `scene.schema.mjs` | 模型**不许**做什么（白名单、截断、clamp） | 调"它最多能干什么" |
+
+第三件是最容易被忽略的：接上真模型之后，`spec` 就不再是"我写的对象"，而是**外部输入**。
+没有这一层，模型把 `value` 写成 71 会被 `clamp` 成 1 —— 仪表显示满格，
+界面上看不出是谁的错，只会觉得这系统不准。所以校验层做两件事：**挡住**，然后**如实回报**
+（`dropped` / `adjusted` 作为工具结果回给模型，否则它会在同一个错误上重复八次）。
+
+## 配置
+
+`agent/.env`（已在 `.gitignore` 里，不会提交）：
+
+```ini
+MODEL_KEY=sk-...                          # 必填（MODEL=mock 时不需要）
+MODEL=deepseek-ai/DeepSeek-V4-Flash       # 任何 OpenAI 兼容模型名；mock = 不联网
+MODEL_BASE=https://api.siliconflow.cn/v1  # 换厂商只改这一行
+SYS=host                                  # host 读本机真数字 / mock 用固定假数据
+```
+
+`SYS` 和 `MODEL` 是**两件事**，刻意分开：`SYS=mock MODEL=<真模型>` 能在可复现的假数据上调
+提示词，`SYS=host MODEL=mock` 能在真数据上验工具。混成一个开关就没法分开排障。
+
+### 硅基流动的实测记录（2026-10-21）
+
+- 接口通，key 有效，`/v1/models` 能列出 98 个模型。
+- **但所有模型都返回 `402 code 30001 account balance insufficient`** —— 包括标着"免费"的那些。
+  硅基流动的免费额度是记在账户上的赠金，赠金用尽后连免费模型也会 402。
+  需要实名认证 + 领新用户赠金，或充一点钱。
+- 能用的时候实测延迟（带工具调用）：`DeepSeek-V4-Flash` ~1.1s/步且会并行发调用，
+  `Qwen2.5-7B-Instruct` ~0.9s/步最稳，`GLM-5.3-Flash` ~3s/步，`Qwen3-8B` 首次调用 90s（冷启动）。
+
+### 没有余额怎么继续开发
+
+`tools/dev/stub-openai.mjs` 是一个本地 OpenAI 兼容桩，把"模型"这一端固定下来：
+
+```
+node tools/dev/stub-openai.mjs            # :8790，按脚本回放
+node tools/dev/stub-openai.mjs --bad      # 故意吐非法 spec（验校验层）
+
+MODEL=stub MODEL_BASE=http://127.0.0.1:8790/v1 MODEL_KEY=x node agent/server.mjs
+```
+
+它还有一个用处：把收到的请求原文落到 `.tmp/stub-req.jsonl`，
+于是"我们到底给模型喂了什么"是可以 grep 的 —— 验 `intent` 这类私有字段没漏出去，
+靠的就是这个。
 
 ## 为什么下行 SSE、上行 POST
 
@@ -25,7 +76,7 @@ SSE 是 HTTP/1.1 上最省事的流式方案，反代只要 `proxy_buffering off
 
 | `t` | 字段 | 意思 |
 |---|---|---|
-| `hello` | `sid model sys tools[]` | 连上了。`tools` 是这一版注册了多少个工具 |
+| `hello` | `sid model sys tools[]` | 连上了。`model` 是当前用的模型名（`mock:v1` / `sf:<模型id>`） |
 | `turn` | `round kind intent?` | 一轮开始。`kind` = `ask` / `intent` |
 | `think` | `on step` | 模型在想。**前端拿它降相干度** —— 不是转圈，是"还没成形" |
 | `say` | `text` | 模型说了一句话（一行，≤20 字） |
@@ -33,6 +84,7 @@ SSE 是 HTTP/1.1 上最省事的流式方案，反代只要 `proxy_buffering off
 | `scene` | `op spec ops kind at` | 场景指令，`op` = `set` / `patch` / `pulse` / `transition` |
 | `approval` | `id tool args label danger` | 危险工具挂起，等一个 `approve` |
 | `approval_done` | `id ok` | 挂起结束（批准 / 拒绝 / 超时） |
+| `error` | `message` | 模型/网络出错。前端要**在场里说一句短话**（`模型账户没余额`），不能只写日志 |
 | `note` | `message` | 系统级提示（例如"模型重复了同一组调用，已中止这一轮"） |
 | `busy` | — | 上一轮没结束，这次请求被丢掉 |
 | `idle` | — | 一轮结束 |
@@ -85,15 +137,15 @@ SSE 是 HTTP/1.1 上最省事的流式方案，反代只要 `proxy_buffering off
 | 重复调用检测 | 同一组 `name:args` 连着来 2 次就停 | 多跑的那几次会把同一个动画重播八遍，用户看到的是"东西在抽"，不是"在思考" |
 | `APPROVAL_MS` | 90s | 超时按拒绝处理，不无限挂着 |
 
-## 还没做（M1 该换掉的东西）
+## 还没做（M2 该换掉的东西）
 
-1. **模型**：`model.mock.mjs` → `model.openai.mjs`（DeepSeek / 任何 OpenAI 兼容端点）。
-   接口形状已经对齐，只差 `fetch` 和流式 token。
-2. **工具**：`sys_status` / `app_list` / `fs_scan` 的 `run()` 换成真的 k8s API 和真实文件系统。
+1. **工具**：`sys_status` / `app_list` / `fs_scan` 的 `run()` 换成真的 k8s API 和真实文件系统。
    `MOCK_*` 常量全部删掉。**schema 不用改。**
-3. **流式 token**：现在 `say` 是一整句到达。真模型要按 SSE 分块推，前端得支持"同一行字追加"。
-4. **鉴权**：`/api/*` 在 `nginx.conf` 里没校验。要接 authelia 的 forward-auth
+2. **流式 token**：现在 `say` 是一整句到达。真模型要按 SSE 分块推，前端得支持"同一行字追加"。
+3. **鉴权**：`/api/*` 在 `nginx.conf` 里没校验。要接 authelia 的 forward-auth
    （`authelia-backend-svc:9091/api/verify`，无 cookie 返 401，已实测）。
-5. **审计**：每次工具调用落 `~/Agent/audit/*.jsonl`，返回值脱敏（抹 JWT / Bearer 形状）。
-6. **`/api/debug` 要关掉**：它现在把整个会话消息原样吐出来，只该在 dev 开。
-7. **会话持久化**：内存 Map，进程重启就没了。M1 先落 jsonl，M3 再接记忆层。
+4. **审计**：每次工具调用落 `~/Agent/audit/*.jsonl`，返回值脱敏（抹 JWT / Bearer 形状）。
+5. **`/api/debug` 要关掉**：它现在把整个会话消息原样吐出来（含系统提示词），只该在 dev 开。
+6. **会话持久化**：内存 Map，进程重启就没了。M2 先落 jsonl，M3 再接记忆层。
+7. **提示词还没经过真模型检验**：写它的依据是源码里的上限和 `timing.js` 的常数，
+   但没有一轮真实对话验证过"模型会不会照着做"。余额恢复后第一件事就是跑这条。

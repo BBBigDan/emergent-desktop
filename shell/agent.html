@@ -151,6 +151,15 @@ function reassertLine() {
   if (lineText) line.set(lineText, { force: true });
 }
 
+/** 把服务端的错误原文压成一句人能读的短话（场里每行只有 20 格的宽度） */
+function friendly(msg = '') {
+  if (/402|balance|余额/i.test(msg)) return '模型账户没余额';
+  if (/401|unauthor|invalid.*key/i.test(msg)) return '模型 key 不对';
+  if (/超时|timeout/i.test(msg)) return '模型没响应';
+  if (/连不上|ENOTFOUND|ECONN/i.test(msg)) return '连不上模型';
+  return '模型出错了';
+}
+
 /* ───────────────── 与服务端 ───────────────── */
 
 const sid = sessionStorage.getItem('sid') || (crypto.randomUUID?.() ?? String(Math.random()).slice(2));
@@ -176,6 +185,13 @@ function setThink(on) {
   if (!scene.tr) f.setCoherence(thinking > 0 ? 0.58 : 1);
   statEl.classList.toggle('off', thinking > 0);
   statTxt.textContent = thinking > 0 ? 'thinking' : busy ? 'running' : 'ready';
+}
+
+/** 无论因为什么结束，场必须回到成形状态 —— 相干度只是"临时的说法" */
+function clearThink() {
+  thinking = 0;
+  if (!scene.tr) f.setCoherence(1);
+  statEl.classList.remove('off');
 }
 
 const es = new EventSource(`/api/events?sid=${sid}`);
@@ -258,6 +274,8 @@ function onEvent(m) {
       break;
 
     case 'idle':
+      /* 兜底：即使 think:off 因为断线丢了，一轮结束也必须让场重新成形 */
+      clearThink();
       busy = false;
       statTxt.textContent = 'ready';
       break;
@@ -271,6 +289,10 @@ function onEvent(m) {
       break;
 
     case 'error':
+      /* 只在观察窗里写一行是不够的：观察窗是小字、会滚掉，而用户眼前就这一片场。
+         模型连不上是"这一轮没有任何反应"，必须在场里说出来。 */
+      clearThink();
+      say(friendly(m.message));
       insp('error', m.message);
       busy = false;
       statTxt.textContent = 'ready';

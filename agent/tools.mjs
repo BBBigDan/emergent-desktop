@@ -14,6 +14,11 @@
 import os from 'node:os';
 import fs from 'node:fs/promises';
 
+import {
+  SPEC_SCHEMA, OPS_SCHEMA, PULSES,
+  normalizeSpec, normalizeOps, normalizePulse,
+} from './scene.schema.mjs';
+
 const GB = 1024 ** 3;
 
 /* ── 数据源：host 读本机真实数字，mock 给固定假数据（截图与自测要可复现） ── */
@@ -82,8 +87,17 @@ function statusScene(s) {
 
 /* ── 工具表 ── */
 
-export function makeTools(o = {}) {
-  const source = o.source || 'host';
+/* 校验层的两种"我说的话和你画的不一样"都要回给模型：
+   dropped 是被丢弃的，adjusted 是被改写后仍然生效的。
+   只挡不报，模型会以为自己成功了，然后在同一个错误上重复八次。 */
+function tail(r) {
+  const out = {};
+  if (r.dropped?.length) out.dropped = r.dropped;
+  if (r.adjusted?.length) out.adjusted = r.adjusted;
+  return out;
+}
+
+export function makeTools(o = {}) {  const source = o.source || 'host';
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
 
@@ -156,42 +170,57 @@ export function makeTools(o = {}) {
     },
   });
 
-  /* 输出通道也是工具 —— 它们不改变世界，只改变"看见什么"。所以都是 safe。 */
+  /* 输出通道也是工具 —— 它们不改变世界，只改变"看见什么"。所以都是 safe。
+     但"看见什么"同样要过边界：spec 来自模型，是不可信输入（见 scene.schema.mjs）。 */
 
   add('scene_set', {
     level: 'safe',
-    describe: '铺一整屏。首屏用这个；已经有一屏了就用 scene_transition。'
-      + ' 约束：label ≤ 12 字（超过会被截断），数值一律用 0~1 的 number 不用字符串，'
-      + ' 一屏最多 6 个 layer，总字数越少越好。',
-    schema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'], additionalProperties: false },
-    run: async ({ spec }) => ({ ok: true, op: 'set', spec }),
+    describe: '铺一整屏，替换当前所有内容。只有第一屏用这个。',
+    schema: { type: 'object', properties: { spec: SPEC_SCHEMA }, required: ['spec'], additionalProperties: false },
+    run: async ({ spec }) => {
+      const r = normalizeSpec(spec);
+      if (!r.spec) return { ok: false, error: 'spec 没有可用的 layer', dropped: r.dropped };
+      return { ok: true, op: 'set', spec: r.spec, ...tail(r) };
+    },
   });
 
   add('scene_patch', {
     level: 'safe',
-    describe: '只改数值，不重排。进度推进、指标刷新、换一句问话都走这个。'
-      + ' 换 fork 的文案时只传 label/options，几何不用管。',
-    schema: { type: 'object', properties: { ops: { type: 'array' } }, required: ['ops'], additionalProperties: false },
-    run: async ({ ops }) => ({ ok: true, op: 'patch', ops }),
+    describe: '只改值，不重排。指标刷新、进度推进、换一句问话都走这个。'
+      + ' 不能新建 layer，也不能改 kind —— 要加东西用 scene_transition。',
+    schema: { type: 'object', properties: { ops: OPS_SCHEMA }, required: ['ops'], additionalProperties: false },
+    run: async ({ ops }) => {
+      const r = normalizeOps(ops);
+      if (!r.ops) return { ok: false, error: 'ops 没有可用的改动', dropped: r.dropped };
+      return { ok: true, op: 'patch', ops: r.ops, ...tail(r) };
+    },
   });
 
   add('scene_pulse', {
     level: 'safe',
-    describe: '一次物理动作：confirm / arrive / error / settle。',
+    describe: '一次物理动作，让某个 layer 震一下。confirm 是"成了"，arrive 是"看这里"，'
+      + 'error 是"出事了"，settle 是"落定"。同一轮里最多发一次。',
     schema: {
       type: 'object',
-      properties: { kind: { type: 'string' }, at: { type: 'string' } },
+      properties: {
+        kind: { type: 'string', enum: PULSES },
+        at: { type: 'string', description: '震哪个 layer 的 id' },
+      },
       required: ['kind'],
       additionalProperties: false,
     },
-    run: async ({ kind, at }) => ({ ok: true, op: 'pulse', kind, at }),
+    run: async ({ kind, at }) => ({ ok: true, op: 'pulse', ...normalizePulse({ kind, at }) }),
   });
 
   add('scene_transition', {
     level: 'safe',
-    describe: '换一整屏：溶解 → 换几何 → 重组。之后的换景都用这个，不要用 set。',
-    schema: { type: 'object', properties: { spec: { type: 'object' } }, required: ['spec'], additionalProperties: false },
-    run: async ({ spec }) => ({ ok: true, op: 'transition', spec }),
+    describe: '换一整屏：溶解 → 换几何 → 重组。已经有内容之后再换景都用这个，不要用 set。',
+    schema: { type: 'object', properties: { spec: SPEC_SCHEMA }, required: ['spec'], additionalProperties: false },
+    run: async ({ spec }) => {
+      const r = normalizeSpec(spec);
+      if (!r.spec) return { ok: false, error: 'spec 没有可用的 layer', dropped: r.dropped };
+      return { ok: true, op: 'transition', spec: r.spec, ...tail(r) };
+    },
   });
 
   return {

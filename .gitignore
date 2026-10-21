@@ -20,3 +20,8 @@ Thumbs.db
 
 # 本地调试产物
 .tmp/
+
+# ---- 凭据 ----
+# agent/.env 里有模型的 API key，只能留在本机
+agent/.env
+.env
