@@ -64,24 +64,45 @@ jobs:
       fail-fast: false
       matrix:
         image: [shell, agent, memory]
+    # 两个 secret（Settings → Secrets and variables → Actions）：
+    #   DOCKERHUB_USERNAME  Hub 用户名，同时也是镜像命名空间
+    #   DOCKERHUB_TOKEN     Hub 的 Access Token，权限只要 Read & Write
+    # 不用 Hub 密码：Access Token 能单独吊销，密码不能。
+    #
+    # 没配 secret 时**不报错，只构建不推送**：Dockerfile 本身对不对是另一件事，
+    # 那件事没配凭据也该被验。配好之后再跑一次就自动开始推。
+    env:
+      HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      HAS_HUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
-      # 两个 secret（Settings → Secrets and variables → Actions）：
-      #   DOCKERHUB_USERNAME  Hub 用户名，同时也是镜像命名空间
-      #   DOCKERHUB_TOKEN     Hub 的 Access Token，权限只要 Read & Write
-      # 不用 Hub 密码：Access Token 能单独吊销，密码不能。
       - uses: docker/login-action@v3
+        if: env.HAS_HUB == 'true'
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.HUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 没有凭据时：只构建，落到本地名字上（证明 Dockerfile 能跑通）
+      - name: 构建 ${{ matrix.image }}（无凭据，不推送）
+        if: env.HAS_HUB != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/${{ matrix.image }}.Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: emergent-desktop-${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
       # 两个标签：
       #   sha-<7>  回滚点。install.sh --tag sha-xxxxxxx 就退回那一版
       #   latest   日常
       - name: 构建并推送 ${{ matrix.image }}
+        if: env.HAS_HUB == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -90,9 +111,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:${{ github.sha }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:sha-${{ github.sha }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:latest
+            ${{ env.HUB_USER }}/emergent-desktop-${{ matrix.image }}:${{ github.sha }}
+            ${{ env.HUB_USER }}/emergent-desktop-${{ matrix.image }}:sha-${{ github.sha }}
+            ${{ env.HUB_USER }}/emergent-desktop-${{ matrix.image }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -102,8 +123,9 @@ jobs:
       # 匿名探测：不登录也能取到 manifest，才算"集群拉得到"。
       # Hub 匿名拉取有 100 次/6 小时的限流，我们一次部署三个镜像，离限很远。
       - name: 匿名拉取探测
+        if: env.HAS_HUB == 'true'
         env:
-          NS: ${{ secrets.DOCKERHUB_USERNAME }}
+          NS: ${{ env.HUB_USER }}
         run: |
           R="$NS/emergent-desktop-${{ matrix.image }}"
           TOK=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$R:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
