@@ -709,6 +709,8 @@ export function createMemory(o = {}) {
 
   return {
     start, stop, drain, enabled,
+    /** 真的能用吗（开着 且 连上了）。冷启动失败后要给上层一个重试的判据。 */
+    get ok() { return ok(); },
     get dir() { return dir; },
     get store() { return storeKind; },
     setExtractor(fn) { extractor = fn; },

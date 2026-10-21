@@ -1755,6 +1755,28 @@ for (let i = 0; i < 6; i++) {
   }
 }
 
+/* 还有第三种失败，它比上面那个更坏：**冷启动拉镜像**。
+   第一次部署时 memory 镜像要在节点上下 150MB，侧车出现得比 agent 晚几十秒，
+   上面那 20 秒等不到就放弃了。表现是"3/3 Running、桌面正常、记忆一直 off"，
+   而日志里那句"侧车不可用"看不出是拉镜像慢。等下次删 pod 才恢复 —— 没人会去删。
+   所以这里留一个后台重试：每 30 秒试一次、最多 10 分钟，连上了就照常工作。
+   只重试 axolotl 这一条路，绝不顺手退回 SQLite（两份库并存 = 记忆分叉）。 */
+if (!memory.ok()) {
+  let tries = 0;
+  const timer = setInterval(async () => {
+    tries += 1;
+    if (memory.ok() || tries > 20) { clearInterval(timer); return; }
+    try {
+      await memory.start();
+      if (memory.ok()) {
+        console.log(`[memory] 后台第 ${tries} 次重试连上了侧车`);
+        clearInterval(timer);
+      }
+    } catch { /* 还没起来，下一轮再说 */ }
+  }, 30_000);
+  timer.unref?.();
+}
+
 /* 人格层同理：它起不来就当没有这个人格（不注入身份、不漂移），
    而不是让整个服务打不开。 */
 try {

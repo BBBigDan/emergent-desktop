@@ -310,6 +310,15 @@ spec:
           volumeMounts:
             - name: userspace
               mountPath: /userspace
+          # 侧车有 3/3 的意义：没这个探针，python 还在加载图的时候 pod 已经报 Ready，
+          # 而那时 agent 连上去只会得到 fetch failed。有了它，"三容器 Ready"
+          # 才真的等于"记忆能用了" —— install.sh 等的就是这一刻。
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 7801
+            initialDelaySeconds: 3
+            periodSeconds: 5
           resources:
             requests: {cpu: 20m, memory: 64Mi}
             limits: {cpu: 500m, memory: 512Mi}
