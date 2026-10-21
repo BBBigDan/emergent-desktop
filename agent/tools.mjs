@@ -515,6 +515,129 @@ export function makeTools(o = {}) {
     },
   });
 
+  /* ── 输出通道之二：渲染树（DOM）──
+   *
+   * 场装不下"要读进去"的东西：表格、清单、代码、表单。这些都是 DOM 的活，
+   * 但模型不能给 HTML —— 渲染发生在我们自己的 origin 里，一段 script 标签
+   * 就等于把 cookie 交出去。所以它只描述「这是什么」，版式由 surface.js 决定。
+   *
+   * 三条硬规则：动作只能指向已注册工具、数据必须内联、节点预算 200
+   * （超了渲染器会截断并明说）。
+   */
+  add('surface_render', {
+    level: 'safe',
+    describe: '给用户看一块"要读进去"的内容：表格、清单、代码、表单、进度。'
+      + '表格/清单/代码用它；要看一眼就知道的（几个比例、趋势、二选一）用 scene_show。'
+      + 'root 是一棵节点树，节点类型只有：text / code / table / list / chart / progress / approval / actions / form / box。',
+    schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '标题，≤20 字' },
+        subtitle: { type: 'string', description: '副标题，一行说明（可选）' },
+        root: {
+          type: 'object',
+          description: '根节点。table:{"type":"table","head":["名字","大小"],"rows":[["a","1"]]} · '
+            + 'text:{"type":"text","md":"..."} · list:{"type":"list","items":["一条","另一条"]} · '
+            + 'code:{"type":"code","lang":"js","text":"..."} · '
+            + 'chart:{"type":"chart","kind":"bars","data":[0.3,0.8],"labels":["一","二"]} · '
+            + 'progress:{"type":"progress","value":0.6,"label":"..."} · '
+            + 'actions:{"type":"actions","items":[{"label":"删掉","tool":"fs_scan"}]} · '
+            + 'form:{"type":"form","fields":[],"submit":"..."} · 容器:{"type":"section","title":"...","children":[]}',
+        },
+      },
+      required: ['root'],
+      additionalProperties: false,
+    },
+    run: async ({ title, subtitle, root }) => {
+      if (!root || typeof root !== 'object') return { ok: false, error: 'root 必须是节点对象' };
+      /* 体积守门：渲染树是内联数据，超过 24KB 的屏一定是有东西写错了
+         （比如把整个文件贴进表格里）。 */
+      const bytes = Buffer.byteLength(JSON.stringify(root), 'utf8');
+      if (bytes > 24 * 1024) {
+        return { ok: false, error: `渲染树太大（${Math.round(bytes / 1024)}KB）。表格只放结论行，别贴原始数据。` };
+      }
+      return { ok: true, surface: { title, subtitle, root } };
+    },
+  });
+
+  add('surface_close', {
+    level: 'safe',
+    describe: '收起当前那块渲染树内容。用户问下个问题时它自己也会收，所以只有"明确要收"才用。',
+    schema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => ({ ok: true, closeSurface: true }),
+  });
+
+  /* ── 输出通道之三：粒子绘画 ──
+   *
+   * 这套桌面独有的东西：模型说"画个笑脸"，桌面本身的 6400 颗粒子聚成脸。
+   * 三级表达里只给**语义层**：模型给 mood / 文字 / 数据，几何由 painter 算。
+   * 绝不让它给像素坐标 —— 它算不准，画布尺寸也轮不到它知道。
+   */
+  add('draw', {
+    level: 'safe',
+    describe: '用桌面自己的粒子画一幅画（解释类问题首选）。'
+      + '层类型：face（表情，给 mood）/ text（字）/ chart（柱状或折线，给 data）/ arrow / '
+      + 'line / polyline / circle / rect / path。坐标用 0~1 的相对值，不是像素。'
+      + '画会占用桌面，默认 8 秒后自动散开。',
+    schema: {
+      type: 'object',
+      properties: {
+        layers: {
+          type: 'array',
+          description: '最多 4 层',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['face', 'text', 'chart', 'arrow', 'line', 'polyline', 'circle', 'rect', 'path'] },
+              mood: { type: 'string', enum: ['happy', 'calm', 'sad', 'angry', 'surprised', 'thinking'] },
+              text: { type: 'string', description: 'text 层画的字，≤6 字' },
+              kind: { type: 'string', description: 'chart 的形状：bars | line' },
+              data: { type: 'array', items: { type: 'number' }, description: 'chart 的数据，2~8 个 0~1 的数' },
+              labels: { type: 'array', items: { type: 'string' }, description: 'chart 的 x 轴标签（可选）' },
+              from: { type: 'array', items: { type: 'number' }, description: 'arrow/line 起点 [x,y]，0~1' },
+              to: { type: 'array', items: { type: 'number' }, description: 'arrow/line 终点 [x,y]，0~1' },
+              points: { type: 'array', description: 'polyline 的点列 [[x,y],...]，0~1' },
+              at: { type: 'array', items: { type: 'number' }, description: '位置 [x,y]，0~1。face/text/circle 是中心，chart/rect 是左上角。不填由系统摆' },
+              size: { type: 'number', description: '相对大小 0~1（文字是字号、表情是直径、图表的宽），不填由系统定' },
+              color: { type: 'string', description: '#rrggbb（可选）' },
+            },
+            required: ['type'],
+            additionalProperties: true,
+          },
+        },
+        hold: { type: 'number', description: '显示多久（毫秒），默认 8000' },
+      },
+      required: ['layers'],
+      additionalProperties: false,
+    },
+    run: async ({ layers, hold }) => {
+      const L = (layers || []).slice(0, 4);
+      if (!L.length) return { ok: false, error: '至少要有一层' };
+      const h = Number(hold);
+      return { ok: true, draw: { layers: L, hold: Number.isFinite(h) ? Math.min(30000, Math.max(2500, h)) : 8000 } };
+    },
+  });
+
+  /* 最常用的那个：一个参数，桌面粒子就笑了 */
+  add('face', {
+    level: 'safe',
+    describe: '画一张表情。等于 draw 的一层 face，用起来更省事 —— 被夸、被问心情、打招呼时用它。',
+    schema: {
+      type: 'object',
+      properties: { mood: { type: 'string', enum: ['happy', 'calm', 'sad', 'angry', 'surprised', 'thinking'] } },
+      required: ['mood'],
+      additionalProperties: false,
+    },
+    run: async ({ mood }) => ({ ok: true, draw: { layers: [{ type: 'face', mood }], hold: 6000 } }),
+  });
+
+  add('draw_stop', {
+    level: 'safe',
+    describe: '立刻把画散掉。',
+    schema: { type: 'object', properties: {}, additionalProperties: false },
+    run: async () => ({ ok: true, draw: { stop: true } }),
+  });
+
   return {
     all: T,
     /** 兜底屏要一条真曲线时用。没有集群就返回 null，调用方自己决定退化成什么。 */

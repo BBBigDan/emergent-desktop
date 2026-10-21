@@ -413,6 +413,35 @@ body.launching .rail-zone { display: none; }
 .ag-stop:hover { color: rgba(255, 205, 140, .95); }
 .ag-stop[hidden] { display: none; }
 
+/* 渲染树内容的宿主。
+ * 它是这一层里唯一"有框"的东西 —— 因为里面的内容本来就需要一个明确的边界
+ * （表格、表单、代码都要能滚动、能选）。板和雾沿用桌面窗口那一套，不另起风格。 */
+.ag-surface {
+  position: fixed; left: 50%; top: 50%;
+  width: min(760px, 74vw); max-height: 68vh;
+  display: flex; flex-direction: column; min-height: 0;
+  transform: translate(-50%, -47%);
+  background: rgba(9, 13, 21, .84);
+  border: 1px solid rgba(148, 178, 255, .13);
+  border-radius: 12px;
+  box-shadow: 0 26px 80px rgba(0, 0, 0, .55);
+  backdrop-filter: blur(10px);
+  opacity: 0; pointer-events: auto; z-index: 6;
+  transition: opacity .18s ease, transform .18s ease;
+}
+.ag-surface.in { opacity: 1; transform: translate(-50%, -50%); }
+.ag-surface[hidden] { display: none; }
+.ag-surface > .surface { min-height: 0; }
+
+.ag-surface-x {
+  position: absolute; top: 8px; right: 10px; z-index: 2;
+  width: 24px; height: 24px; padding: 0; cursor: pointer;
+  background: transparent; border: 0; border-radius: 6px;
+  font: 15px/1 ui-sans-serif, sans-serif; color: rgba(148, 178, 255, .45);
+  transition: color .16s, background .16s;
+}
+.ag-surface-x:hover { color: rgba(228, 238, 255, .85); background: rgba(148, 178, 255, .1); }
+
 /* 审批的兜底：当场里没有分叉可借用时，用一条 DOM 带子。
    审批是**系统的 affordance**，不受模型表达自由支配 —— 所以它允许不是粒子。 */
 .ag-gate {

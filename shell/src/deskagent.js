@@ -17,6 +17,8 @@
 
 import { FieldScene } from './scene.js';
 import { UI_ENV_DIM } from './field.js';
+import { renderSurface } from './surface.js';
+import { compileDraw } from './draw.js';
 import { ParticleText, SlotAllocator } from './pui.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
@@ -110,6 +112,59 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   stopBtn.hidden = true;
 
   layer.append(histEl, histBtn, stopBtn);
+
+  /* ───────────────── 渲染树（DOM 内容） ─────────────────
+   *
+   * 场装不下"要读进去"的东西：表格、清单、代码、表单。它们走 DOM —— 这是
+   * 论证稿 §4 的另一半，和粒子场是并列的两个输出通道，不是降级方案。
+   *
+   * 它和场的关系跟记录面板一样：打开时场退到后面（uiFade），因为这一屏
+   * 要读，不是要"看个大概"。 */
+  const surfEl = el('div', 'ag-surface');
+  surfEl.hidden = true;
+  const surfX = el('button', 'ag-surface-x', '×');
+  surfX.type = 'button';
+  surfX.setAttribute('aria-label', '收起');
+  surfEl.appendChild(surfX);
+  layer.appendChild(surfEl);
+
+  let surfaceOpen = false;
+
+  function closeSurface() {
+    if (!surfaceOpen) return false;
+    surfaceOpen = false;
+    surfEl.classList.remove('in');
+    field.uiFadeTo = 1;
+    setTimeout(() => { if (!surfaceOpen) surfEl.hidden = true; }, 180);
+    return true;
+  }
+
+  function showSurface(spec) {
+    if (!spec) return;
+    const node = renderSurface(spec, {
+      /* 动作只能指向已注册工具（surface.js 的三条硬规则之一）——
+         这里不执行任何东西，只把"点了什么"变成一条意图交回模型。 */
+      act: (a) => {
+        const label = a.label || a.tool || '操作';
+        insp('act', `${a.tool || 'ask'} · ${label}`);
+        closeSurface();
+        send({ t: 'intent', intent: { kind: 'pick', target: 'surface', option: a.tool || 'ask', optionLabel: label, label } });
+      },
+      ask: (p) => {
+        closeSurface();
+        send({ t: 'ask', text: String(p).slice(0, 300) });
+      },
+    });
+    for (const old of surfEl.querySelectorAll('.surface')) old.remove();
+    surfEl.appendChild(node);
+    surfEl.hidden = false;
+    surfaceOpen = true;
+    closeHist();
+    requestAnimationFrame(() => surfEl.classList.add('in'));
+    field.uiFadeTo = 0.18;
+  }
+
+  surfX.addEventListener('click', (e) => { e.stopPropagation(); closeSurface(); });
 
   function histPush(r, text) {
     const t = String(text || '').trim();
@@ -412,6 +467,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         break;
 
       case 'scene':
+        /* 新的一屏来了 = 刚才那块 DOM 内容已经过时（它是"上一个问题的答案"） */
+        closeSurface();
         /* 服务端的动作也走节拍器：mock 模型一秒钟能把四条指令全吐出来，
            但界面上必须有先后 —— 这就是"时序由前端强制"的意义。 */
         if (m.op === 'set') {
@@ -467,6 +524,17 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       case 'note': insp('note', m.message); break;
       case 'busy': insp('busy', '上一轮还没结束，这一步先排队'); break;
 
+      /* 两个新的输出通道 */
+      case 'surface':
+        if (m.op === 'close') closeSurface();
+        else showSurface(m.spec);
+        insp('surface', `${m.op}${m.spec?.title ? ' · ' + m.spec.title : ''}`);
+        break;
+
+      case 'draw':
+        runDraw(m.spec);
+        break;
+
       case 'error':
         /* 只在观察窗里写一行是不够的：用户眼前就这一片场。
            模型连不上是"这一轮没有任何反应"，必须在场里说出来。 */
@@ -480,6 +548,91 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       default:
         insp(m.t, JSON.stringify(m).slice(0, 90));
     }
+  }
+
+  /* ───────────────── 粒子绘画 ─────────────────
+   *
+   * draw.js 的 compileDraw 把语义层（face / text / chart / arrow …）栅格化再采样成
+   * 点云，field.setDraw 只负责"把点飞过去"。所以这里只有三件事：
+   *   1. 画布多大（相对视口，留边）—— 尺寸由前端定，模型只给 0~1 的相对坐标
+   *   2. 把画的中心对到屏幕中心
+   *   3. 到时间散回桌面，并把刚才那一屏还回来
+   */
+  let drawTimer = 0;
+  let drawLine = '';
+
+  function stopDraw() {
+    clearTimeout(drawTimer);
+    drawTimer = 0;
+    if (!field.drawOn) return;
+    field.clearDraw();
+    /* 画不是"换了一屏"，是"临时占用桌面"：散掉之后原来那一屏要回来。
+       clearDraw 有 1.6s 的回落，等它落定再重铺，否则两套点会叠在半路。 */
+    const spec = scene?.spec;
+    const back = drawLine;
+    drawLine = '';
+    setTimeout(() => {
+      if (spec?.layers?.length) scene.set(spec);
+      if (back) { lineText = back; say(back, { instant: true }); }
+    }, 1700);
+  }
+
+  /* 协议是 0~1 的相对坐标，painter 要的是画布像素。
+   *
+   * 这一层转换必须在客户端：模型**永远不知道画布多大**，这正是它不会算错像素的原因。
+   * 顺带把缺省位置补上 —— "画个笑脸"这种事不该要求模型指定 at 和 size。 */
+  function denorm(spec, w, h) {
+    const S = Math.min(w, h);
+    const P = (a) => (Array.isArray(a) ? [a[0] * w, a[1] * h] : a);
+    const scale = (s) => (Array.isArray(s) ? [s[0] * w, s[1] * h] : (s <= 1.5 ? s * S : s));
+    return {
+      ...spec,
+      layers: (spec.layers || []).map((L) => {
+        const o = { ...L };
+        /* face / text / circle 的 at 是中心，chart / rect 的 at 是左上角 ——
+           这个差别由 painter 的几何决定，不强行统一（统一了文字就会偏半个字高）。 */
+        const defaultAt = L.type === 'chart' || L.type === 'rect' ? [0.08, 0.16] : [0.5, 0.48];
+        o.at = P(L.at || defaultAt);
+        if (L.from) o.from = P(L.from);
+        if (L.to) o.to = P(L.to);
+        if (Array.isArray(L.points)) o.points = L.points.map(P);
+        if (L.c) o.c = P(L.c);
+        if (L.r != null) o.r = Array.isArray(L.r) ? [L.r[0] * w, L.r[1] * h, L.r[2] * w, L.r[3] * h] : L.r * S;
+        const ds = L.type === 'chart' ? [0.84, 0.62] : (L.type === 'text' ? 0.2 : 0.46);
+        o.size = scale(L.size != null ? L.size : ds);
+        return o;
+      }),
+    };
+  }
+
+  function runDraw(spec) {
+    if (!spec || spec.stop) { stopDraw(); return; }
+    const w = Math.min(980, Math.round(innerWidth - 180));
+    const h = Math.min(600, Math.round(innerHeight - 300));
+    let pack;
+    try { pack = compileDraw(denorm(spec, w, h), { w, h, max: 5600 }); } catch (e) {
+      insp('draw', '编译失败：' + (e.message || e));
+      return;
+    }
+    if (!pack.points.length) { insp('draw', '没有点可画'); return; }
+
+    /* 画之前把 DOM 内容收掉：它正好盖在画面正中，两套东西抢同一块地方 */
+    closeSurface();
+    field.slotBegin({ dim: 0.9, dot: 1 });
+    field.setDraw(pack, {
+      x: Math.round((innerWidth - w) / 2),
+      y: Math.round((innerHeight - h) / 2),
+      dot: 1, dim: 0.9,
+      drawOnMs: 1400,       // 一道波沿着笔迹推过去，不是整幅图同时亮起来
+    });
+    /* 那一行字让位：画的点会写到同一批槽位上 */
+    drawLine = lineText;
+    line.set('', { force: true });
+    lineText = '';
+    insp('draw', `${spec.layers?.length || 0} 层 · ${pack.points.length} 点 · ${pack.spacing.toFixed(1)}px`);
+    clearTimeout(drawTimer);
+    /* 到点自己散 —— 画是"占用桌面"的行为，不能赖着不走 */
+    drawTimer = setTimeout(() => { drawTimer = 0; stopDraw(); }, Math.min(20000, Math.max(2500, spec.hold || 8000)));
   }
 
   /* ───────────────── 输入 ───────────────── */
@@ -683,6 +836,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        而用户已经离开这一层了，桌面球没有理由还在转。 */
     field.vorts.length = 0;
     field.clearDraw();
+    closeSurface();
+    clearTimeout(drawTimer);
+    drawTimer = 0;
+    drawLine = '';
     closeHist();
     histBtn.hidden = true;
     clearInterval(ingestTimer);
@@ -786,7 +943,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       closeHist();
       return true;
     },
+    /** 渲染树内容优先于记录：它是屏幕正中最大的一块 */
+    closeSurface: () => closeSurface(),
+    stopDraw: () => stopDraw(),
+    isDrawing: () => !!field.drawOn,
     history: () => (histOpen ? log.slice(-10) : null),
+    /* 自测钩子（只有 ?dev=1 才有）：直接喂一条服务端事件，
+       用来验新的输出通道，不必每次都等模型想起来调那个工具。 */
+    ...(DEV ? { emit: (ev) => onEvent(ev) } : {}),
     toggle,
     ask: (t) => { typeEl.value = t; submit(); },
     /* 自测：走真实的手势通道（和用户按下去完全同一条路），不是直接调 scene */

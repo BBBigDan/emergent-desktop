@@ -282,7 +282,11 @@ const _esc = () => {
     /* 三级：先收记录，再停这一轮，最后才收整个场。
        "停下这一轮"排在"收起"前面，因为跑着的时候用户按 Esc 想撤的多半是
        这三十秒的等待，而不是他刚打开的这片界面。 */
+    /* 按"眼前最上面那一层"排：渲染树是屏幕正中最大的东西，先收它；
+       然后是记录面板、再是这一轮、最后才收整个场。 */
+    if (agent.closeSurface?.()) return;
     if (agent.closeHistory?.()) return;
+    if (agent.isDrawing?.()) { agent.stopDraw?.(); return; }
     if (agent.isBusy?.()) { agent.abort?.(); return; }
     agent.close();
     return;

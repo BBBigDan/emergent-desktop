@@ -286,8 +286,22 @@ const NODE = {
 
   table: (node, api) => {
     const box = el('div', 'sf-tablebox');
-    const cols = (Array.isArray(node.columns) ? node.columns : []).filter(isObj);
-    const rows = (Array.isArray(node.rows) ? node.rows : []).filter(isObj);
+    /* 两种写法都收：
+     *   正规：columns:[{key,label}] + rows:[{key:value}]
+     *   简写：head:['名字','大小'] + rows:[['a','1']]
+     * 简写是模型最常写的形状（"table 当然有表头"），而一个字段对不上就是整张空表 ——
+     * 空表比"稍微丑一点的表"糟得多，所以这里认它。 */
+    const short = !Array.isArray(node.columns) && Array.isArray(node.head);
+    const cols = short
+      ? node.head.map((h, i) => ({ key: `c${i}`, label: String(h) }))
+      : (Array.isArray(node.columns) ? node.columns : []).filter(isObj);
+    let rows = (Array.isArray(node.rows) ? node.rows : []);
+    if (short) {
+      rows = rows.map((r) => (Array.isArray(r)
+        ? Object.fromEntries(r.map((v, i) => [`c${i}`, v]))
+        : r));
+    }
+    rows = rows.filter(isObj);
     const table = el('table', 'sf-table');
 
     const thead = el('thead');
@@ -538,6 +552,18 @@ const NODE = {
       if (n) box.appendChild(n);
     });
     return box;
+  },
+
+  /* box = 无标题的 section。
+     它存在的唯一理由是模型太爱写 "box"（实测第一次调 surface_render 就写了），
+     而一个"未知节点"整块渲染失败，等于整屏白给。与其纠正它，不如认下这个词。 */
+  box: (node, api, depth) => {
+    const wrap = el('div', 'sf-box');
+    (node.children || []).forEach((c) => {
+      const n = build(c, api, depth + 1);
+      if (n) wrap.appendChild(n);
+    });
+    return wrap;
   },
 
   tabs: (node, api) => {

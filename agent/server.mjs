@@ -499,6 +499,21 @@ async function runTurn(s, goal) {
           result = { error: String(e?.message || e) };
         }
 
+        /* ── 另外两个输出通道 ──
+           渲染树进 DOM、绘画进粒子，两者都不改变世界，所以都不进审批。
+           但它们的**体积**不能进模型上下文（上面已经切成一句摘要）。 */
+        if (result && result.ok && result.surface) {
+          s.lastSurface = result.surface;
+          emit(s, { t: 'surface', op: 'set', spec: result.surface });
+        }
+        if (result && result.ok && result.closeSurface) {
+          s.lastSurface = null;
+          emit(s, { t: 'surface', op: 'close' });
+        }
+        if (result && result.ok && result.draw) {
+          emit(s, { t: 'draw', spec: result.draw });
+        }
+
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */
         if (result && result.ok && result.op) {
           /* 曲线要延续。
@@ -573,7 +588,14 @@ async function runTurn(s, goal) {
           }
         }
 
-        s.messages.push({ role: 'tool', name, tool_call_id: id, content: JSON.stringify(result) });
+        /* 渲染树 / 绘画同样不是"数据"，是给眼睛的指令。
+           但**必须**把体积从上下文里切掉：一屏表格 20KB，回灌给 7B 模型
+           就是把它的窗口填满，后面几轮全在复读表头。 */
+        const forContext = result?.surface ? { ok: true, shown: 'surface' }
+          : result?.closeSurface ? { ok: true, closed: true }
+            : result?.draw ? { ok: true, drawn: result.draw.stop ? 0 : (result.draw.layers?.length || 0) }
+              : result;
+        s.messages.push({ role: 'tool', name, tool_call_id: id, content: JSON.stringify(forContext) });
         emit(s, { t: 'tool', id, name, state: result?.denied ? 'denied' : result?.error ? 'err' : 'ok', ms: Date.now() - t0, note: summarize(result) });
 
         /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
