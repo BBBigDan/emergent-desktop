@@ -154,9 +154,19 @@ export function openGraph(file) {
 
     softDelete(ids) {
       const del = stmt('update nodes set alive = 0 where id = ?');
+      /* 事实的边跟着一起下葬。不这样做，stats 里的主题计数会把"剪掉的记忆"
+         继续算进去（实测：删了 4 条，n8n 仍然显示 9 条），
+         用户看到的数字和实际能回忆到的东西对不上。 */
+      const delEdge = stmt('update edges set alive = 0 where src = ?');
       let n = 0;
-      for (const id of ids) { del.run(id); n++; }
+      for (const id of ids) { del.run(id); delEdge.run(id); n++; }
       return n;
+    },
+
+    /** 收拾历史遗留：早先软删的节点，边还活着。巩固时扫一遍（幂等）。 */
+    sweepEdges() {
+      const r = stmt('update edges set alive = 0 where alive = 1 and src in (select id from nodes where alive = 0)').run();
+      return r.changes || 0;
     },
 
     setCommunity(id, community) {

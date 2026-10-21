@@ -47,6 +47,7 @@ Olares 的 Prometheus，`app_list` 读的是它的 k8s API，`logs_tail` 读的�
 | `~/Agent/memory/memory.db` | 图：fact / entity / community 三类节点 + `about` / `covers` 边 |
 | `~/Agent/memory/snapshots/` | `VACUUM INTO` 快照，留最近 5 份 |
 | `GET /agent/api/memory?q=n8n` | 当前 stats + 一次回忆 —— **唯一可观测入口** |
+| `GET /agent/api/memory?sweep=1` | 顺手做一次巩固（剪枝 / 社群合并 / 快照），返回报告 |
 
 环境变量：`MEMORY=0` 整个关掉；`MEMORY_DIR=/path` 指定目录
 （默认落在用户的 `~/Agent/memory`，用户在 Files 里看得见；挂载不可用时退回 `agent/memory/`）。

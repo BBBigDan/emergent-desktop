@@ -41,6 +41,22 @@ const KINDS = new Set(['pref', 'event', 'fact', 'task', 'relation']);
 
 const sha = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 12);
 
+/* 部件词表。
+ *
+ * 7B 给的 about 往往只有主语（"n8n"），可"同一条记忆里还提到了什么"
+ * 恰恰是回忆的跳板：问"日志"要能找到谈论 n8n 日志的那一条。
+ * 与其求模型多写两个词（实测求不动），不如让它只负责**主语**，
+ * 部件由这份词表兜住 —— 它比模型稳定，也比模型便宜。
+ * 加词要有节制：这些是这台机器上真正常出现的东西，不是通用名词表。 */
+const PARTS = ['端口', '日志', '内存', '磁盘', 'CPU', '备份', '相册', '下载', '网络',
+  '域名', '证书', '数据库', '容器', '镜像', '配置', '权限', '温度', '队列', '任务',
+  '通知', '账号', '密码', '代理', '隧道', '风扇'];
+
+function partsOf(text) {
+  const t = String(text || '').toLowerCase();
+  return PARTS.filter((p) => t.includes(p.toLowerCase())).slice(0, 2);
+}
+
 /* ───────────────────────── 文本工具 ───────────────────────── */
 
 /** 中文没有空格，2-gram 是"能命中"和"完全命中"之间最省事的那一档。 */
@@ -104,11 +120,25 @@ export const EXTRACT_SYS = `你把一段刚结束的对话压缩成**几条值�
 
 规则：
 - 最多 3 条。宁少勿多 —— 记错一条比少记一条糟得多。
-- text 是一句完整的话，用第三人称，不超过 40 个字，不要写"用户说"。
-- about 是这句话里出现的**具体东西**（应用名、文件名、人、主题），0~3 个，不要写"用户""这台机器"。
+- **只写对话里出现过的。** 用户说"怀疑"，就写"用户怀疑…"；不要替他把原因定下来。
+  你写下的每一句都要能在上面这段对话里找到出处。编一条因果，比不记这一轮坏得多。
+- **"我说"那一行不作数。** 那是我自己的回话，我可能说错（实测有过：
+  用户说日志在 ~/n8n.log，我却回了"没有日志文件"）。事实只从"用户说"和
+  "我做了 → 工具返回"里来；拿不准就不写。
+- text 是一句完整的话，用第三人称，不超过 40 个字，不要写"用户说"，也不要写半句
+  （"怀疑是重启太频繁"不行，"用户怀疑 n8n 重启太频繁"可以）。
+- about 是这句话里出现的**所有**具体东西：应用名、文件名、部件（端口 / 日志 / 内存）、
+  人、主题，1~3 个。只写一个"n8n"太少了 —— 两个东西一起出现在同一句话里，
+  以后才能顺着它找回另一件事。不要写"用户""这台机器"。
 - kind 只能是 pref / event / fact / task / relation。
 - valence 是这件事对用户的好坏，-1（很糟）到 1（很好），中性写 0。
-- 没有值得记的就输出 {"facts":[]}。`;
+- 没有值得记的就输出 {"facts":[]}。
+
+例（示例里的名字和数字只是形状，不许照抄到结果里）：
+"我把 PhotoPrism 挪到 8000 了，以后相册超过 10 万张就提醒我"
+→ {"facts":[
+  {"text":"用户把 PhotoPrism 挪到了 8000 端口","about":["PhotoPrism","8000 端口"],"kind":"event","valence":0.2},
+  {"text":"用户要求相册超过 10 万张时提醒他","about":["PhotoPrism","相册"],"kind":"task","valence":0}]}`;
 
 /** 只取**第一个完整的 JSON 对象**。
  *
@@ -153,9 +183,12 @@ function cleanFact(f) {
   if (!f || typeof f !== 'object') return null;
   let text = String(f.text || '').replace(/^["'「](.*)["'」]$/, '$1').replace(/\s+/g, ' ').trim();
   if (text.length < 5 || text.length > 60) return null;
-  /* 纯读数：「内存是 41%」「CPU 18%」。这类东西每轮都变，记下来只会污染回忆。 */
-  if (/^(cpu|内存|磁盘|负载|占用)[^，。]{0,10}\d/i.test(text)) return null;
-  if (/^\D{0,6}\d+(\.\d+)?%$/.test(text)) return null;
+  /* 纯读数：「内存是 41%」「n8n 内存 2.3% · CPU 5.5%」。这类东西每轮都变，
+     记下来只会污染回忆 —— 而且它看起来"很事实"，最容易被当真。
+     判据不看开头，看**整句**：带百分比且没有任何"会持续下去"的动作/偏好词，就是读数。 */
+  const pct = (text.match(/\d+(\.\d+)?\s*%/g) || []).length;
+  const durable = /(挪|改|加|删|放|设|要求|喜欢|不希望|不想|需要|应该|不要|记得|提醒|装|换|写|保存|用)/.test(text);
+  if (pct && !durable) return null;
   const about = (Array.isArray(f.about) ? f.about : [])
     .map((x) => String(x || '').trim())
     .filter((x) => x.length >= 1 && x.length <= 20 && !GENERIC.has(norm(x)))
@@ -343,6 +376,17 @@ export function createMemory(o = {}) {
 
   /* ── 写 ── */
 
+  /** 实体节点：按标签查，没有就建。display 保留原始大小写，label 归一化后当键。 */
+  function ensureEntity(label, ts) {
+    return g.nodeByLabel('entity', label) || g.upsertNode({
+      id: entityId(label), kind: 'entity', label: norm(label), props: { display: label }, ts,
+    });
+  }
+
+  function linkEntity(factNode, label, ts) {
+    g.upsertEdge({ src: factNode.id, dst: ensureEntity(label, ts).id, type: 'about', ts });
+  }
+
   /** 一条事实落图：精确去重（id 由文本决定）+ 近似去重（2-gram Jaccard）。 */
   function remember(fact, src, ts = nowTs()) {
     const text = fact.text;
@@ -368,12 +412,8 @@ export function createMemory(o = {}) {
       props: { kind: fact.kind, about: fact.about }, valence: fact.valence, src, ts,
     });
 
-    for (const label of fact.about) {
-      const eid = entityId(label);
-      const e = g.nodeByLabel('entity', label) || g.upsertNode({
-        id: eid, kind: 'entity', label: norm(label), props: { display: label }, ts,
-      });
-      g.upsertEdge({ src: node.id, dst: e.id, type: 'about', ts });
+    for (const label of [...fact.about, ...partsOf(text).filter((p) => !fact.about.includes(p))]) {
+      linkEntity(node, label, ts);
     }
     return { node, reinforced: !!prev };
   }
@@ -414,6 +454,7 @@ export function createMemory(o = {}) {
   function consolidate() {
     if (!ok()) return null;
     const ts = nowTs();
+    g.sweepEdges();
     const deg = g.degreeMap();
     const facts = g.nodes('fact');
     const ents = g.nodes('entity');
@@ -447,14 +488,35 @@ export function createMemory(o = {}) {
     const factsOf = new Map();      // 实体 → 提到它的事实
     const aboutOf = new Map();      // 事实 → 它提到的实体
     for (const e of g.edges()) {
-      if (e.type !== 'about' || !entById.has(e.dst)) continue;
-      if (!factsOf.has(e.dst)) factsOf.set(e.dst, []);
-      factsOf.get(e.dst).push(e.src);
-      if (!aboutOf.has(e.src)) aboutOf.set(e.src, []);
-      aboutOf.get(e.src).push(e.dst);
+      if (e.type !== 'about') continue;
+      if (!aboutOf.has(e.src)) aboutOf.set(e.src, new Set());
+      aboutOf.get(e.src).add(e.dst);
+    }
+    /* 补边。老事实（抽取提示词还不要求多实体时写下的）只有主语，
+       巩固顺手把它们和提到的部件接上。幂等：已经有这条边就不动。 */
+    let relinked = 0;
+    for (const f of facts) {
+      const have = aboutOf.get(f.id) || new Set();
+      for (const label of partsOf(f.label)) {
+        const e = g.nodeByLabel('entity', label);
+        if (e && have.has(e.id)) continue;
+        const ent = e || ensureEntity(label, ts);
+        g.upsertEdge({ src: f.id, dst: ent.id, type: 'about', ts });
+        have.add(ent.id);
+        entById.set(ent.id, ent);
+        relinked++;
+      }
+      aboutOf.set(f.id, have);
+    }
+    for (const [fid, set] of aboutOf) {
+      for (const eid of set) {
+        if (!entById.has(eid)) continue;
+        if (!factsOf.has(eid)) factsOf.set(eid, []);
+        factsOf.get(eid).push(fid);
+      }
     }
     for (const f of facts) {
-      const es = aboutOf.get(f.id) || [];
+      const es = [...(aboutOf.get(f.id) || [])];
       for (let i = 0; i < es.length; i++) {
         for (let j = i + 1; j < es.length; j++) {
           const k = es[i] < es[j] ? `${es[i]}|${es[j]}` : `${es[j]}|${es[i]}`;
@@ -511,7 +573,7 @@ export function createMemory(o = {}) {
     for (const c of g.nodes('community')) if (!madeIds.has(c.id)) g.softDelete([c.id]);
 
     const report = {
-      at: ts, pruned: doomed.length, communities: madeIds.size, covered,
+      at: ts, pruned: doomed.length, communities: madeIds.size, covered, relinked,
       facts: g.stats().facts, edges: g.stats().edges,
     };
     g.meta.set('lastSweep', ts);

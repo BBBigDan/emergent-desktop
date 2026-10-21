@@ -45,6 +45,7 @@ batches = [[
   { text: '用户把 n8n 挪到了 5679 端口', about: ['n8n', '端口'], kind: 'event', valence: 0.2 },
   { text: 'n8n 每小时重启一次，原因是内存超限', about: ['n8n', '重启'], kind: 'fact', valence: -0.6 },
   { text: '内存现在是 41%', about: [], kind: 'fact', valence: 0 },   // 读数，应被丢弃
+  { text: 'n8n 内存 2.3% · CPU 5.5%', about: ['n8n'], kind: 'fact', valence: 0 }, // 换个样子的读数，同样丢
 ]];
 await m.afterTurn({ sid: 's1', turn: 1, user: '我把 n8n 挪到 5679 了，别在半夜重启它', reply: '记下了' });
 await m.drain();

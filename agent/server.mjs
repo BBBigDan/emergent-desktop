@@ -499,14 +499,41 @@ async function runTurn(s, goal) {
         emit(s, { t: 'think', on: false, step });
       }
 
+      /* 空回复重试一次。
+         7B 实测会偶尔吐一个空 message（没有 content，也没有 tool_calls）——
+         一句话不说，屏幕上就是一片安静的粒子，看起来像"它没听懂"，
+         其实是模型这一口气没接上。给它一句提示再问一遍，成功率明显高于
+         把这一轮判死。只重试 step 0，免得在本该停下的地方原地打转。 */
+      if (step === 0 && !(out.tool_calls || []).length && !String(out.content || '').trim()) {
+        emit(s, { t: 'note', message: '模型空回复，重试一次' });
+        try {
+          out = await s.model.complete({
+            messages: withMemory(s.messages, (memNote ? memNote + '\n\n' : '')
+              + '（上一次回答是空的。不要解释这件事，直接用一句话回答用户刚才的问题。）'),
+            tools: s.tools.schemas(),
+            toolChoice: memHits.length ? 'auto' : 'required',
+            goal: { ...goal, pendingTo: s.lastAdjustTo },
+            signal: s.abortCtl.signal,
+          });
+        } catch (e) {
+          if (e?.aborted || s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
+          throw e;
+        }
+      }
+
       const calls = out.tool_calls || [];
       /* 便宜模型会把示例里的记号一起抄出来（"content: ..."、"→ scene_set(...)"），
          或者写一整段带换行和清单的计划。场里只有**一行** 20 格，这些都不该下去：
          截到第一行、去掉列表符号，剩下的由前端按字数再压。 */
-      const rawSpeech = String(out.content || '')
+      const rawSpeech = (String(out.content || '')
         .replace(/^\s*(content|回答|你说)\s*[:：]\s*/i, '')
         .replace(/^["'「](.*)["'」]$/, '$1')
-        .split('\n')[0]
+        /* 取**第一行非空**，不是第一行。实测 7B 会先吐一个换行再说话：
+           按第一行截，整句话就变成空字符串，用户看到的是它一声不吭
+           （而且没有任何"被过滤"的提示，因为过滤发生在更后面）。
+           这一条曾经把一句正确答案吃掉了两轮。 */
+        .split('\n').map((l) => l.trim()).filter(Boolean)[0] || ''
+      )
         .replace(/^\s*[-*·]\s*/, '')
         /* 先清掉它自己插的图，再截字数 —— 反过来的话 40 格的额度会被 base64 吃掉，
            真正的那句话一个字都留不下。 */
@@ -1155,6 +1182,9 @@ const server = http.createServer(async (req, res) => {
     const q = u.searchParams.get('q') || '';
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     try {
+      /* `?sweep=1` 立刻做一次巩固。验收要用：等 6 轮才能看到"社群在合并"，
+         而这件事恰恰是记忆里最需要被看见的部分（剪掉了什么、合并了什么）。 */
+      if (u.searchParams.get('sweep') === '1') memory.consolidate();
       res.end(JSON.stringify(memory.debug(q), null, 1));
     } catch (e) {
       res.end(JSON.stringify({ error: String(e?.message || e) }));
