@@ -1,6 +1,0 @@
-apiVersion: v2
-appVersion: 0.1.2
-description: 涌现式桌面 · 住在桌面里的那一个（agent 服务）
-name: emergentdesktop
-type: application
-version: 0.1.2

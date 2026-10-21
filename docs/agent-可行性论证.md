@@ -702,7 +702,7 @@ Rust 工具链只在**重建 wheel** 时用一次（`/root/axbuild.yaml` 那个 
 | **M3 输出通道** | 渲染树 + 10 个组件；`draw` + 语义层 + `drawOn` | "Downloads 什么占地方" 直接给可操作的表；"画个开心的表情" 桌面粒子聚成笑脸 |
 | **M4 自造工具** | 工具注册 + `needs` 强制 + 技能加载 | "给 Navidrome 加个歌单" 自己查 API、写脚本、自测、等你批准 |
 | **M5 人格层** | L0 种子 + 漂移注入 + 面板（**✅ 2026-10-21，见下**；L0.5 知识轨迹未做） | 它会说"我今天看到…"，且能指出那条信息是哪来的 |
-| **M6 产品化** | 打成 Olares 应用（**✅ 2026-10-21，见下**；镜像与多用户隔离未做） | 市场里能装能卸 |
+| **M6 产品化** | 一个工作负载 + 一条命令（**✅ 2026-10-21**；市场应用试过、撤了，见下） | 一条命令装、一条命令回滚、挂了会自己回来 |
 
 M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么样；M5 让它有"自己"。
 
@@ -734,36 +734,48 @@ M1 之后它就不是聊天框；M2 让它有连续性；M3 决定它长什么�
 **边界**：只记得"做过"什么，不记得"决定"过什么；L0.5（每天学一个新知识）没做。
 这是风味层，`PERSONA=off` 一句话关掉，记忆照常。
 
-### M6 落地（2026-10-21）
+### M6 落地（2026-10-21，当天改了两次定位）
 
-一句话：**它现在是一个能在市场里装、能在市场里卸的应用，而不是一台机器上的一个 pod。**
+一句话：**它现在是一条命令装、一条命令回滚的桌面替换层，不是一个装着 agent 的应用。**
 
-验收链路上的四件事，都在真机上验过：
+这一节记的是**一次判断失误和它的修正**，因为那个失误很典型。
 
-| 验收 | 结果 |
-|---|---|
-| 装 | `olares-cli chart lint` 通过 → 上传本地源 → `market install` → 4/4 Running |
-| 入口 | entrance `emergentdesktop` 注册进网关（和 navidrome 同一条路）；根路径与 `/agent/` 都 200 |
-| 数据 | `Home/Agent/{memory,drift,persona.md}` 在 Files 里可见；卸载重装后 16 条记忆、人格设定、drift 全在 |
-| 卸 | `market uninstall` → 命名空间 Terminating → 数据保留 |
+**第一版：做成 Olares 应用包。** 走 `olares-cli chart lint` → 上传本地源 → `market install`，
+能装能卸、数据在 Home、pod 自愈，四条都验过。工程上没问题。
 
-三条取舍值得记下来：
+**然后撤了。** 用户一句话点破："既然我们是社区版的桌面，就没必要遵循官方的 app 安装，
+换桌面这种事本来就不是给小白用户玩的。" 回头看，四条硬理由：
 
-1. **走市场而不是 helm**。helm 能把 pod 跑起来，但没有 Application 记录、没有 entrance、
-   没有 NetworkPolicy —— 桌面上看不到图标，从市场点进来是 404。而"卸载"这件事在 helm 那条路上
-   是十几个 `kubectl delete`。
-2. **代码仍然不进镜像**。节点上没有 docker/nerdctl/buildah，也没有可推的仓库 —— 打不了镜像。
-   于是沿用 hostPath + 重启进程，另加一个 initContainer 检查代码在不在：
-   没有它，用户看到的是 node 的 `MODULE_NOT_FOUND` 堆栈，而那行报错不会告诉他该跑什么。
-   **这是这一版最大的产品债**，`values.image.agent` 已经是普通字段，换真镜像即可。
-3. **工作负载从裸 Pod 换成 Deployment**。原来那个裸 Pod 能存在，是因为
-   `appns-validating-webhook` 只校验 deployments/statefulsets/daemonsets 的 CREATE ——
-   它是一条约束的缝，不是设计。装成应用之后，Deployment 反而成了自愈的来源
-   （删 pod 20 秒后自己回来，实测）。
+1. **应用装不出"换桌面"。** `edge-desktop` 在 `user-space-<user>` 里，应用 pod 在
+   `<appid>-<user>` 里，而 **Service 的 selector 只在同一命名空间内生效** ——
+   桌面入口永远选不到应用里的 pod。这是 Kubernetes 的约束。
+2. **1.12.7 没有"桌面应用"这个概念。** `Application` CRD 里没有任何 desktop/theme 字段，
+   机器上装的应用 `olaresManifest.type` 全是 `app`。
+3. **官方桌面不只是静态页。** 它还要代理 `/api`、`/bfl`、`/kapis`。顶替它必须有一个 pod
+   在 user-space 里同时干两件事，那个 pod 注定不属于应用的生命周期。
+4. **两套生命周期错配是真事故。** 卸应用之后桌面还停在被替换的状态：粒子场照动，
+   `/agent/` 502 —— 用户在市场点"卸载"，得到的是"东西半没了"。
 
-**多用户隔离没做**：RBAC 还是集群级只读，代码里按命名空间后缀过滤"哪些是我的"。
-单用户等价，多用户会看到别人的 pod。要做干净得给每个用户的命名空间建 Role/RoleBinding，
-而命名空间是装应用时才出现的 —— 绑定也得动态。
+**第二版：一个工作负载 + 一个脚本。** `deploy/install.sh`：找 Home → 铺文件 → 写 Secret →
+apply → 删 pod → 等三容器 Ready → **最后**改 selector。`--revert` 切回官方，
+`--uninstall` 连工作负载一起删（数据保留）。
+
+三个技术决定，每个都有代价：
+
+| 决定 | 原因 | 代价 |
+|---|---|---|
+| 工作负载用 **ReplicaSet** | webhook 只拦 deployments/sts/ds 的 CREATE；裸 Pod 能过但不自愈（节点重启后桌面死在那儿，没人报错）。RS 能过，删 pod 10 秒自己回来（实测） | RS **不会滚动更新**，改模板必须显式删 pod —— 否则你以为改了，看到的还是旧容器的日志 |
+| nginx / agent / memory **同一个 pod** | nginx 用 `127.0.0.1:8788`，不跨命名空间、不过 netpol、不占 Service | 一个容器崩了整 pod 重启；日志要 `-c` 分开看 |
+| 静态文件只有一份 `www` | nginx 当站点根，agent 当 `WEB_ROOT`，再挂到 `/app/shell` 让 `prompt.mjs` 能 import `timing.js` | 目录结构比"各一份"绕，得在清单里写清为什么 |
+
+**当天踩的最大一个坑：蹭平台标签。** 为了让壳层过应用命名空间的 NetworkPolicy，
+给它打了 `tier: bfl`。而 `bfl` 这个 Service 的 selector 就是 `tier: bfl` ——
+壳层立刻被塞进 bfl 的 endpoints，一半请求打到不监听 8080 的 nginx 上，
+`olares-cli market` 直接 400 `connection refused`。教训：**不认识的标签不要借**，
+它是别人 selector 的钩子。
+
+**未做**：镜像（节点没有 docker/nerdctl/buildah，也没仓库；代码仍是 hostPath + 重启）、
+多用户 RBAC 隔离（还是集群级只读 + 代码按后缀过滤）。
 
 ### token 账本（2026-10-21，横切能力，不占分期）
 

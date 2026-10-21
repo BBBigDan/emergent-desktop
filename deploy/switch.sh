@@ -13,7 +13,7 @@ NS=user-space-bbbigdan
 
 desktop() {
   case "$1" in
-    dev)      kubectl patch svc edge-desktop -n "$NS" -p '{"spec":{"selector":{"app":"emergent-shell"}}}' ;;
+    dev)      kubectl patch svc edge-desktop -n "$NS" -p '{"spec":{"selector":{"app":"emergent-desktop"}}}' ;;
     official) kubectl patch svc edge-desktop -n "$NS" -p '{"spec":{"selector":{"app":"olares-app"}}}' ;;
     *) echo "usage: $0 desktop dev|official" >&2; exit 1 ;;
   esac
@@ -44,7 +44,7 @@ status() {
   printf '%-14s selector=%s targetPort=%s\n' authelia-svc \
     "$(kubectl get svc authelia-svc -n "$NS" -o jsonpath='{.spec.selector.app}')" \
     "$(kubectl get svc authelia-svc -n "$NS" -o jsonpath='{.spec.ports[0].targetPort}')"
-  kubectl get pod -n "$NS" -l 'app in (emergent-shell,emergent-auth)' --no-headers 2>/dev/null || true
+  kubectl get pod -n "$NS" -l 'app in (emergent-desktop,emergent-auth)' --no-headers 2>/dev/null || true
 }
 
 case "${1:-}" in
