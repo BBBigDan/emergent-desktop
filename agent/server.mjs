@@ -179,6 +179,21 @@ function withMemory(messages, note) {
   return out;
 }
 
+/** 容量探针：**故意**把上下文撑大，用来回答"多长算太长"。
+ *
+ *   CTX_PAD=3000 node agent/server.mjs
+ *
+ * 只在显式设了才生效，而且不改任何规则 —— 它只在系统提示词后面追加一段
+ * 与本轮无关的占位文字。这样"变蠢"如果发生，原因就只剩长度这一个变量。
+ * 没有这个开关，所有"上下文太大了"的判断都只能靠感觉。
+ */
+const CTX_PAD = Number(process.env.CTX_PAD || 0);
+function padded(sys) {
+  if (!CTX_PAD) return sys;
+  const unit = '（以下是与本轮无关的占位文字，用来测量上下文长度的影响。）';
+  return sys + '\n\n' + unit.repeat(Math.ceil(CTX_PAD / unit.length)).slice(0, CTX_PAD);
+}
+
 async function getSession(sid) {
   let s = sessions.get(sid);
   if (!s) {
@@ -187,7 +202,7 @@ async function getSession(sid) {
       sid,
       /* 系统提示词是会话的第一条消息，进历史。这样 /api/debug 能直接看到
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
-      messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: buildSystemPrompt() }],
+      messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: padded(buildSystemPrompt()) }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
       tools: makeTools({ source: SYS, memory, forge }),
       model: null,
