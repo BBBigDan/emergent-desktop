@@ -19,7 +19,7 @@
 #   于是又要 NetworkPolicy 白名单（上一版为此给壳层打了 `tier: bfl` 标签去蹭平台的规则，
 #   那是冒充桌面网关）。同一个 pod 里走 127.0.0.1，这些全都不需要。
 #
-# 代码在哪：**在镜像里**（ghcr.io，由 .github/workflows/images.yml 构建）。
+# 代码在哪：**在镜像里**（Docker Hub，由 .github/workflows/images.yml 构建）。
 # 曾经是 hostPath —— 节点上没有 docker/nerdctl/buildah，也没有可推的仓库，tar 上去是唯一的路。
 # 那条路的代价是"永远在跑一个没有版本号的东西"：改坏了没法回滚、没人知道线上是哪份代码、
 # 谁 exec 进去都能顺手改一行。现在回滚 = `install.sh --tag sha-xxxxxxx`。
@@ -207,13 +207,13 @@ spec:
         # 现在的架构里 agent 在同一个 pod（127.0.0.1），根本不需要那个标签。
     spec:
       serviceAccountName: emergent-desktop
-      # ghcr.io 上的三个包是 public 的（CI 里翻的，装完可以用匿名探测脚本复核），
-      # 所以不需要 imagePullSecrets。要是哪天变回 private，pod 会停在 ImagePullBackOff，
-      # `kubectl describe pod` 的事件里会写 401 —— 那时候再来加一个 pull secret。
+      # Hub 上三个仓库是 public 的，所以不需要 imagePullSecrets。要是哪天被设成 private，
+      # pod 会停在 ImagePullBackOff，`kubectl describe pod` 的事件里会写 401 ——
+      # 那时候要么把仓库改回 public，要么加一个 pull secret。
       containers:
         # ── 壳层：静态 + 把官方接口转回去 ──
         - name: shell
-          image: __IMAGE_PREFIX__/shell:__IMAGE_TAG__
+          image: __IMAGE_SHELL__
           # latest 必须 Always：标签不变而内容变了，IfNotPresent 会让节点永远跑着
           # 缓存里那份旧镜像 —— 表现是"重新装了但页面没变"。
           imagePullPolicy: Always
@@ -235,7 +235,7 @@ spec:
 
         # ── agent：粒子场的服务端 ──
         - name: agent
-          image: __IMAGE_PREFIX__/agent:__IMAGE_TAG__
+          image: __IMAGE_AGENT__
           imagePullPolicy: Always
           ports:
             - containerPort: 8788
@@ -296,7 +296,7 @@ spec:
 
         # ── 记忆侧车：真图库。wheel 是 cp311，别"顺手升一下" ──
         - name: memory
-          image: __IMAGE_PREFIX__/memory:__IMAGE_TAG__
+          image: __IMAGE_MEMORY__
           imagePullPolicy: Always
           env:
             - name: PYTHONUNBUFFERED

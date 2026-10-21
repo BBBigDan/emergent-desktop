@@ -44,25 +44,35 @@ Olares 的 `appns-validating-webhook` 只拦 `deployments` / `statefulsets` / `d
 ## 镜像从哪来：GitHub Actions
 
 节点上没有 docker/nerdctl/buildah，也没有私有仓库 —— 所以代码曾经是 `tar` 到
-hostPath、重启进程生效。现在改成 CI 打镜像：runner 有 docker，ghcr 是免费仓库，
+hostPath、重启进程生效。现在改成 CI 打镜像：runner 有 docker，Hub 是免费仓库，
 这条路**什么都没多花**。
 
 ```
 push main ──► .github/workflows/images.yml
                 ① 六份自测（history / memory / model.retry / persona / usage / forge）
-                ② 并行打三个镜像 → ghcr.io/bbigdan/emergent-desktop/{shell,agent,memory}
+                ② 并行打三个镜像 → docker.io/<hub用户>/emergent-desktop-{shell,agent,memory}
                    标签：sha-<7>（回滚点）、latest（日常）
+                ③ 匿名探测：不登录能不能取到 manifest
 ```
+
+仓库里要放两个 secret（Settings → Secrets and variables → Actions）：
+`DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`（Hub 的 Access Token，权限 Read & Write）。
+
+> **为什么不是 ghcr。** 2026-10-21 试过：这个账号的 `GITHUB_TOKEN` 推 ghcr 在三种
+> 命名（平级 / 三段 / 同名仓库）、两种登录名写法下都是
+> `denied: permission_denied: The requested installation does not exist`，
+> 而 token 的 `Packages: write` 确实生效了 —— 是账号层的事，不是配置漏了。
+> Hub 这边只要仓库 public，集群就匿名拉得到，连 imagePullSecret 都不用维护。
 
 | 镜像 | 内容 | 为什么不合并成一个 |
 |---|---|---|
-| `/shell` | nginx:alpine + `shell/` 静态站 | 合成一个（nginx+node+python）要 350MB，每个容器都拖着另外两套运行时 |
-| `/agent` | node:22-alpine + `agent/` + `shell/` | 见左：`prompt.mjs` 要 `../shell/src/timing.js`，那张常数表不能复制一份 |
-| `/memory` | python:3.11-slim + `axolotl_rs` | wheel 是 cp311 + manylinux_2_34，**升 3.12 或换 alpine 都装不上** |
+| `-shell` | nginx:alpine + `shell/` 静态站 | 合成一个（nginx+node+python）要 350MB，每个容器都拖着另外两套运行时 |
+| `-agent` | node:22-alpine + `agent/` + `shell/` | 见左：`prompt.mjs` 要 `../shell/src/timing.js`，那张常数表不能复制一份 |
+| `-memory` | python:3.11-slim + `axolotl_rs` | wheel 是 cp311 + manylinux_2_34，**升 3.12 或换 alpine 都装不上** |
 
-三个包必须是 **public**：CI 里会用 API 翻一次（推上去默认是 private），
-然后跑一次**匿名探测**。探测失败会在 Actions 里留下 warning ——
-那种情况下 pod 会停在 `ImagePullBackOff`，`describe` 的事件里写的是 401。
+三个 Hub 仓库都要是 **public**（Hub 新建时默认就是），否则集群匿名拉不到，
+pod 会停在 `ImagePullBackOff` —— `describe` 的事件里写的是 401。
+CI 最后会跑一次匿名探测，拉不到就在 Actions 里留 warning。
 
 > `.dockerignore` 挡 `agent/.env` 和 `agent/.kube/`。build context **不认
 > `.gitignore`**，而镜像是推到公开仓库的 —— 这两个进镜像等于把模型 key 和
@@ -149,7 +159,7 @@ scp /tmp/i.html root@HOST:/olares/emergent-auth/www/index.html
 
 | 点 | 做法 | 原因 |
 |---|---|---|
-| 静态文件 | 打进 `/shell` 镜像（`/www`） | 回滚 = 换 tag，不再"改完 tar 上去" |
+| 静态文件 | 打进 `-shell` 镜像（`/www`） | 回滚 = 换 tag，不再"改完 tar 上去" |
 | 只接管 `/` | nginx `try_files`，`/api` `/server` `/kapis` … 反代到 `olares-app-official:91` | 登录态、接口、其他应用完全不受影响 |
 | `/bfl/` 单独直连 bfl 网关 | 官方前端 pod 自己不代理 `/bfl`（桌面是跨域走 auth 域名 + JWT 拿遥测的），所以壳层直接 `proxy_pass` 到 `bfl` 服务 | 右下角设备状态面板的 `/bfl/monitor/v1alpha1/cluster` 能用同域 cookie 取到数据 |
 | 切换 | 改 `edge-desktop` 的 selector | 一条 patch，秒级生效，随时回滚 |

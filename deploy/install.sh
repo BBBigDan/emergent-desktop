@@ -11,7 +11,7 @@
 #   · 一条命令装、一条命令回滚，出了事你不用去翻三个命名空间
 #   · 数据仍在用户 Home（Files 里看得见），重装不丢
 #
-# 代码在镜像里（ghcr.io/bbigdan/emergent-desktop-{shell,agent,memory}），
+# 代码在镜像里（docker.io/<hub用户>/emergent-desktop-{shell,agent,memory}），
 # 由 .github/workflows/images.yml 在 push 到 main 时构建。
 #
 # 为什么工作负载是 ReplicaSet：平台的 `appns-validating-webhook` 只拦
@@ -26,7 +26,8 @@ USER_NAME="${OLARES_USER:-bbbigdan}"
 NS="user-space-$USER_NAME"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-IMAGE_PREFIX="${IMAGE_PREFIX:-ghcr.io/bbigdan/emergent-desktop}"
+# 镜像前缀（不含 -shell/-agent/-memory）。默认 Docker Hub，public 仓库，集群匿名拉。
+IMAGE_PREFIX="${IMAGE_PREFIX:-docker.io/${DOCKERHUB_USER:-bbigdan}/emergent-desktop}"
 IMAGE_TAG="latest"
 STATE_DIR="/olares/emergent-desktop/state/$USER_NAME"
 
@@ -70,18 +71,35 @@ fi
 
 # ── 0. 先确认镜像拉得到 ──────────────────────────────────
 # 顺序很重要：**先探测，再动线上**。反过来的话，镜像标签写错了、包是 private、
-# ghcr 抽风 —— 每一种都会先把你正在跑的桌面删掉，然后卡在 ImagePullBackOff，
+# 仓库设成了 private —— 每一种都会先把你正在跑的桌面删掉，然后卡在 ImagePullBackOff，
 # 而那时候能看的东西只剩事件里的 401。
 say "探测镜像（匿名，$IMAGE_TAG）"
-"${SSH[@]}" "for I in shell agent memory; do
-    R='${IMAGE_PREFIX#ghcr.io/}/'\$I
-    T=\$(curl -s -m 10 \"https://ghcr.io/token?scope=repository:\$R:pull&service=ghcr.io\" | sed -n 's/.*\"token\":\"\\([^\"]*\\)\".*/\\1/p')
-    C=\$(curl -s -o /dev/null -w '%{http_code}' -m 15 -H \"Authorization: Bearer \$T\" \
-        -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
-        \"https://ghcr.io/v2/\$R/manifests/$IMAGE_TAG\")
-    echo \"  \$I: HTTP \$C\"
-    [ \"\$C\" = 200 ] || exit 7
-  done" || die "镜像 $IMAGE_TAG 拉不到 —— 线上没动过。先在 GitHub 的 Actions 里看构建，或换 --tag"
+# 两个 registry 的匿名取 manifest 流程不一样，按前缀分派：
+#   docker.io —— 先向 auth.docker.io 换 token，再打 registry-1.docker.io
+#   其它       —— 同一个主机上的 /token 端点（ghcr 就是这样）
+# 探测脚本用 heredoc 发到远端跑：本地不展开任何 $，省掉三层反斜杠。
+REG="${IMAGE_PREFIX%%/*}"
+REPO="${IMAGE_PREFIX#*/}"
+PROBE=$(sed -e "s|@REG@|$REG|g" -e "s|@REPO@|$REPO|g" -e "s|@TAG@|$IMAGE_TAG|g" <<'EOS'
+for I in shell agent memory; do
+  R="@REPO@-$I"
+  if [ "@REG@" = "docker.io" ]; then
+    U="https://auth.docker.io/token?service=registry.docker.io&scope=repository:$R:pull"
+    M="https://registry-1.docker.io/v2/$R/manifests/@TAG@"
+  else
+    U="https://@REG@/token?scope=repository:$R:pull&service=@REG@"
+    M="https://@REG@/v2/$R/manifests/@TAG@"
+  fi
+  T=$(curl -s -m 10 "$U" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  C=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "Authorization: Bearer $T" \
+      -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+      "$M")
+  echo "  $I: HTTP $C"
+  [ "$C" = 200 ] || exit 7
+done
+EOS
+)
+"${SSH[@]}" sh -s <<<"$PROBE" || die "镜像 $IMAGE_TAG 拉不到 —— 线上没动过。先在 Actions 里看构建，或换 --tag"
 
 # ── 1. 找用户 Home ─────────────────────────────────────
 say "找用户 Home"
@@ -105,8 +123,9 @@ fi
 say "apply 工作负载（ReplicaSet，$IMAGE_TAG）"
 sed -e "s|__USER_HOME__|$HOME_PATH|g" \
     -e "s|__STATE_DIR__|$STATE_DIR|g" \
-    -e "s|__IMAGE_PREFIX__|$IMAGE_PREFIX|g" \
-    -e "s|__IMAGE_TAG__|$IMAGE_TAG|g" \
+    -e "s|__IMAGE_SHELL__|$IMAGE_PREFIX-shell:$IMAGE_TAG|g" \
+    -e "s|__IMAGE_AGENT__|$IMAGE_PREFIX-agent:$IMAGE_TAG|g" \
+    -e "s|__IMAGE_MEMORY__|$IMAGE_PREFIX-memory:$IMAGE_TAG|g" \
     "$HERE/desktop-k8s.yaml" | "${SSH[@]}" "kubectl apply -f - 2>&1 | tail -6"
 
 # ReplicaSet 和 Deployment 的一个关键差别：改了 pod template **不会**替换已有的 pod，
@@ -150,7 +169,7 @@ cat <<EOF
 
 装好了。打开桌面就是它：https://desktop.$USER_NAME.olares.com
 
-镜像：$IMAGE_PREFIX/{shell,agent,memory}:$IMAGE_TAG
+镜像：$IMAGE_PREFIX-{shell,agent,memory}:$IMAGE_TAG
 数据：
   记忆/人格  Userspace/Home/Agent        （Files 里看得见）
   会话/用量  $STATE_DIR
@@ -160,7 +179,7 @@ cat <<EOF
   ./deploy/install.sh # 拉 latest 并重建 pod
 
 回滚到某个提交：./deploy/install.sh --tag sha-<7位>
-  标签列表：gh api '/user/packages/container/emergent-desktop%2Fagent/versions' --jq '.[].metadata.container.tags'
+  标签列表：Hub 仓库的 Tags 页，或 Actions 日志里那行 sha-xxxxxxxx
 
 桌面回官方：./deploy/install.sh --revert
 连工作负载一起删：./deploy/install.sh --uninstall      （数据保留）

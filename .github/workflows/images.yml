@@ -1,9 +1,15 @@
-# 打镜像 + 推到 ghcr.io
+# 打镜像 + 推到 Docker Hub
 #
 # 为什么在 CI 里打：**集群节点上没有 docker/nerdctl/buildah**（Olares 节点是纯 kubelet
 # + containerd），也没有私有仓库，所以"代码 tar 到 hostPath、重启进程"曾经是唯一的路。
 # 那条路的代价写在 deploy/README.md 里：镜像版本号不存在、代码不回滚、谁 exec 进去都能改。
-# GitHub 的 runner 有 docker，ghcr 是免费的仓库 —— 这条路什么都没多花。
+# GitHub 的 runner 有 docker —— 这条路什么都没多花。
+#
+# 为什么是 Docker Hub 不是 ghcr：2026-10-21 实测，这个账号的 GITHUB_TOKEN 推 ghcr
+# 在三种命名（平级 / 三段 / 同名仓库）、两种登录名写法下都是
+#   denied: permission_denied: The requested installation does not exist
+# 而 token 的 `Packages: write` 明明生效了 —— 是账号层的事，不是配置漏了。
+# Hub 这边只要仓库 public，集群就能匿名拉，连 imagePullSecret 都不用维护。
 #
 # 三个镜像而不是一个大镜像：
 #   shell   nginx + 静态站            ~60MB
@@ -31,14 +37,6 @@ concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # 必须是全小写：OCI 引用里 owner 大小写不合法（仓库是 BBBigDan，镜像是 bbigdan）
-  REGISTRY: ghcr.io
-  # 三段：owner/仓库/镜像名。**不能用 bbigdan/emergent-desktop-shell 那种平级命名** ——
-  # GITHUB_TOKEN 推 ghcr 时只对"仓库自己的命名空间"有写权限，平级名字会回
-  # `denied: permission_denied: The requested installation does not exist`（踩过）。
-  PREFIX: ghcr.io/bbigdan/emergent-desktop
-
 jobs:
   # 先跑自测。这六份是纯 Node 的（零依赖、不连网、不碰集群），几秒钟，
   # 但它们盖的正是"最容易一次改坏一片"的东西：截断策略、记忆三条纪律、
@@ -62,10 +60,6 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # 推 ghcr 要这个；GITHUB_TOKEN 是 workflow 临时发的，不用在仓库里放 PAT
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -75,58 +69,48 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # 两个 secret（Settings → Secrets and variables → Actions）：
+      #   DOCKERHUB_USERNAME  Hub 用户名，同时也是镜像命名空间
+      #   DOCKERHUB_TOKEN     Hub 的 Access Token，权限只要 Read & Write
+      # 不用 Hub 密码：Access Token 能单独吊销，密码不能。
       - uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # 两个标签：
-      #   sha-<7>  回滚点。install.sh --tag sha-xxxxxxx 就能退回那一版
+      #   sha-<7>  回滚点。install.sh --tag sha-xxxxxxx 就退回那一版
       #   latest   日常
-      # 不用 :main —— 分支名会变，回滚点不该跟着变。
       - name: 构建并推送 ${{ matrix.image }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/docker/${{ matrix.image }}.Dockerfile
-          # 只打 amd64：Olares 那台是 x86_64。打 arm64 要多花 10 分钟换一个没人用的层。
+          # 只打 amd64：Olares 那台是 x86_64。打 arm64 要多花十分钟换一个没人用的层。
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.PREFIX }}/${{ matrix.image }}:${{ github.sha }}
-            ${{ env.PREFIX }}/${{ matrix.image }}:sha-${{ github.sha }}
-            ${{ env.PREFIX }}/${{ matrix.image }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:sha-${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/emergent-desktop-${{ matrix.image }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
-      # 镜像要能被集群**匿名**拉取，否则每个 pod 都得带 imagePullSecrets。
-      # 从 workflow 推上去的包默认是 private，这里翻成 public。
-      # 失败不算错（权限模型偶尔不给这条），下一行的匿名探测会如实说出结论。
-      - name: 翻成 public
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          P=emergent-desktop-${{ matrix.image }}
-          gh api --method PATCH "/user/packages/container/$P" \
-            -f visibility=public --jq '.visibility' 2>&1 || \
-          gh api --method PATCH "/users/${{ github.repository_owner }}/packages/container/$P" \
-            -f visibility=public --jq '.visibility' 2>&1 || echo "翻不动，需要手工设一次"
-
       # 匿名探测：不登录也能取到 manifest，才算"集群拉得到"。
+      # Hub 匿名拉取有 100 次/6 小时的限流，我们一次部署三个镜像，离限很远。
       - name: 匿名拉取探测
+        env:
+          NS: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          P="${{ env.PREFIX }}/${{ matrix.image }}"
-          R="${P#ghcr.io/}"
-          TOK=$(curl -s "https://ghcr.io/token?scope=repository:$R:pull&service=ghcr.io" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+          R="$NS/emergent-desktop-${{ matrix.image }}"
+          TOK=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$R:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
           CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOK" \
             -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://ghcr.io/v2/$R/manifests/latest")
-          echo "$P → HTTP $CODE"
+            "https://registry-1.docker.io/v2/$R/manifests/latest")
+          echo "$R → HTTP $CODE"
           if [ "$CODE" != "200" ]; then
-            echo "::warning::$P 匿名拉不到（$CODE）。集群会 ImagePullBackOff —— 去 Packages 里把可见性改成 public。"
+            echo "::warning::$R 匿名拉不到（$CODE）。集群会 ImagePullBackOff —— 去 Hub 上把这个仓库设成 public。"
           fi
