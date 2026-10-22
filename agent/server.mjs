@@ -34,6 +34,7 @@ import { trimHistory } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
+import { cleanSpeech } from './speech.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -1116,7 +1117,7 @@ async function runTurn(s, goal) {
       const calls = out.tool_calls || [];
       /* 便宜模型会把示例里的记号一起抄出来（"content: ..."、"→ scene_set(...)"），
          也会写一整段带换行和清单的计划。 */
-      const rawSpeech = String(out.content || '')
+      let rawSpeech = String(out.content || '')
         .replace(/^\s*(content|回答|你说)\s*[:：]\s*/i, '')
         .replace(/^["'「](.*)["'」]$/, '$1')
         /* 取**所有非空行**，不是第一行。
@@ -1140,6 +1141,12 @@ async function runTurn(s, goal) {
         .replace(/!\[[^\]]*\]\([^)]*\)?/g, '')
         .replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
         .trim();
+      /* 把"它给自己下的指令"从要上屏的那段话里切掉。
+         实测（2026-10-22 线上）：正文写完之后它会接着写
+         "第 1 步，调 logs_tail 查看 n8n 的最近日志…第 2 步，调 scene_show…"，
+         还把参数 JSON 放进 ``` 代码块 —— 全都上屏了。
+         那是草稿，不是回答：屏幕是粒子，代码块在点阵里就是一堵乱码墙。 */
+      rawSpeech = cleanSpeech(rawSpeech);
       /* 提到工具名的话是"它对自己下的指令"，不是给用户的话。
          实测原话："请调用 scene_ask 把问题问出来" —— 用户看到只会莫名其妙。 */
       /* 也不要 JSON 残片。实测 7B 会把本该是参数的东西写进 content：

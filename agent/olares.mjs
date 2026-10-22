@@ -256,6 +256,8 @@ export function createOlares(o = {}) {
        为什么非要合并：模型画仪表要 0~1 的占比，只有清单时会拿 0 顶上去 ——
        屏幕上就是"n8n / navidrome / qbittorrent 全 0%"，那是**假数**。 */
     if (op === 'apps') return remember(key, await readApps());
+    /* events 要带命名空间（CLI 强制要求），而模型只记得住 pod 名 —— 这里替它查 */
+    if (op === 'events') return remember(key, await readEvents(name));
 
     const r = await run(make(name));
     if (!r.ok) {
@@ -320,6 +322,45 @@ export function createOlares(o = {}) {
   function remember(key, data) {
     if (data && !data.error) cache.set(key, { at: Date.now(), data });
     return data;
+  }
+
+  /* pod 名 → 命名空间。`cluster pod events` 的 `-n` 是**必填**（实测：
+     不带给 plain error "namespace required"），而模型只会记得住 pod 名。
+     与其让它先问一轮，不如在这里替它查一次 —— 顺手也把最近一次 pods 的结果用上了。 */
+  let podNs = new Map();
+
+  async function readEvents(name) {
+    let pod = String(name || '').trim();
+    let ns = '';
+    /* 显式给了 `命名空间/pod` 就用它 */
+    if (pod.includes('/')) { const [a, b] = pod.split('/'); ns = a; pod = b; }
+    if (!ns) {
+      if (!podNs.size) {
+        const r = await run(['cluster', 'pod', 'list'], { timeout: 30_000 });
+        if (r.ok) {
+          for (const p of r.data?.items || []) {
+            if (p?.metadata?.name) podNs.set(p.metadata.name, p.metadata.namespace || 'default');
+          }
+        }
+      }
+      ns = podNs.get(pod) || '';
+      /* 模型常用应用名（n8n）而不是 pod 名（n8n-7d9f-xx2k）—— 唯一前缀匹配一次 */
+      if (!ns) {
+        const cand = [...podNs.keys()].filter((k) => k.startsWith(pod));
+        if (cand.length === 1) { pod = cand[0]; ns = podNs.get(pod); }
+      }
+    }
+    if (!ns) {
+      const known = [...podNs.keys()].slice(0, 12).join('、');
+      return {
+        error: `没找到叫「${pod}」的 pod（它可能已经重建过，名字变了）。`
+          + `先调 olares 的 pods 看现在的名字${known ? `：${known}` : ''}；`
+          + '或者用「命名空间/pod名」的形式给 name。',
+      };
+    }
+    const r = await run(['cluster', 'pod', 'events', pod, '-n', ns], { timeout: 30_000 });
+    if (!r.ok) return { error: r.error.message, code: r.error.code };
+    return { ns, ...shape('events', r.data, pod) };
   }
 
   /** apps：清单 + 占用 + 总量，合成一份 */
@@ -448,10 +489,15 @@ export function createOlares(o = {}) {
       return {
         name,
         state: data?.state || data?.status || '',
+        version: data?.version || undefined,
+        source: data?.source || undefined,
+        /* 装到一半卡住时，progress / message 才是答案（"一直在转圈"问的就是这个） */
+        progress: data?.progress && data.progress !== '-' ? data.progress : undefined,
+        message: data?.message || undefined,
+        reason: data?.reason && data.reason !== data?.state ? data.reason : undefined,
         entrances: (data?.entrances || []).map((e) => ({
           name: e.name, url: e.url || e.host, state: e.state, authLevel: e.authLevel,
         })),
-        raw: undefined,
       };
     }
 
@@ -489,15 +535,19 @@ export function createOlares(o = {}) {
       return {
         pods: items.map((p) => {
           const cs = p?.status?.containerStatuses || [];
-          return {
+          const waiting = cs.map((c) => c.state?.waiting?.reason).filter(Boolean).slice(0, 2).join(',');
+          const row = {
             name: p?.metadata?.name,
             ns: p?.metadata?.namespace,
             phase: p?.status?.phase,
             ready: cs.filter((c) => c.ready).length + '/' + (cs.length || (p?.spec?.containers || []).length),
             restarts: cs.reduce((n, c) => n + (c.restartCount || 0), 0),
-            /* 起不来的两个真信号，别让模型从 phase 猜 */
-            waiting: cs.map((c) => c.state?.waiting?.reason).filter(Boolean).slice(0, 2).join(',') || undefined,
           };
+          /* 起不来的真信号单独给；正常的 pod **不带这个键** ——
+             `waiting: undefined` 在 JSON 里会消失，但在模型眼里那是一句"它在等什么"，
+             于是它会给正常 pod 编一个原因。 */
+          if (waiting) row.waiting = waiting;
+          return row;
         }).slice(0, 40),
         count: items.length,
       };
@@ -520,16 +570,20 @@ export function createOlares(o = {}) {
 
     if (op === 'images') {
       const items = data?.images || (Array.isArray(data) ? data : []);
-      const used = items.filter((i) => i.in_use || i.inUse || (i.used_by || i.usedBy || []).length);
-      /* 只给最大的 8 个：这一问的答案永远是"哪几个最占地方" */
+      /* 字段名是 `refs`（被几个工作负载引用），不是 in_use —— 猜错过一次，
+         结果把 179 个镜像全说成"没人用"。没有这个数就不给 unused，
+         宁可少一句，也不给一句假话。 */
+      const hasRefs = items.length > 0 && items[0] && 'refs' in items[0];
+      const usedN = hasRefs ? items.filter((i) => Number(i.refs) > 0).length : null;
       return {
         total: items.length,
-        unused: items.length - used.length,
+        unused: hasRefs ? items.length - usedN : undefined,
+        /* 只给最大的 8 个：这一问的答案永远是"哪几个最占地方" */
         biggest: items
           .map((i) => ({
             sizeMB: Math.round((i.size || 0) / 1024 / 1024),
             tag: (i.repo_tags || i.repoTags || [])[0] || String(i.id || '').slice(7, 19),
-            used: !!(i.in_use || i.inUse || (i.used_by || i.usedBy || []).length),
+            used: hasRefs ? Number(i.refs) > 0 : undefined,
           }))
           .sort((a, b) => b.sizeMB - a.sizeMB)
           .slice(0, 8),
@@ -568,6 +622,9 @@ export function createOlares(o = {}) {
     bin,
     probe,
     read,
+    /* 给自测用：拿真实 CLI 的原始输出喂进来，看压出来的形状对不对。
+       这一层最容易错（字段名是猜的），而错了屏幕上不会报错，只会少一个数。 */
+    shape,
 
     /**
      * 启动预热：探身份 + 把内存分母读进来。

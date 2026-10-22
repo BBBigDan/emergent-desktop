@@ -1,0 +1,11 @@
+{
+  "name": "n8n",
+  "state": "running",
+  "version": "1.1.8",
+  "opType": "install",
+  "progress": "-",
+  "message": "running",
+  "source": "market.olares",
+  "reason": "running",
+  "statusTime": "2026-10-20T07:42:33Z"
+}

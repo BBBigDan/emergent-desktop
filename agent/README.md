@@ -538,7 +538,83 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
    "系统提示和工具表本身就把窗口占满了" —— 那时候该做的是裁工具表，不是裁历史。
 
 不摘要：摘要要再调一次模型，而**那次调用的上下文本来就是满的**。
-要做也应该在后台做，不挡这一轮（还没做）。
+要做也应该在后台做，不挡这一轮。
+
+### 压缩（`/compact`）与新会话（`/new`）
+
+上面那条"直接丢"解决的是**接口 400**，不是"用户还想接着聊"。所以现在有两条路，
+顺序是**先压缩，压不动才丢**：
+
+| | 压缩上下文 | 开新会话 |
+|---|---|---|
+| 目的 | 同一件事聊太长，腾地方接着聊 | 换一件事，别被前面带着走 |
+| 会话 id | 不变 | 换新 |
+| 屏幕上 | 内容还在 | 清空 |
+| 上一段 | 变成摘要，仍在上下文里 | 变成**一条记忆**，靠 recall 取 |
+| 记忆 / 账本 | 不动 | 不动（**这正是"新会话"≠"失忆"**） |
+
+**压缩**（`history.mjs` 的 `compactPlan` / `applyCompact`，`server.mjs` 的 `compactSession`）：
+
+- 到 78% 时**先摘要再替换**，摘要那条是 `user` 角色并带身份标签
+  （"以下是更早对话的摘要，不是原话"）—— 不标的话模型会把摘要当事实引用，
+  而我们不允许"模型自己的话"变成事实。用 user 而不是改 system：改 system 会把前缀缓存打掉。
+- 切点仍必须落在 `user`；窗口太窄时**往回**退到最近的 user。
+  踩过：兜底成 `length - 2` 会切在 `tool` 上，下一次请求直接 400 且报错像接口坏了。
+- 手动 `/compact`（或「压缩一下」）走旁路，**不占模型一轮**；
+  自动压缩有 60s 冷却，否则同一段水位会每轮花一次调用。
+- 状态条的水位线改成一条来回扫的带子：摘要要多久取决于模型，进度不可知，
+  所以不画进度条（画了就是编数字）。
+
+**新会话**（`newSession`）三件事缺一不可，少一件用户就觉得"它把我刚说的忘了"：
+
+1. 上一段压成**一行 episode** 写进记忆（`kind: 'episode'`）—— 新会话里问
+   "上次那个日志"，`memory_recall` 能取到；
+2. 换 sid、清屏、重建系统提示，**新会话立刻落盘**（否则刷新会随出一个新 id）；
+3. 旧会话归档到 `sessions/archive/<sid>.json`，不删。
+   归档后置 `s.dead`，否则回合结束的 idle 保存会把刚移走的文件又写回来。
+
+摘要**不**塞进新会话的第一条 system：那会让"新会话"没那么新，还重复占上下文。
+需要时它自己 recall —— 记忆是**相关才取**，不是常驻。
+
+## 官方技能（`skills.mjs`）
+
+`olares-cli` 是 Olares 官方的命令树，每个子树配一份 `SKILL.md`（Claude 式技能），
+12 份都编在二进制里（`skills list / read / export`）。**能力不用自己造，缺的是语义层。**
+
+- 构建时 `olares-cli skills export /app/agent/olares-skills` 落成文件，
+  运行时**不 spawn**（`skills.mjs` 只读盘）。
+- 展开时压到 400~840 字：只留「该用的场合」+ 命令样例 + 症状路由表。
+  英文长文（5~17KB）整份塞给 7B 等于把窗口吃掉一半，而且它会开始只复述。
+- `skill_use` 工具**同时返回 `ops`** —— 文档是动词表（几十个），
+  `olares` 的 op 是能执行的那一小撮（16 个）。两个都递过去，模型才知道
+  "这个系统能干这件事，但现在我只能看到这几样"。
+  `chart` / `publish` / `router` / `search` / `knowledge` 还没接，表里就是空 ——
+  那时候要照实说"这块还没接"，**不要现场编命令**。
+
+为什么不在运行时调 `olares-cli skills read`：要 spawn，而且输出是给人读的长文；
+更重要的是一份 `skills.test.mjs` 能钉住"压完还看得懂"这件事（行边界、体积、症状表）。
+
+## 系统层：官方 CLI 的受控出口（`olares.mjs`）
+
+一个工具 + `op` 枚举，不是十几个平铺工具（每个 schema 进上下文约 150 token）。
+`op` → **固定 argv 数组**，模型只填枚举和名字，拼不了字符串。
+
+| op | 命令 | 回答什么 |
+|---|---|---|
+| `apps` | `market list --mine` + `dashboard applications` + 分母 | 装了哪些、版本、状态、各自占多少 |
+| `app` / `appinfo` | `market status/get` | 卡在哪（progress/message）、是干什么的 |
+| `catalog` / `categories` | `market list` / `categories` | 能不能装、有什么分类 |
+| `overview` / `usage` | `dashboard overview` / `applications` | 整机负载、谁在吃资源 |
+| `pods` / `events` | `cluster pod list` / `pod events <n> -n <ns>` | 排障：重启次数、waiting 原因、事件 |
+| `images` | `doctor images` | 磁盘被什么占了（**引用数字段是 `refs`**） |
+| `backup` / `users` / `appcfg` / `context` / `version` / `whoami` | 对应子树 | 备份计划、用户、入口、ISO 视野 |
+
+**原始输出必须 shape**：`cluster pod list` 366KB、`market get` 32KB、`images` 85KB。
+压完分别是 856 字 / 几百字节 / 8 条。字段名是**猜的**，所以有 `olares.test.mjs`：
+夹具是 2026-10-22 从线上 pod 抓的真货（`agent/fixtures/olares/`），不改字段只截条数。
+这条测试挡的是"屏幕上不报错、只是少一个数或说一句假话"的那类错误
+（踩过：`in_use` 猜错 → 179 个镜像全说成没人用；`memPct` 当整机 → 2% 说成 0.22%）。
+
 
 ## 限流（429）怎么处理
 
