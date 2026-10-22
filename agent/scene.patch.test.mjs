@@ -9,7 +9,7 @@
  * 服务端现在把"打到新 id 的 patch"升级成一屏 set（旧层保留 + 新层加进去）。
  */
 
-import { normalizeSpec, patchToSpec } from './scene.schema.mjs';
+import { normalizeSpec, normalizeOps, patchToSpec } from './scene.schema.mjs';
 
 let failed = 0;
 const ok = (c, l, e = '') => { if (c) console.log('  ✓ ' + l); else { failed++; console.log('  ✗ ' + l + (e ? ` — ${e}` : '')); } };
@@ -63,6 +63,20 @@ console.log('只有一句问题、没有选项');
 {
   const spec = patchToSpec(prev, [{ id: 'q', label: '要看看 n8n 的日志吗' }]);
   ok(spec.layers.length === 4 && spec.layers[3].kind === 'condense', '退化成一句凝缩的话（至少看得见）');
+}
+
+console.log('scene_ask 的问句上限（两行）');
+{
+  /* 27 字是这次线上那条被切坏的原句长度。以前 fork label 上限 14，
+     一切就是「要在 Navidrome 中…」。现在上限 30，屏幕上排两行。 */
+  const label = '要把内存压到 20% 吗？这会重启占内存最多的那个应用';
+  const r = normalizeOps([{ id: 'ask', label, options: [{ id: 'yes', label: '压' }, { id: 'no', label: '先不动' }] }]);
+  ok(!!r.ops, 'ops 合法');
+  ok(r.ops[0].label === label, `问句原样保留（${Array.from(label).length} 字）`, r.ops[0].label);
+  /* 超长的仍然要收 —— 两行 30 字以外屏幕上放不下 */
+  const long = '一'.repeat(60);
+  const r2 = normalizeOps([{ id: 'ask', label: long, options: [{ id: 'yes', label: '压' }, { id: 'no', label: '算了' }] }]);
+  ok(Array.from(r2.ops[0].label).length === 30, '60 字收到 30');
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');

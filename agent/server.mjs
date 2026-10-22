@@ -315,6 +315,31 @@ function shrinks(next, prev) {
 }
 
 /**
+ * 把一条分叉 op 放到屏幕上 —— **有那一层就改，没有就长出来**。
+ *
+ * `scene.patch()` 遇到不存在的层会 `continue`（静默），所以"问一句"这件事
+ * 在**没有任何分叉的屏幕**上从来不会发生。两处踩过：
+ *   ① 模型调 `scene_ask`（线上："要在 Navidrome 中查找《千与千寻》吗"）；
+ *   ② 系统自己的"拖了仪表代问"兜底。
+ * 两处都走这里，别再各写一份。
+ */
+function askOnScreen(s, op) {
+  const known = new Set((s.lastSceneSpec?.layers || []).map((l) => l.id));
+  if (known.has(op.id)) {
+    s.postOps = [...(s.postOps || []), op].slice(-8);
+    emit(s, { t: 'scene', op: 'patch', ops: [op] });
+    return true;
+  }
+  const norm = normalizeSpec(patchToSpec(s.lastSceneSpec, [op]));
+  if (!norm.spec) return false;
+  s.lastSceneSpec = norm.spec;
+  s.postOps = [];
+  s.drew = true;
+  emit(s, { t: 'scene', op: 'set', spec: norm.spec });
+  return true;
+}
+
+/**
  * 兜底铺一屏：模型没给出这一屏（空回复、超时、429）时，用**这一轮已经拿到的读数**铺。
  *
  * 两条触发路径共用它：
@@ -1583,13 +1608,14 @@ async function runTurn(s, goal) {
         s.spoke = true;
         speak(s, `压到 ${to}% 要重启占内存最多的那个`);
       }
-      emit(s, {
-        t: 'scene', op: 'patch',
-        ops: [{
-          id: 'ask',
-          label: `压到 ${to}%？`,
-          options: [{ id: 'yes', label: `压到 ${to}%` }, { id: 'no', label: '算了' }],
-        }],
+      /* **这里以前是直接 emit 一个 patch**，而屏幕上通常只有仪表、没有分叉 ——
+         patch 打在不存在的层上会被静默丢掉，于是"系统代问"也什么都没问出来。
+         用户看到的是：拖了一下仪表，屏幕没反应，它说了一句话就没下文。
+         所以走同一个"有就改、没有就长一个"的入口。 */
+      askOnScreen(s, {
+        id: 'ask',
+        label: `压到 ${to}%？`,
+        options: [{ id: 'yes', label: `压到 ${to}%` }, { id: 'no', label: '算了' }],
       });
       emit(s, { t: 'note', message: '模型没有把问题问出来，由系统代问' });
     }
