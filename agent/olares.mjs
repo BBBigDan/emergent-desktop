@@ -59,7 +59,7 @@ export const OPS = Object.keys(READ);
 
 /** 给模型看的 op 说明。写在这里而不是提示词里：工具 schema 离调用更近。 */
 export const OP_DOC = [
-  'apps=装了哪些应用(版本/状态/来源/CPU/内存)；cpu 和 memPct 都是 0~1，指的是**这一个应用**占节点的比例，不是整机使用率',
+  'apps=装了哪些应用(版本/状态/来源/CPU/内存)，并附整机内存 node；每个应用的 cpu/memPct 是 0~1、指它自己占节点的比例（整机看 node）',
   'app=某个应用的状态(name)',
   'catalog=市场有什么可装',
   'overview=整机负载(CPU/内存/磁盘/网络)',
@@ -249,16 +249,27 @@ export function createOlares(o = {}) {
     return remember(key, shape(op, r.data, name));
   }
 
-  /** /proc/meminfo 的 MemTotal（字节）。读不到就返回 null，不抛 */
-  async function readMemTotal() {
+  /** /proc/meminfo 的总量与可用量（字节）。读不到返回 null，不抛 */
+  async function readMemInfo() {
     try {
       const fs = await import('node:fs/promises');
       const txt = await fs.readFile('/proc/meminfo', 'utf8');
-      const m = /^MemTotal:\s+(\d+)\s+kB/m.exec(txt);
-      return m ? Number(m[1]) * 1024 : null;
+      const total = /^MemTotal:\s+(\d+)\s+kB/m.exec(txt);
+      const avail = /^MemAvailable:\s+(\d+)\s+kB/m.exec(txt);
+      if (!total) return null;
+      return {
+        total: Number(total[1]) * 1024,
+        avail: avail ? Number(avail[1]) * 1024 : null,
+      };
     } catch {
       return null;
     }
+  }
+
+  /** 只要总量 */
+  async function readMemTotal() {
+    const m = await readMemInfo();
+    return m ? m.total : null;
   }
 
   /** 节点内存总量（字节）：本机优先，overview 兜底 */
@@ -293,11 +304,12 @@ export function createOlares(o = {}) {
 
   /** apps：清单 + 占用 + 总量，合成一份 */
   async function readApps() {
-    const [mk, ap, totalBytes] = await Promise.all([
+    const [mk, ap, totalBytes, memInfo] = await Promise.all([
       run(['market', 'list', '--mine']),
       run(['dashboard', 'applications']),
       /* 分母走配额缓存（启动时已预取）。冷启动时才真去等那 8.5 秒 */
       memTotal(true),
+      readMemInfo(),
     ]);
     if (!mk.ok) {
       if (mk.error.code?.startsWith('auth_')) return { error: `Olares 不认这个身份了（${mk.error.code}），要重新授权。` };
@@ -328,6 +340,18 @@ export function createOlares(o = {}) {
       count: list.length,
       /* 总内存一起给：没有它，memPct 就是一个无法核对的百分比 */
       memTotalMB: totalBytes ? Math.round(totalBytes / 1024 / 1024) : undefined,
+      /* **整机内存使用率**。不给这个，模型会拿上面某个应用的 memPct（0.022）
+         去说"整机内存使用了大约 0.22%" —— 实测它就是这么读的，而且读得自信。
+         根因不是它笨：问"装了哪些应用"时它手里只有应用占比，想补一句整体
+         就只能猜。把整机读数一起递过去，它就不必猜。
+         （`MemAvailable` 才是"还能用多少"，`MemFree` 会把 cache 算成已用。） */
+      node: memInfo?.avail
+        ? {
+          memUsedPct: Math.round((1 - memInfo.avail / memInfo.total) * 1000) / 1000,
+          memUsedMB: Math.round((memInfo.total - memInfo.avail) / 1024 / 1024),
+          memTotalMB: Math.round(memInfo.total / 1024 / 1024),
+        }
+        : undefined,
       usageAt: ap.ok ? ap.data?.meta?.fetched_at : undefined,
     };
   }
