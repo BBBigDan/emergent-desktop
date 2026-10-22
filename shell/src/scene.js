@@ -118,7 +118,7 @@ export class FieldScene {
     /* slotStart：场之外的常驻元素（比如演示页的提问字幕）先占住 0..N，
        场景从 N 往后分配。槽位是一条直线，两个分配器各开一个必然互相覆盖。 */
     this.slotStart = o.slotStart || 0;
-    this.alloc = new SlotAllocator(6400, this.slotStart);
+    this.alloc = new SlotAllocator(this.field.poolN, this.slotStart);
     this.layers = new Map();     // id -> { spec, nodes }
     this.texts = [];             // ParticleText
     this.flows = [];             // { idx:Uint16Array, path, speed, span, s0 }
@@ -142,7 +142,7 @@ export class FieldScene {
   set(spec) {
     const f = this.field;
     const a = this.area;
-    this.alloc = new SlotAllocator(6400, this.slotStart);
+    this.alloc = new SlotAllocator(this.field.poolN, this.slotStart);
     this.layers.clear();
     this.texts.length = 0;
     this.flows.length = 0;
@@ -387,7 +387,7 @@ export class FieldScene {
     const n = pts.length;
     const start = base ?? this.alloc.alloc(n, 'shape');
     f.slotPut(start, pts, rgb(color), scl);
-    return { base: start, len: n, idx: Uint16Array.from(pts, (_, k) => ((start + k) * 7919 + 13) % 6400) };
+    return { base: start, len: n, idx: Uint16Array.from(pts, (_, k) => ((start + k) * 7919 + 13) % this.field.poolN) };
   }
 
   /**
@@ -441,10 +441,19 @@ export class FieldScene {
 
   /** 环形仪表：整圈点云，前 value 段亮，其余压暗 */
   _gauge(spec, i, count, a, reuse) {
-    const R = 52;
+    /* 横排要 (count-1) x 250 + 2R，三个仪表 750 宽 —— 半宽 668 装不下。
+       所以窄的时候改**竖排**：一列贴着场景区左侧，曲线和选项环挪到右边。
+       这不是"顺手调间距"：250 的间距缩到 200 会让两个圆环的刻度叠在一起。 */
+    const vert = a.w < 820;
+    const R = vert ? 44 : 52;
     const gap = 250;
-    const cx = a.x + a.w / 2 + (i - (count - 1) / 2) * gap;
-    const cy = this.L?.gaugeCy ?? a.y + 150;
+    const baseCy = this.L?.gaugeCy ?? a.y + 150;
+    const cx = vert
+      ? a.x + a.w * 0.26
+      : a.x + a.w / 2 + (i - (count - 1) / 2) * gap;
+    const cy = vert
+      ? baseCy + (i - (count - 1) / 2) * 168
+      : baseCy;
     const N = 180;
     const v = clamp(spec.value ?? 0, 0, 1);
     const lit = Math.max(0, Math.min(N, Math.round(v * N)));
@@ -553,7 +562,7 @@ export class FieldScene {
       this.flows = this.flows.filter((x) => x.id !== spec.id);
       this.flows.push({
         id: spec.id,
-        idx: Uint16Array.from(arr, (_, k) => ((layer.flowBase + k) * 7919 + 13) % 6400),
+        idx: Uint16Array.from(arr, (_, k) => ((layer.flowBase + k) * 7919 + 13) % this.field.poolN),
         s0: prog,
         path,
         speed: 0.22,
@@ -616,7 +625,7 @@ export class FieldScene {
 
     if (layer.base == null) {
       layer.base = this.alloc.alloc(N, `trace-${spec.id}`);
-      layer.idx = Uint16Array.from({ length: N }, (_, k) => ((layer.base + k) * 7919 + 13) % 6400);
+      layer.idx = Uint16Array.from({ length: N }, (_, k) => ((layer.base + k) * 7919 + 13) % this.field.poolN);
     }
     this._tracePoints(layer);
 
@@ -709,58 +718,76 @@ export class FieldScene {
   /** 分叉：两股流从一点分开，越靠外越散；光标是第三个吸引子 */
   _fork(spec, a) {
     const cx = a.x + a.w / 2;
-    const cy = this.L?.forkCy ?? a.y + 470;
-    const opts = (spec.options || []).slice(0, 2);
+    const cy = a.y + a.h / 2;
+    const opts = (spec.options || []).slice(0, 8);
     const layer = { spec, anchor: { x: cx, y: cy }, branches: [] };
     layer.hot = { type: 'circle', cx, cy, r: 66, gestures: ['tap'] };
-    /* 分支各自可点：两个选项共用一个锚点的话，永远分不出点了哪边。
-       必须在 branches 填好之后再把它们挂上去（见函数末尾）。 */
     this.layers.set(spec.id, layer);
 
     const f = this.field;
     const title = new ParticleText({
-      field: f, alloc: this.alloc, x: cx, y: cy - 30, size: 18, max: 14,
+      field: f, alloc: this.alloc, x: cx, y: cy - 78, size: 17, max: 12,
       color: '#93b8d8', align: 'center', font: FONT, label: `f-${spec.id}`,
     });
-    title.set(fit(spec.label, 14));
+    title.set(fit(spec.label, 12));
     layer.title = title;
 
-    opts.forEach((o, si) => {
-      const dir = si === 0 ? -1 : 1;
-      const N = 170;
-      const path = (s) => ({
-        x: cx + dir * (60 + s * 210) + Math.sin(s * 2.2) * 10,
-        y: cy + 20 + s * 62,
-      });
-      const arr = [];
-      for (let k = 0; k < N; k++) {
-        const p = path((k + 0.5) / N);
-        arr.push({ x: p.x, y: p.y, ink: 0.6 });
-      }
-      /* 槽位不够时**丢掉这条流光，留住文字** —— 分叉的文字是能点的，
-         流光只是"这条路通向哪"的提示。为一条装饰线让整屏铺不出来是最坏的选择
-         （实测：预算差 52 颗就抛异常，screen 上直接什么都不剩）。 */
-      let base = -1;
-      let idx = null;
-      try {
-        base = this.alloc.alloc(N, `fork-${o.id}`);
-        f.slotPut(base, arr, rgb(si === 0 ? COL.ok : COL.dim), 0.9);
-        idx = Uint16Array.from(arr, (_, k) => ((base + k) * 7919 + 13) % 6400);
-        this.flows.push({ id: `${spec.id}:${o.id}`, idx, s0: 0, path, speed: 0.16, jitter: 0.4 });
-      } catch { /* 挤不下就不画这条线 */ }
+    /* 方位即时间。角度是屏幕坐标：0° = 正右，顺时针为正。
+         右 330°（跨 0°）= 未来、下 60° = 现在、左 150° = 过去，各占 60°
+       上方 240° 空着 —— 那里留给"元操作"，现在没有确定的内容，宁可不放。 */
+    const R = Math.max(120, Math.min(200, a.w / 2 - 150));
+    const BAND = { next: 330, now: 60, past: 150 };
+    const COLOR = { next: '#7fb4ff', now: '#7fe3cf', past: '#e0a35c' };
+    const groups = { next: [], now: [], past: [] };
+    for (const o of opts) (groups[o.when] || groups.next).push(o);
 
-      const txt = new ParticleText({
-        field: f, alloc: this.alloc, x: cx + dir * 240, y: cy + 96, size: 16, max: 7,
-        color: si === 0 ? COL.ok : '#93b8d8', align: 'center', font: FONT, label: `fo-${o.id}`,
+    for (const key of ['next', 'now', 'past']) {
+      const list = groups[key];
+      list.forEach((o, i) => {
+        const deg = BAND[key] + ((i + 0.5) * 60) / list.length;
+        const t = (deg * Math.PI) / 180;
+        const ux = Math.cos(t);
+        const uy = Math.sin(t);
+        /* 标签不贴着实角度走，而是**吸到所属方位的那一列/那一行**：
+           右侧永远在最右一列、左侧永远在最左一列。这样"过去/现在/未来"
+           才是一眼能读出来的空间，同侧多个选项也自然排成一列。 */
+        const side = ux > 0.3 ? 1 : ux < -0.3 ? -1 : 0;
+        const bx = side ? cx + side * (R + 70) : cx + ux * (R + 70);
+        const by = cy + uy * (R + 70);
+
+        /* 连线：从主图边缘（半径 96）到标签，短促 —— 不做长流光，
+           那会和螺旋 loading 抢"哪里在动"的读法。 */
+        const N = 80;
+        const arr = [];
+        const ix = cx + ux * 96;
+        const iy = cy + uy * 96;
+        for (let k = 0; k < N; k++) {
+          const u = (k + 0.5) / N;
+          arr.push({
+            x: ix + (bx - ix) * u * 0.88,
+            y: iy + (by - iy) * u * 0.88,
+            ink: 0.62 - u * 0.42,
+          });
+        }
+        let base = -1;
+        let idx = null;
+        try {
+          base = this.alloc.alloc(N, `fork-${o.id}`);
+          f.slotPut(base, arr, rgb(COLOR[key]), 0.9);
+          idx = Uint16Array.from(arr, (_, k) => ((base + k) * 7919 + 13) % this.field.poolN);
+        } catch { /* 挤不下就不画这条线，文字优先 */ }
+
+        const txt = new ParticleText({
+          field: f, alloc: this.alloc, x: bx, y: by, size: 16, max: 8,
+          color: COLOR[key], align: 'center', font: FONT, label: `fo-${o.id}`,
+        });
+        txt.set(fit(o.label, 8));
+        layer.branches.push({
+          option: o, base, idx, text: txt, side: side || 1, when: key,
+          hot: { type: 'circle', cx: bx, cy: by, r: 66, gestures: ['pick'], option: o.id },
+        });
       });
-      txt.set(fit(o.label, 8));
-      const bx = cx + dir * 240;
-      const by = cy + 96;
-      layer.branches.push({
-        option: o, base, idx, path, text: txt, side: dir,
-        hot: { type: 'circle', cx: bx, cy: by, r: 70, gestures: ['pick'], option: o.id },
-      });
-    });
+    }
     layer.hots = [layer.hot, ...layer.branches.map((b) => b.hot)];
     return layer;
   }
@@ -803,7 +830,7 @@ export class FieldScene {
     }
     const base = this.alloc.alloc(N, `turb-${spec.id}`);
     this.field.slotPut(base, pts, rgb(COL.warn), 0.9);
-    const idx = Uint16Array.from(pts, (_, k) => ((base + k) * 7919 + 13) % 6400);
+    const idx = Uint16Array.from(pts, (_, k) => ((base + k) * 7919 + 13) % this.field.poolN);
     this.flows.push({ id: spec.id, idx, s0: 0, speed: 0, jitter: 2.4 * lv, path: (s) => ({ x: cx, y: cy }) });
     /* 一团乱点没有标签就没有意义 —— 看的人只会觉得"画面脏了"。
        标签挂在下方 46px，和乱团的抖动区域分开，不会跟着一起抖。 */

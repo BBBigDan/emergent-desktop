@@ -135,7 +135,11 @@ const STAT_DELAY = 0.30;
  * 逐粒摊开的话，同一时刻有的点已经就位、有的还在路上，看到的就是一团星云。 */
 const STAT_OPEN = 0.56;   // 到这个进度开始摊
 const STAT_DONE = 0.98;   // 摊完
-const N = RIM_END;
+/* UI 池。agent 展开后球面整批退场，这些点全让给界面用。
+   实测 stepShape 每颗约 0.027 µs：32000 颗 ~= 0.86 ms，占 60fps 帧预算 5%。
+   以前槽位池直接复用了 AMBIENT_N，界面永远只有 6400 颗可用 —— 那是耦合，不是上限。 */
+const UI_POOL = 32000;
+const N = Math.max(RIM_END, UI_POOL);
 
 /* 应用列表（launchpad）：每个应用一个图标，图标也是粒子。
  *
@@ -258,6 +262,12 @@ export class Field {
     this.rimDim = 1;
     this.rimTo = 1;
     this.drawUse = new Uint8Array(n);       // 哪几颗点被这幅画借走了
+    /* 槽位池上限 + 球面退场。两者一起决定"这一屏能写多少字"：
+       poolN 是能借多少颗，sphereDim 是球面还剩多亮（0 = 让干净了）。
+       分开是因为过渡期不同步 —— 球面要 700ms 才退完，池子必须立刻能借。 */
+    this.poolN = RIM_END;
+    this.sphereDim = 1;
+    this.sphereTo = 1;
     this.drawCol = new Float32Array(n * 3);
     this.drawMix = 0;                        // 当前混合量
     this.drawOn = 0;                         // 目标混合量
@@ -474,6 +484,24 @@ export class Field {
         this.size[i] = this.baseS[i];
         this.alpha[i] = 0;
         this.pos[i * 3] = 0; this.pos[i * 3 + 1] = 0; this.pos[i * 3 + 2] = 0;
+      } else {
+        /* 池子里多出来的那些：按球面铺开（半径更外一圈），平时 alpha = 0 不可见。
+           为什么不堆在原点：被槽位借用时弹簧从"自己的位置"拉过去，
+           堆在原点的话，第一次写字的瞬间会从屏幕正中窜出一团点。 */
+        const k = i - RIM_END;
+        const sy1 = 1 - 2 * ((k + 0.5) / (N - RIM_END));
+        const srr1 = Math.sqrt(Math.max(0, 1 - sy1 * sy1));
+        const sth1 = GOLDEN * k;
+        this.sd[i * 3] = Math.cos(sth1) * srr1;
+        this.sd[i * 3 + 1] = sy1;
+        this.sd[i * 3 + 2] = Math.sin(sth1) * srr1;
+        this.kind[i] = 0;
+        this.size[i] = this.baseS[i] = 1.1 + Math.random() * 2.1;
+        this.alpha[i] = this.baseA[i] = 0;
+        const rr = 620 + Math.random() * 500;
+        this.pos[i * 3] = this.sd[i * 3] * rr;
+        this.pos[i * 3 + 1] = this.sd[i * 3 + 1] * rr;
+        this.pos[i * 3 + 2] = this.sd[i * 3 + 2] * rr;
       }
     }
 
@@ -1835,6 +1863,18 @@ export class Field {
    * 所以界面上一个字变了，不会带动别的字重排。
    */
 
+  /** 进 / 出 agent：球面退场 + 槽位池扩到全池。
+   *  两件事必须一起做 —— 只退球面不扩池，会空出一大片没用的黑；
+   *  只扩池不退球面，球面的点会和字抢位置（一颗点不能既当球面又当字）。 */
+  setAgentMode(on) {
+    /* 缩池前必须把借用标记还干净。否则那一万多个 drawUse=1 会一直留着，
+       下次扩池时它们"自带绘制权"，在旧坐标上原地亮起来 —— 屏幕上出现一屏
+       谁也解释不了的死点。 */
+    if (!on) { this.drawUse.fill(0); this.drawN = 0; }
+    this.sphereTo = on ? 0 : 1;
+    this.poolN = on ? N : RIM_END;
+  }
+
   slotBegin(opt = {}) {
     if (!this.col0) this.col0 = this.col.slice();
     /* 先把上一轮占用过的点交还给环境。
@@ -1846,9 +1886,10 @@ export class Field {
      *
      * 交还的方式不是置 0（那会让桌面球面凹掉一块），而是恢复成环境点的
      * 基础亮度与大小 —— 它们重新成为背景的一部分，位置由球面目标拉回去。 */
-    for (let i = 0; i < AMBIENT_N; i++) {
+    for (let i = 0; i < this.poolN; i++) {
       if (this.drawUse[i] !== 1) continue;
-      this.alpha[i] = this.baseA[i];
+      /* 乘 sphereDim：球面已经退场的那些不该被"交还"成可见的点 */
+      this.alpha[i] = this.baseA[i] * this.sphereDim;
       this.size[i] = this.baseS[i];
     }
     this.drawUse.fill(0);
@@ -1867,7 +1908,7 @@ export class Field {
    * @param {number[]} col [r,g,b] 0..1
    */
   slotPut(base, pts, col, scl = 1, spawn = null, dotScale = 1) {
-    const n = AMBIENT_N;
+    const n = this.poolN;
     const cx = this.W * 0.5;
     const cy = this.H * 0.5;
     const dot = this.drawDot ?? 0.9;
@@ -1909,7 +1950,7 @@ export class Field {
 
   /** 清空一段槽位：点留在原地但亮度归零（下次输入直接复用，不飞回球面） */
   slotBlank(base, len) {
-    const n = AMBIENT_N;
+    const n = this.poolN;
     for (let k = 0; k < len; k++) {
       const slot = base + k;
       if (slot >= n) break;
@@ -2014,7 +2055,7 @@ export class Field {
 
   stepShape(dt) {
     const t = this.time;
-    const n = AMBIENT_N;
+    const n = this.poolN;
     const T = this.ta, P = this.pos, V = this.vel;
 
     /* 涡的时间包络。env 乘在**力**上而不是位移上：力退到 0 之后点还带着速度
@@ -2024,6 +2065,12 @@ export class Field {
       this.uiFade += (this.uiFadeTo - this.uiFade) * Math.min(1, dt * 6);
     } else if (this.uiFade !== this.uiFadeTo) {
       this.uiFade = this.uiFadeTo;
+    }
+    /* 球面退场 / 归位：约 700ms。快了像"啪一下关灯"，而这是一整颗球。 */
+    if (Math.abs(this.sphereDim - this.sphereTo) > 0.002) {
+      this.sphereDim += (this.sphereTo - this.sphereDim) * Math.min(1, dt * 5);
+    } else if (this.sphereDim !== this.sphereTo) {
+      this.sphereDim = this.sphereTo;
     }
 
     if (this.vorts.length) {
@@ -2122,6 +2169,11 @@ export class Field {
     const f = this.form;
 
     for (let i = 0; i < n; i++) {
+      /* 窗沿那 3600 颗由 step() 的另一段驱动（它们有自己的轮廓逻辑），这里不碰 */
+      if (i >= AMBIENT_N && i < RIM_END) continue;
+      /* 球面已退场、这颗也没被 UI 借走 -> 完全不参与：
+         不绘制、不跑弹簧、不吃涡。这是"进了 agent 就别在背后无意义地跑"的落点。 */
+      if (this.drawUse[i] !== 1 && this.sphereDim < 0.02) continue;
       const i3 = i * 3, i2 = i * 2;
       let tx, ty, z2 = 0, em = 1, szm = 1;
       /* 流线：沿"流动方向"把圆点拉长，静止画面也读得出在往哪边流（和窗口门同一套） */
@@ -2330,7 +2382,7 @@ export class Field {
       } else {
         /* occ：有窗口时压暗 —— 但改道到日冕之后（auraW→1）就不压了，
            否则窗口外面那圈会灰得看不见 */
-        sa = this.baseA[i] * dzk * 2.9 * dim * em
+        sa = this.baseA[i] * this.sphereDim * dzk * 2.9 * dim * em
           * (1 - 0.62 * this.occ * (1 - auraW))
           * (1 + 0.45 * beat);
         ss = this.baseS[i] * (0.45 + 1.5 * dzk) * szm;

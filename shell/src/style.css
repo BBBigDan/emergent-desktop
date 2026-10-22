@@ -511,3 +511,18 @@ body.agent-open .stat-zone { pointer-events: none; }
    撤掉了：遮罩会把**底部那一行读数**一起压暗（它在 y=884，离屏幕中心的垂直距离
    已经落在渐变段里），而那一行是用户唯一要读的字。
    残留只出现在"开着窗口唤出 agent"这一种情形，代价不对等。 */
+
+/* 答案页码：导航信息，不是内容，所以用 DOM 而不是粒子 */
+.ag-page {
+  position: fixed;
+  left: 50%;
+  bottom: 84px;
+  transform: translateX(-50%);
+  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.08em;
+  color: rgba(150, 180, 210, 0.5);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+body.agent-open .ag-page { opacity: 1; }

@@ -127,14 +127,31 @@ function normLayer(raw, i, taken, dropped, ctx) {
   } else if (kind === 'fork') {
     out.label = clip(raw.label, cap.label);
     const opts = (Array.isArray(raw.options) ? raw.options : [])
-      .slice(0, 2)
-      .map((o, k) => ({ id: safeId(o?.id, `o${k}`), label: clip(o?.label, cap.option) }))
+      .slice(0, 8)
+      .map((o, k) => ({
+        id: safeId(o?.id, `o${k}`),
+        label: clip(o?.label, cap.option),
+        when: ['past', 'now', 'next'].includes(o?.when) ? o.when : 'next',
+      }))
       .filter((o) => o.label);
-    if (opts.length !== 2) {
-      dropped.push(`layer[${i}] fork 必须正好 2 个带 label 的选项`);
+    if (opts.length < 2) {
+      dropped.push(`layer[${i}] fork 至少 2 个带 label 的选项`);
       return null;
     }
-    out.options = opts;
+    /* 每一类最多 4 个：60° 扇区里 4 个标签的垂直间距 29px，而标签高 20px ——
+       这是"不叠字"的下限。超了就丢，并且把丢掉的写进 dropped，
+       而不是让它悄悄消失（模型会以为它给出的选项都在屏幕上）。 */
+    const seen = { past: 0, now: 0, next: 0 };
+    const kept = [];
+    for (const o of opts) {
+      if (seen[o.when] >= 4) {
+        dropped.push(`layer[${i}] fork 的 ${o.when} 已经 4 个，丢弃「${o.label}」`);
+        continue;
+      }
+      seen[o.when] += 1;
+      kept.push(o);
+    }
+    out.options = kept;
   } else if (kind === 'condense') {
     out.text = clip(raw.text ?? raw.label, cap.text);
     if (!out.text) return null;
@@ -214,11 +231,15 @@ export function normalizeOps(raw) {
     }
     if (o.label != null) out.label = clip(o.label, TEXT_CAP.fork.label);
     if (Array.isArray(o.options)) {
-      const opts = o.options.slice(0, 2)
-        .map((x, k) => ({ id: safeId(x?.id, `o${k}`), label: clip(x?.label, TEXT_CAP.fork.option) }))
+      const opts = o.options.slice(0, 8)
+        .map((x, k) => ({
+          id: safeId(x?.id, `o${k}`),
+          label: clip(x?.label, TEXT_CAP.fork.option),
+          when: ['past', 'now', 'next'].includes(x?.when) ? x.when : 'next',
+        }))
         .filter((x) => x.label);
-      if (opts.length === 2) out.options = opts;
-      else dropped.push(`ops[${i}] options 需要正好 2 个`);
+      if (opts.length >= 2) out.options = opts;
+      else dropped.push(`ops[${i}] options 需要 2~8 个`);
     }
     if (Object.keys(out).length === 1) { dropped.push(`ops[${i}] 没有任何可改字段`); continue; }
     ops.push(out);
@@ -245,7 +266,13 @@ export function normalizePulse({ kind, at }) {
 
 const OPTION_SCHEMA = {
   type: 'object',
-  properties: { id: { type: 'string' }, label: { type: 'string', description: '≤ 8 字' } },
+  properties: {
+    id: { type: 'string' },
+    label: { type: 'string', description: '≤ 8 字' },
+    /* 选项落在环的哪个方位。左 = 过去（补细节/还技术债/修老 bug）、
+       下 = 现在（停下/验证）、右 = 未来（继续下一步）。缺省 next。 */
+    when: { type: 'string', enum: ['past', 'now', 'next'] },
+  },
   required: ['id', 'label'],
   additionalProperties: false,
 };
@@ -265,7 +292,7 @@ const LAYER_SCHEMA = {
     text: { type: 'string', description: 'condense 用，一行结论 ≤20 字' },
     data: { type: 'array', items: { type: 'number' }, description: 'trace 用，最多 280 个 0~1 的点，从左到右是时间' },
     axis: { type: 'array', items: { type: 'number' }, description: 'trace 用，[最小值, 最大值]；缺省 0~1' },
-    options: { type: 'array', items: OPTION_SCHEMA, description: 'fork 用，正好 2 个' },
+    options: { type: 'array', items: OPTION_SCHEMA, description: 'fork 用，2~8 个；每个标 when: past/now/next（左=过去/下=现在/右=未来）' },
     color: { type: 'string', description: '可省略。#RRGGBB' },
   },
   required: ['id', 'kind'],
@@ -291,7 +318,7 @@ const OP_SCHEMA = {
     progress: { type: 'number', description: 'stream 的新进度 0~1' },
     data: { type: 'array', items: { type: 'number' }, description: 'trace 的新数据' },
     label: { type: 'string', description: '换文字（fork 换问法就用这个）' },
-    options: { type: 'array', items: OPTION_SCHEMA, description: 'fork 换两个选项' },
+    options: { type: 'array', items: OPTION_SCHEMA, description: 'fork 换选项（2~8 个，各带 when）' },
   },
   required: ['id'],
   additionalProperties: false,

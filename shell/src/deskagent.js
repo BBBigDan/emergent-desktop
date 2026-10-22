@@ -21,6 +21,7 @@ import { renderSurface } from './surface.js';
 import { compileDraw } from './draw.js';
 import { ParticleText, SlotAllocator } from './pui.js';
 import { createAnswer } from './answer.js';
+import { createFace } from './face.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
 import { GestureTracker, describe } from './gesture.js';
@@ -263,24 +264,17 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let head = null;
   let ask = null;   // 用户那一行（输入行）
   let ans = null;   // 模型那一块（上面的大字）
-  let ringBase = -1;
+  let face = null;   // loading 区：小表情 / 在想
   let scene = null;
 
-  /* 槽位预算。场里一共 6400 颗，四家用：
-       问（下面那一行）  22 字 × 36 = 792
-       答（上面那一块）  按档位，见下
-       "在想"的环         260
-       场景              剩下的（仪表 / 曲线 / 分叉 —— 它是这几个里最贪的）
-     数字不能拍：给少了 ParticleText 会静默截字（"标签少一截"），场景里还有几处
-     直接 alloc 的点云，给少了会直接抛异常、整屏不铺。所以按档位分开算：
-       有场景（compact）→ 答案 1900（22px × 2 行 = 43 字），场景拿回 ~3450
-       没场景（big）    → 答案 3600（32px × 3 行 × 20 字 = 60 字），场景反正空着
-     1650/2700 是上一版：45 字的回答在 compact 档被切掉一截（"那个重启"没说完），
-     而实测场景只用到 1972 颗 —— 空着的槽位不该让字去承担。
+  /* 槽位总账（池子 32000，见 field.js 的 UI_POOL）：
+       问           22 字 × 36 = 792      —— 先拿，它在输入行、位置固定
+       loading 区    300
+       答案         18600                —— 20px × 2 × 400 字
+       场景         11000                —— 仪表 / 曲线 / 分叉环
+       余量         ~1300                —— 某一层超配时不至于整屏不铺
+     "问"必须先拿：被场景挤掉就等于用户看不到自己刚问过什么。 */
 
-     "问"那一行**先拿**：它固定在输入行、只占一行，被场景挤掉就等于用户
-     看不到自己刚问过什么 —— 那比少画一个仪表严重得多。 */
-  const ANS_SLOTS = { big: 3600, compact: 1900 };
   /* 背景那 6400 颗还留多亮。这个数是**压暗比例**，越大越暗（见 field.js 的 drawDim）：
        0.84 → 背景剩 16%，桌面态的数（球面还在、但不抢戏）
        0.94 → 剩 6%，agent 展开、屏幕上要读字的时候用这个
@@ -295,45 +289,52 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
      从字缝里冒出来，读起来比输出时更糊 —— 那正是用户说的"什么都看不出来"。
      空屏才需要明显的云（38%），因为那时屏幕上没有别的东西可看。 */
   const ENV_DIM_THINK_BUSY = 0.82;
-  const RING_SLOTS = 220;   // 140 颗绕一圈太稀，像撒了一把芝麻（实测）
-  /* 环用青色：和内容的白/蓝明确分开。这圈不是内容，是"它在做" */
-  const RING_RGB = [0.50, 0.89, 0.82];
-
-  /* 用户那一行（"问"）：占输入框那一行，18px、暗色、单行。
+  /* loading 区的槽位。300 够 260 颗的螺旋 + 一圈光尘；
+     它和答案块抢的是同一段槽位，所以数字要记在总账里（见 ANS_SLOTS）。 */
+  const FACE_SLOTS = 300;
+  /* 用户那一行（"问"）：18px、暗色、单行。
      它是和答案块分开的第二块字，不是答案块的降级版。 */
   const ASK_SIZE = 18;
   const ASK_CHARS = 22;
 
-  /* 答案块有两种规格：
-       big     —— 没有场景时，字大、行宽，占满输入框上面那块空地
-       compact —— 有场景时，让位给仪表/曲线：字号降下来、行数压到 2 行
-     为什么要有两档：字越大每字吃的点越多，一屏 6400 颗同时养三行大字和三个仪表是
-     养不下的。与其两边都糊，不如按"这一屏到底要读什么"分档。 */
-  let modeNow = 'big';   // 当前档位（场景有没有在决定）
-  const ANS_MODE = {
-    big: { size: 32, lh: 44, lines: 3, maxWidth: 620 },
-    compact: { size: 22, lh: 34, lines: 2, maxWidth: 560 },
-  };
+  /* 答案块的槽位：20px x 2 = 40 颗/字。
+     一页 400 字 = 16000；上限 14 行 x 33 字 = 462 字 = 18480，所以给 18600。 */
+  const ANS_SLOTS = 18600;
 
-  function ansMode() {
-    return scene && scene.layers.size > 0 ? 'compact' : 'big';
+  let areaA = null;   // 态 A：场景满宽
+  let areaB = null;   // 态 B：场景只占右半
+
+  /* 内容区：1440 基准下 1360 x 692。
+     上边 68 留给状态区（36 + 12 间距），下边留到输入行上方。 */
+  function contentArea() {
+    const W = innerWidth;
+    const H = innerHeight;
+    const w = Math.min(1360, W - 80);
+    return {
+      x: Math.round((W - w) / 2),
+      y: 68,
+      w,
+      h: Math.max(360, H - 140 - 68),
+    };
   }
 
-  /** 答案块的几何：底部贴输入框往上长；宽度取屏幕和某个上限的较小者 */
+  /* loading 区：场景区左上角，200 x 88 里的一小块。表情 48 摆在里面偏左。 */
+  function faceGeom() {
+    return { x: area.x + 52, y: area.y + 44, size: 48, slots: FACE_SLOTS };
+  }
+
+  /* 答案块：左半屏居中，20px / 26 行高 / 33 字一行 / 14 行 / 400 字一页 */
   function ansGeom() {
-    const m = ANS_MODE[ansMode()];
-    const W = innerWidth;
-    /* 大字档没有场景，块就该站在屏幕中间偏下（H×0.60）：
-       太高像标题、太低挤着输入框。有小场景时压在输入框上方一行，
-       让上面的仪表说话。 */
-    const baseY = ansMode() === 'big'
-      ? Math.round(innerHeight * 0.60) + ((m.lines - 1) * m.lh) / 2
-      : lineY - 84;
+    const a = contentArea();
+    const half = (a.w - 24) / 2;
     return {
-      ...m,
-      maxChars: Math.floor(m.maxWidth / m.size) + 1,
-      cx: Math.round(W / 2),
-      baseY,
+      size: 20, lh: 26, lines: 14,
+      /* 每行字数要按"字宽 + 字距"算，不能只除字号：汉字之间有一格字距，
+         33 字 × 20 看着是 660，实际排出来 726 —— 会直接压过中线进到场景区。 */
+      maxChars: Math.max(8, Math.floor((half - 40) / (20 * 1.08))),
+      maxWidth: half - 32,
+      cx: Math.round(a.x + half / 2),
+      centerY: Math.round(a.y + a.h / 2),
     };
   }
 
@@ -341,19 +342,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     const W = innerWidth;
     const H = innerHeight;
     lineY = H - 116;
-    const g = ansGeom();
-    /* 场景能用到哪：答案块上面 24px 为止。h 不至于小到仪表和曲线挤在一起
-       （band 里有硬下限），所以给一个 460 的地板，宁可让场景贴紧一点也不重叠。 */
-    const ansTop = g.baseY - (g.lines - 1) * g.lh - g.size;
-    const bottom = ansTop - 26;
-    const h = Math.max(460, Math.min(560, bottom - 56));
-    const w = Math.min(920, Math.max(600, W - 120));
-    area = { w, h, x: Math.round((W - w) / 2), y: Math.max(48, bottom - h) };
-    area.h = bottom - area.y;
-
-    /* 记录入口贴在场的外侧下角 —— 它属于"这一层"的控件，不悬在屏幕角落 */
+    const a = contentArea();
+    const half = (a.w - 24) / 2;
+    areaA = { ...a };
+    areaB = { x: a.x + half + 24, y: a.y, w: half, h: a.h };
+    /* 态由"有没有答案"决定 —— 不是由场景有没有内容。
+       用场景判断的话，模型只说话不出图时整屏会一直停在满宽，答案块没地方站。 */
+    area = ans && ans.text ? areaB : areaA;
+    /* 记录 / 停止：贴输入行的右端，不再挂在场角 */
     histBtn.style.top = `${lineY - 42}px`;
-    histBtn.style.right = `${Math.max(26, W - area.x - area.w + 10)}px`;
+    histBtn.style.right = '26px';
     stopBtn.style.top = histBtn.style.top;
     stopBtn.style.right = histBtn.style.right;
   }
@@ -365,16 +363,21 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        （实测：回答出来之后，占位语那半句一直浮在上面）。 */
     if (ans) ans.clear();
     if (ask) ask.clear();
-    head = new SlotAllocator(6400, 0);
+    head = new SlotAllocator(field.poolN, 0);
     /* 问在前：它在最下面、位置固定、只占一行。槽位是一条直线，谁先拿谁拿全额 */
     ask = new ParticleText({
       field, alloc: head, x: Math.round(innerWidth / 2), y: lineY,
       size: ASK_SIZE, max: ASK_CHARS, color: ASK_COLOR, align: 'center',
       font: FONT, weight: 300, label: 'ask',
     });
-    ans = createAnswer({ field, alloc: head, reserve: ANS_SLOTS[modeNow] });
+    /* loading 区先于答案块分配：位置固定、只占 300 格。
+       被答案挤掉就等于"它不在了"，而这张小脸是屏幕上唯一的在场信号。 */
+    if (face) face.dispose();
+    face = createFace({ field, alloc: head, slots: FACE_SLOTS });
+    face.layout(faceGeom());
+    ans = createAnswer({ field, alloc: head, reserve: ANS_SLOTS });
     ans.layout(ansGeom());
-    ringBase = head.alloc(RING_SLOTS, 'think-ring');
+
     /* 场从常驻元素之后开始分配：槽位是一条直线，两个分配器各开一个必然互相覆盖 */
     scene = new FieldScene({ field, area, a11y, slotStart: head.used, envDim: ENV_DIM_AGENT });
   }
@@ -382,28 +385,27 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /* 场景出现/消失时，答案块要换档（big ⇄ compact）。换档只动字块，不动场景。
      只在档位**真的变了**时重排：每次 patch 都重排会让字闪一下，而 patch 是
      读数在跳的时候每秒都会来的东西。 */
-  function reflowAnswer() {
-    const m = ansMode();
-    if (!ans || m === modeNow) return;
-    /* 两档的槽位预算不一样，换档只能整套重开（allocator 是一条直线，
-       开出去收不回来）。重开之后场景和那句话都要重新铺一次。 */
-    const spec = scene?.spec;
-    const text = ans.text;
-    modeNow = m;
-    build();
-    /* 重开之后先清一次槽位所有权：旧的那几行字住的是**同一段槽号**，
-       新块只写它用到的那些格子 —— 写不到的就原地留着，屏幕上出现一块
-       旧字的化石（实测："我看一眼。" 上浮着一截 "这台"）。 */
-    field.slotBegin({ dim: ENV_DIM_AGENT, dot: 0.95 });
-    if (spec) scene.set(spec);
-    /* 重建之后两块字都要补：ask 是新的 ParticleText，say 是新的块 */
-    if (askText) ask?.set(askText, { instant: true, color: ASK_COLOR });
-    if (text) speak(text, { instant: true });
+  /* 态切换（满宽 ⇄ 分栏）：不是"换字号档"，是**场景让出半边**。
+     场景要按新 area 重铺一次，答案块也跟着换到左半的中点。 */
+  function applyMode() {
+    if (!ans) return;
+    const want = ans.text ? areaB : areaA;
+    if (!want) return;
+    /* 比的是**场景当前用的** area，不是全局那个 —— 全局 area 在 measure 里早已
+       被改成新值，拿它比较会永远得出"没变"，场景就一直按旧的满宽铺着不收缩。 */
+    const changed = !scene || !scene.area || scene.area.w !== want.w || scene.area.x !== want.x;
+    area = want;
+    if (scene) {
+      scene.area = area;
+      if (changed && scene.spec) scene.set(scene.spec);
+    }
+    face?.layout(faceGeom());
+    ans.layout(ansGeom());
   }
 
   /* 场景铺完：先换档，再把这句字幕写回去（换档会重建字块，字是新长出来的） */
   function afterScene() {
-    reflowAnswer();
+    applyMode();
     reassertLine();
     /* 场景铺出来了：加载圈收掉（它只在空屏时代表"在想"），背景也降回
        有内容时的亮度 —— 内容一出现，屏幕上的主角就换成它 */
@@ -422,73 +424,26 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
    * 它在答案块的位置上转，所以"回答出现"这件事就是圆心那圈收束成字 ——
    * 同一个位置，同一批粒子，不需要额外的过场动画。
    */
-  let ringRAF = 0;
-  let ringT0 = 0;
-  let ringFade = 0;
-  let ringLit = false;   // 环真的亮过（决定收的时候要不要补那一脚）
-
-  function ringFrame() {
-    const cx = innerWidth / 2;
-    /* 贴在答案块上沿再往上 92px：压在字上就成了"字里有个洞" */
-    const cy = Math.max(area.y + 64, (ans?.top ?? lineY - 120) - 92);
-    const t = (performance.now() - ringT0) / 1000;
-    ringFade = Math.min(1, ringFade + 0.05);
-    const pts = [];
-    /* 三条臂，各自转速略有差异 —— 一个正圆读成 spinner，三臂旋转读成"云在搅"。
-       臂只占 1.35 rad（约 77°），所以整圈是"三段光弧"在转，中间是空的：
-       空心的圆心才有地方交给马上要出现的字。 */
-    const ARMS = 3;
-    const per = Math.ceil(RING_SLOTS / ARMS);
-    for (let i = 0; i < RING_SLOTS; i++) {
-      const arm = i % ARMS;
-      const k = Math.floor(i / ARMS) / per;              // 0..1：沿这条臂的位置
-      /* 每条臂只占 0.95 rad（约 54°）：三段短弧才像"彗星在绕"，连成大半圈
-         就退化成一条抖动的手绘圆（第一版 1.35 rad 就是这样） */
-      const a = (arm / ARMS) * Math.PI * 2 + t * (1.45 + arm * 0.28) + k * 0.95;
-      /* 半径带一点起伏：正圆会读成 spinner，起伏会读成"云在动" */
-      const rr = 96 + Math.sin(k * 7 + t * 2.2 + arm) * 6 + Math.sin(t * 3.1) * 2.5;
-      /* 头亮尾淡：指数决定彗尾多长。6 时只剩末尾七八颗（像撒了把芝麻），1.6 才有尾巴 */
-      const trail = Math.pow(1 - k, 1.6);
-      pts.push({
-        x: cx + Math.cos(a) * rr,
-        y: cy + Math.sin(a) * rr * 0.9,
-        ink: 0.06 + 0.94 * trail,
-      });
-    }
-    /* 第 6 个参数是点径倍数：环要和"云"明显分得开，靠两点 —— 更亮、更大。
-       1.8 是"看得见但没糊成一条实线"的位置（再大就成了三根荧光棒）。 */
-    field.slotPut(ringBase, pts, RING_RGB, 1.35 * ringFade, null, 1.8);
-    ringRAF = requestAnimationFrame(ringFrame);
-  }
-
+  /* ───────────────── "在想" ─────────────────
+   *
+   * 它不再是一圈环，而是 loading 区那张小表情散开、重组成三种形态的叠加：
+   * 螺旋给结构、云给厚度、流给方向（见 face.js）。只有一圈的话，读起来是
+   * "加载图标"；三层叠起来才像"一团粒子在动"。
+   *
+   * ringOn / ringOff 这两个名字留着，因为 setThink 里已经有一串引用点；
+   * 现在它们只是 face 的开关 + 一次收尾冲量。
+   */
   function ringOn() {
-    if (ringRAF || ringBase < 0) return;
-    /* 屏幕上有场景时不转圈：场景自己就在动，再叠一圈会正好压在分叉的连线上
-       （实测截图：环和"要看看 n8n 吗"的连线缠在一起，两边都读不清）。
-       空屏才需要"它在想"的提示；有内容的时候，内容的出现本身就是提示。 */
-    if (scene && scene.layers.size > 0) return;
-    ringT0 = performance.now();
-    ringFade = 0;
-    ringLit = true;
-    ringRAF = requestAnimationFrame(ringFrame);
+    face?.setLoading(true);
   }
 
   function ringOff() {
-    /* 没在转就什么都不做。这个函数会在每条 say / 每次场景落地时被调用，
-       而它下面那个冲量会真的把环境点往外推一下 —— 平白无故让屏幕"噗"一下
-       （实测：模型只说一句话，背景也抖了一下）。 */
-    const was = ringRAF || ringLit;
-    if (ringRAF) { cancelAnimationFrame(ringRAF); ringRAF = 0; }
-    if (!was && ringBase < 0) return;
-    if (ringBase >= 0) field.slotBlank(ringBase, RING_SLOTS);
-    ringLit = false;
-    if (!was) return;
-    /* 涡停下的地方会留一坨挤在一起的点 —— 因为涡把它们甩到圆心附近，
-       停了之后没有东西再把它们推回去，屏幕上就是一块"不该在那儿的雾"
-       （实测：回答出现后，圆心位置浮着一片读不出来的残字）。
-       这里补一次向外的小冲量，让它们自己散回球面。 */
-    const cy = Math.max(area.y + 64, (ans?.top ?? lineY - 120) - 92);
-    field.impulse(innerWidth / 2, cy, { r: 260, power: 320 });
+    if (!face?.loading) return;
+    face.setLoading(false);
+    /* 收的时候补一次向外的小冲量：转过的点会挤在中心附近，
+       没有东西再把它们推回去，屏幕上就是一块"不该在那儿的雾"。 */
+    const g = faceGeom();
+    field.impulse(g.x, g.y, { r: 180, power: 240 });
   }
 
   /* ───────────────── 两句话：问在下面，答在上面 ─────────────────
@@ -525,13 +480,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /** 答：写进上面那块。整屏唯一会逐字生长的地方 */
   function speak(txt, opt = {}) {
     let s2 = String(txt ?? '');
-    /* 上限交给服务端（64 字）。这里只兜住极端情况：再长也读不完 */
-    if (Array.from(s2).length > 120) s2 = Array.from(s2).slice(0, 120).join('');
+    /* 上限交给服务端（1200 字 = 三页）。这里只兜住极端情况：
+       分页之后一屏能读 400 字，再长就是"读不完"，而不是"排不下"。 */
+    if (Array.from(s2).length > 2000) s2 = Array.from(s2).slice(0, 2000).join('');
     sayText = s2;
     sayColor = opt.color || SAY_COLOR;
     if (!ans) return;
-    if (opt.instant) { ans.set(s2, { instant: true, color: sayColor }); return; }
-    ans.set(s2, { color: sayColor });
+    if (opt.instant) ans.set(s2, { instant: true, color: sayColor });
+    else ans.set(s2, { color: sayColor });
+    updateFooter();
   }
 
   /** 槽位重开/换档之后两块字都要写回去（否则"收起再展开"像失忆） */
@@ -751,7 +708,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
           scene.set(m.scene);
           if (m.ops) scene.patch(m.ops);
           /* 场景回来了，答案块要重新挑规格（big ⇄ compact） */
-          reflowAnswer();
+          applyMode();
           /* 先清再写：新的一句比原来短时，旧字的残余点会留在原地 */
           ans.set('', { instant: true });
           /* 上一轮"问"从记录里捞回来：只恢复模型的回答，重连后就像
@@ -775,6 +732,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 它一开口，"在想"那圈就该收了：圆心要腾出来给字 */
         ringOff();
         speak(m.text);
+        /* 第一次有答案 → 内容区从满宽切成左右分栏。以前这一步只在"场景落地"时做，
+           模型只说话不出图时整屏会一直停在满宽，答案块没地方站。 */
+        applyMode();
         histPush('a', m.text);
         insp('say', m.text, 'say');
         break;
@@ -1083,13 +1043,36 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
     /* ↑ 看刚才说过什么（输入框空着才让位：里面有字时 ↑ 是"我要改这句话"） */
     if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing) { e.preventDefault(); openHist(); }
-    if (e.key === 'ArrowDown' && histOpen) { e.preventDefault(); closeHist(); }
+    if (e.key === 'ArrowDown' && histOpen) { e.preventDefault(); closeHist(); return; }
+    /* 输入框空着时 ↓/↑ 翻答案的页。里面有字时 ↓/↑ 属于"我要改这句话"，
+       不去抢 —— 抢了就会出现"打着字突然翻页"。 */
+    if (e.key === 'ArrowDown' && !typeEl.value && !e.isComposing) {
+      if (ans?.goPage(1)) { e.preventDefault(); updateFooter(); }
+    }
+    if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing && !histOpen) {
+      if (ans?.goPage(-1)) { e.preventDefault(); updateFooter(); }
+    }
   });
   typeEl.addEventListener('input', () => {
     /* 输入回显只进输入行，绝不进上面那块（那正是"用户的输入跑到上面去了"）。
        回显必须瞬时：逐字生长是"它刚想好"的语法，用在打字上就是卡顿。 */
     echo(typeEl.value);
   });
+
+  /* ───────────────── 翻页 ─────────────────
+   * 页码是**导航信息**，不是内容：用 DOM 一行小字，不占粒子槽位。
+   * 画成粒子的话它会和正文抢同一段槽位，而且"还有几页"不需要长在点阵里。
+   */
+  let pageEl = null;
+  function updateFooter() {
+    if (!pageEl) {
+      pageEl = document.createElement('div');
+      pageEl.className = 'ag-page';
+      document.body.appendChild(pageEl);
+    }
+    const n = ans?.pageCount ?? 1;
+    pageEl.textContent = n > 1 ? `${(ans?.page ?? 0) + 1} / ${n}   ↓ 翻页` : '';
+  }
 
   /* ───────────────── 手势 → 意图 ───────────────── */
 
@@ -1161,6 +1144,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (open || busyAnim) return;
     open = true;
 
+    /* 先扩池、再 build。allocator 的容量在构造那一刻定死，晚一步就还是旧上限
+       —— 表现是"池子扩到 32000 了，但这一屏还是只写得下 6400 的字"。 */
+    field.setAgentMode(true);
     if (!scene) build();
 
     /* 接管这 6400 颗粒子的绘制权。
@@ -1175,6 +1161,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
      * 看着像透过一层星尘看字。0.84 把球压回"桌面还在那儿"的底噪；
      * 现在要读的是三行 32px 的字，用 ENV_DIM_AGENT（0.94，剩 6%）——
      * 用户的原话："背景里的粒子也可以使用或者消失掉"。 */
+    /* 先退球面、再接管：球面那 6400 颗在 agent 模式下整批让给界面，
+       不绘制、也不跑球面弹簧（field.setAgentMode 两件事一起做）。 */
     field.slotBegin({ dim: ENV_DIM_AGENT, dot: 0.95 });
 
     /* 从底部长出来：先让粒子"还没成形"，set 之后再把相干度拉回来。
@@ -1183,6 +1171,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.setStiff(2.3);
 
     layer.hidden = false;
+    face?.start();
     document.body.classList.add('agent-open');
     /* 底边那条光已经完成了它的使命（用户就是点它进来的），
        场展开后它再亮着就成了"屏幕上多了一个控件"。 */
@@ -1230,6 +1219,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        而用户已经离开这一层了，桌面球没有理由还在转。 */
     field.vorts.length = 0;
     field.clearDraw();
+    face?.stop();
+    /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
+    field.setAgentMode(false);
     closeSurface();
     clearTimeout(drawTimer);
     drawTimer = 0;
@@ -1383,8 +1375,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       open, thinking, busy, pendingApproval,
       slots: scene?.alloc.used ?? 0,
       ask: askText, say: sayText,
-      answer: ans ? { mode: modeNow, used: ans.used, cap: ans.capacity, typing: ans.typing } : null,
-      ring: !!ringRAF,
+      answer: ans ? { mode: ans.text ? 'split' : 'wide', page: ans.page, pages: ans.pageCount, used: ans.used, cap: ans.capacity, typing: ans.typing } : null,
+      ring: !!face?.loading,
+      mood: face?.mood,
       layers: scene ? [...scene.layers.keys()] : [],
       spec: scene?.spec?.layers?.map((l) => l.kind + ':' + l.id).join(' ') || '',
     }),
