@@ -39,7 +39,11 @@ export const LIMITS = {
 
 /** 各 kind 的文字上限（字）。与 scene.js 里 ParticleText 的 max 一一对应。 */
 export const TEXT_CAP = {
-  gauge: { label: 4 },
+  /* gauge 的 label 以前是 4 —— 那是按"CPU / 内存 / 磁盘"三个汉字估的。
+     但仪表现在经常是**应用占用**，`navidrome` / `qbittorrent` 在这里被截成
+     `navi` / `qbit`，用户认不出是哪个应用（2026-10-22 线上）。
+     宽度的活交给前端 `fitLabel`（按 px 算，竖排 120px），这里只挡"模型写一整句话"。 */
+  gauge: { label: 12 },
   stream: { label: 12 },
   trace: { label: 12 },
   fork: { label: 14, option: 8 },
@@ -285,7 +289,7 @@ const LAYER_SCHEMA = {
     /* 一个字段服务多种 kind，是因为 models 对 oneOf 的支持很差：
        用 oneOf 时便宜模型经常整段 spec 都不生成了。宁可 schema 宽一点，
        由 normalizeSpec 按 kind 二次收紧。 */
-    label: { type: 'string', description: 'gauge ≤4 字，stream/trace ≤12 字，fork ≤14 字' },
+    label: { type: 'string', description: 'gauge ≤12 字（应用就写真名），stream/trace ≤12 字，fork ≤14 字' },
     value: { type: 'number', description: 'gauge 用，0~1 的比例' },
     progress: { type: 'number', description: 'stream 用，0~1 的比例' },
     level: { type: 'number', description: 'turbulence 用，0~1，越大越乱' },

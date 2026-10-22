@@ -190,7 +190,10 @@ export function defaultOverview(status = {}, apps = [], reading = '', trend = nu
        这时仪表该量什么？量**每个应用占了多少内存**：
        圆环大小=占比，标签=应用名。这是编码器能表达的、最接近答案的形状。
        （不能拿"装了 3 个"去填一个 0~1 的仪表，那不是比例。） */
-    gauges = apps.slice(0, 3).map((a) => ({ label: String(a.name).slice(0, 4), value: a.memPct ?? 0 }));
+    /* 标签**不截**：`navidrome` 截成 4 字符就是 `navi`，用户认不出是哪个应用。
+       宽度的活交给前端 `fitLabel`（按 px 算，竖排 120px 放得下 `qbittorrent`）——
+       在这里按字数切，切掉的正是"这块表说的是谁"那部分信息。 */
+    gauges = apps.slice(0, 3).map((a) => ({ label: String(a.name), value: a.memPct ?? 0 }));
     /* 这里**不要**再加一句 note。
        兜底屏的 reading 本身就会以 say 的形式说出来（"3 个应用在跑"），
        再挂一个内容相同的 condense，屏幕上就是同一句话出现两次 ——
@@ -720,7 +723,7 @@ export function makeTools(o = {}) {
           items: {
             type: 'object',
             properties: {
-              label: { type: 'string', description: '≤4 字，例如 CPU / 内存 / 磁盘' },
+              label: { type: 'string', description: '应用名或指标名，≤12 字。**应用要写真名**（navidrome，不是 navi）——缩写用户认不出是哪个' },
               value: { type: 'number', description: '0~1 的比例，不是百分数' },
             },
             required: ['label', 'value'],
