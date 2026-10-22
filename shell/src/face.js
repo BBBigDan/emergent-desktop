@@ -161,6 +161,7 @@ export function createFace({ field, alloc, slots = 300 }) {
 
   let mood = 'calm';
   let loading = false;
+  let busy = false;        // 一轮在跑（含逐字输出）
   let blend = 0;          // 0 = 表情，1 = 螺旋
   let raf = 0;
   let t0 = 0;
@@ -170,6 +171,7 @@ export function createFace({ field, alloc, slots = 300 }) {
   let nextBlink = 0;
   let blinkUntil = 0;
   let nextMood = 0;
+  let alertUntil = 0;
 
   function layout(o) {
     cx = o.x;
@@ -190,9 +192,16 @@ export function createFace({ field, alloc, slots = 300 }) {
     }
     const blink = now < blinkUntil;
 
-    /* 换表情：只在 idle，8~15 秒一次 */
-    if (!loading && now > nextMood) {
-      const pool = ['calm', 'calm', 'sleepy', 'speak'];
+    /* 换表情只在 idle —— 一边转一边换脸，读起来是"它没在听"。
+       三条优先级：告警 > 正在跑（说话/在想）> 空闲轮换。 */
+    if (now < alertUntil) {
+      mood = 'alert';
+    } else if (!loading && busy) {
+      /* 逐字输出时嘴随字开合。节拍跟的是同一个 t，不另设计时器 ——
+         两份节拍必然漂移，而漂移的表现是"嘴和字不同步"。 */
+      mood = 'speak';
+    } else if (!loading && now > nextMood) {
+      const pool = ['calm', 'calm', 'sleepy'];
       mood = pool[Math.floor(Math.random() * pool.length)];
       nextMood = now + 8000 + Math.random() * 7000;
     }
@@ -262,6 +271,13 @@ export function createFace({ field, alloc, slots = 300 }) {
     start,
     stop,
     setMood(m) { mood = m; nextMood = performance.now() + 8000 + Math.random() * 7000; },
+    /** 一轮在跑：逐字输出时锁定"说话"表情（§7.3：思考与输出期间不换表情） */
+    setBusy(on) {
+      busy = !!on;
+      if (!busy) nextMood = performance.now() + 3000;
+    },
+    /** 告警：红脸 3.5 秒后自己回到常态 —— 工具失败不该永久改变它的表情 */
+    alert(ms = 3500) { alertUntil = performance.now() + ms; },
     setLoading(on) {
       loading = !!on;
       if (!loading) nextMood = performance.now() + 3000;

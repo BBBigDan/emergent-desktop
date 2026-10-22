@@ -136,9 +136,11 @@ const STAT_DELAY = 0.30;
 const STAT_OPEN = 0.56;   // 到这个进度开始摊
 const STAT_DONE = 0.98;   // 摊完
 /* UI 池。agent 展开后球面整批退场，这些点全让给界面用。
-   实测 stepShape 每颗约 0.027 µs：32000 颗 ~= 0.86 ms，占 60fps 帧预算 5%。
-   以前槽位池直接复用了 AMBIENT_N，界面永远只有 6400 颗可用 —— 那是耦合，不是上限。 */
-const UI_POOL = 32000;
+   实测 stepShape 每颗约 0.027 µs：56000 颗 ≈= 1.5 ms，占 60fps 帧预算 9%。
+   以前槽位池直接复用了 AMBIENT_N，界面永远只有 6400 颗可用 —— 那是耦合，不是上限。
+   为什么是 56000 而不是 32000：一个汉字要 90 颗才读得出来（见 pui.js 的 glyphBudget），
+   320 字一页就是 28800，加上场景就不够了。这个数是"字能读"倒推出来的。 */
+const UI_POOL = 56000;
 const N = Math.max(RIM_END, UI_POOL);
 
 /* 应用列表（launchpad）：每个应用一个图标，图标也是粒子。

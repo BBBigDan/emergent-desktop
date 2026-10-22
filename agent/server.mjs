@@ -167,10 +167,32 @@ const memory = createMemory({
   },
 });
 
+/* 状态区要的那个「16 条」。
+ *
+ * 为什么不在每次 hello 里现算：`stats()` 要遍历整张边表（每条 'about' 边都要取一次
+ * 目标节点），记忆库大到几千条时那是一次几十毫秒的同步开销，而它只是屏幕上一行
+ * 11px 的小字。15 秒缓存 + 轮末强制刷新 —— 用户看到的"刚记住一条"照样会变。
+ *
+ * 它**不进模型上下文**：这是给人看的数字，不是给模型的提示。
+ */
+let memCache = { at: 0, v: null };
+async function memBrief(force = false) {
+  if (!force && memCache.v && Date.now() - memCache.at < 15000) return memCache.v;
+  let v = { on: false, facts: 0, last: null, recent: null };
+  try {
+    if (memory.ok) {
+      const s = await memory.stats();
+      const r = s.recent?.[0];
+      v = { on: true, facts: s.facts || 0, last: r?.when || null, recent: r?.text || null };
+    }
+  } catch { /* 记忆挂了不影响说话 —— 这条链上任何失败都只是那一格空着 */ }
+  memCache = { at: Date.now(), v };
+  return v;
+}
+
 /** 记忆上下文拼进**第一条 system**，而不是另起一条 system。
  *  另起一条在 OpenAI 兼容服务上不一定被接受（有的只认第一条 system），
- *  而"改了第一条的内容"在协议上永远安全。 */
-/* ───────────────────────── 自造工具 ─────────────────────────
+ *  而"改了第一条的内容"在协议上永远安全。 *//* ───────────────────────── 自造工具 ─────────────────────────
  * 用户目录下的 ~/Agent/tools（脚本 + manifest）和 ~/Agent/skills（做法）。
  * 和记忆一样是可降级的：没挂上用户目录就只有内置工具，对话照常。 */
 /* TOOLBOX_HOME 只给本地调试用：没有 /userspace 时也能把工具落到一个干净的目录里 */
@@ -1440,6 +1462,9 @@ async function runTurn(s, goal) {
          再往观察窗里插一行就重复了。 */
       emit(s, { t: 'usage', ...u, final: true });
     }
+    /* 记忆条数：一轮结束后抽取器可能刚记住一条新的，状态区那一格要跟着变。
+       放在 idle 之前，和 usage 同一个理由（idle 之后到来会闪一下）。 */
+    emit(s, { t: 'mem', ...(await memBrief(true)) });
     emit(s, { t: 'idle' });
     scheduleSave(s);         // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
   }
@@ -1552,6 +1577,9 @@ const server = http.createServer(async (req, res) => {
       /* 一连上就把账本交出去：刷新、换标签页、隔夜回来，用户第一眼
          就该看到"这个会话已经用掉多少"，而不是等下一轮才发现。 */
       usage: s.meter?.snap() || null,
+      /* 记忆条数 —— 状态区那一格。它和 usage 并排出现，因为它们都是
+         "这个会话现在怎么样"，而不是"它刚说了什么"。 */
+      mem: await memBrief(),
     });
     /* 重连/刷新：把上一屏原样还回去。它必须是"已经在那儿"的状态，
        不是重新长一遍 —— 用户没有发起任何事，不该看到一场动画。

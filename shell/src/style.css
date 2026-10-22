@@ -339,27 +339,49 @@ body.launching .rail-zone { display: none; }
 .ag-insp i { color: rgba(147, 184, 216, .28); font-style: normal; }
 .ag-insp .ln.dim { opacity: .3; }
 
-.ag-stat {
-  position: fixed; right: 24px; top: 20px; text-align: right;
-  font: 10.5px/1.7 ui-monospace, Menlo, monospace;
-  color: rgba(147, 184, 216, .4); pointer-events: none;
+/* ── 状态区（§3）：一行 36px，常驻 ──
+ * 它是"它现在怎么样"：连着没有、上下文还剩多少、记得多少。
+ *
+ * 为什么这三样是 DOM 而不是粒子：11px 汉字在点阵里的格距最小 1.5px，而 11px 字的
+ * 笔画只有 0.8px —— 笔画比格子还细，采样必然丢一半。这一行的全部价值是"扫一眼
+ * 就知道"，所以它和记录、页码一样，是有意不做成粒子的第三样东西。
+ *
+ * 没有框、没有底线、没有底色：一有边框它就成了"工具栏"，而这一层不出现控件。 */
+.ag-bar {
+  position: fixed; height: 36px;
+  display: flex; align-items: center; gap: 13px;
+  font: 11px/1 ui-monospace, Menlo, "Cascadia Mono", monospace;
+  letter-spacing: .03em;
+  color: rgba(147, 184, 216, .40);
+  pointer-events: none;
+  white-space: nowrap;
 }
-.ag-stat b { color: rgba(127, 211, 176, .9); font-weight: 400; }
-.ag-stat .dot { display: inline-block; width: 5px; height: 5px; border-radius: 3px; background: #7fd3b0; margin-right: 6px; vertical-align: 1px; }
-.ag-stat.off .dot { background: #ff7c93; }
+/* 数字会跳，等宽 + 不换行才不会让后面那几项左右游 */
+.ag-bar .ag-dot {
+  flex: 0 0 auto; width: 5px; height: 5px; border-radius: 3px;
+  background: rgba(127, 211, 176, .85);
+  box-shadow: 0 0 7px rgba(127, 211, 176, .5);
+  transition: background .3s, box-shadow .3s;
+}
+.ag-bar .ag-dot.on { background: rgba(255, 196, 120, .95); box-shadow: 0 0 9px rgba(255, 196, 120, .55); }
+.ag-bar .ag-dot.off { background: rgba(255, 124, 147, .95); box-shadow: 0 0 9px rgba(255, 124, 147, .5); }
 
-/* token 账本（只有 ?dev=1）。
- * 放右下角、和观察窗（左下）对称 —— 一个是"它在干什么"，一个是"这一切花了多少"。
- * 数字用等宽字体、右对齐：数字会跳动，不对齐的话每一轮都在抖。 */
-.ag-tok {
-  position: fixed; right: 24px; bottom: 20px; text-align: right;
-  font: 10.5px/1.7 ui-monospace, Menlo, "Cascadia Mono", monospace;
-  color: rgba(147, 184, 216, .34); pointer-events: none;
+.ag-bar .ag-model { font-weight: 400; color: rgba(170, 205, 235, .62); }
+.ag-bar .ag-ctx { display: flex; align-items: center; gap: 7px; pointer-events: auto; cursor: default; }
+.ag-bar .ag-ctx-track {
+  display: inline-block; width: 54px; height: 3px; border-radius: 2px;
+  background: rgba(147, 184, 216, .16); overflow: hidden;
 }
-.ag-tok b { display: block; color: rgba(147, 184, 216, .62); font-weight: 400; }
-.ag-tok b.hot { color: rgba(255, 178, 87, .92); }
-.ag-tok span { display: block; }
-.ag-tok[hidden] { display: none; }
+.ag-bar .ag-ctx-fill {
+  display: block; height: 100%; width: 0;
+  background: rgba(127, 211, 176, .8);
+  transition: width .5s ease, background .4s;
+}
+.ag-bar .ag-ctx-fill[data-lv="warm"] { background: rgba(255, 196, 120, .9); }
+.ag-bar .ag-ctx-fill[data-lv="hot"] { background: rgba(255, 124, 147, .95); }
+.ag-bar .ag-ctx-num { font-weight: 400; color: rgba(147, 184, 216, .58); }
+.ag-bar .ag-mem { pointer-events: auto; cursor: default; }
+.ag-bar .ag-tool { color: rgba(255, 178, 87, .62); overflow: hidden; text-overflow: ellipsis; }
 
 .ag-hint {
   position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
@@ -512,17 +534,19 @@ body.agent-open .stat-zone { pointer-events: none; }
    已经落在渐变段里），而那一行是用户唯一要读的字。
    残留只出现在"开着窗口唤出 agent"这一种情形，代价不对等。 */
 
-/* 答案页码：导航信息，不是内容，所以用 DOM 而不是粒子 */
+/* 答案页码：导航信息，不是内容，所以用 DOM 而不是粒子。
+   它在**答案块的底边**（左半、左页码右提示），不是屏幕底边 —— 挂在屏幕底边时
+   它离正文两百多像素，读的人不知道那个「1 / 3」是谁的页。 */
 .ag-page {
   position: fixed;
-  left: 50%;
-  bottom: 84px;
-  transform: translateX(-50%);
-  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  display: flex; justify-content: space-between; align-items: baseline;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
   letter-spacing: 0.08em;
-  color: rgba(150, 180, 210, 0.5);
+  color: rgba(150, 180, 210, 0.42);
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.3s;
 }
-body.agent-open .ag-page { opacity: 1; }
+.ag-page.on { opacity: 1; }
+.ag-page b { font-weight: 400; color: rgba(150, 180, 210, 0.55); }
+.ag-page span { color: rgba(150, 180, 210, 0.28); }

@@ -410,6 +410,19 @@ export class FieldScene {
     const head = has('gauge') || has('stream');
     const bottom = a.y + a.h;
 
+    /* 仪表是竖排还是横排，决定了它占多高 —— 分区必须跟它一致。
+       横排只有一行（a.y+150 ± 52），竖排是**一列**：n 个 × 168 步长。
+       这里踩过：分栏后右侧只有 668 宽，三个仪表改成竖排（50 / 218 / 386），
+       而曲线仍按"仪表栏到 a.y+300 结束"来排 —— 第三个仪表正好压在曲线上，
+       远看像一条曲线穿过了磁盘圆环。 */
+    const nG = list.filter((l) => l.kind === 'gauge').length;
+    const vert = a.w < 820 && nG > 0;
+    /* 竖排的步长 140（不是横排那 168）：圆环直径 88，140 留 52 的间隙，
+       三个仪表从 a.y+50 排到 a.y+440 —— 正好在曲线之上收住。
+       168 的时候第三个圆环压到曲线上，远看像一条线穿过了圆心。 */
+    const gaugeCy = vert ? a.y + 50 + (nG - 1) * 70 : a.y + 150;
+    const gaugeEnd = vert ? a.y + 50 + (nG - 1) * 140 + 44 : a.y + 202;
+
     /* 分叉：圆心贴底 128（标题在 -30、分支文字在 +96，正好落在带内） */
     const forkCy = fork ? bottom - 128 : null;
     /* 往上还有多少可用：分叉的标题上方要留一口气，别让结论贴上去 */
@@ -420,16 +433,19 @@ export class FieldScene {
     if (noteN) top = noteBase - 30 * (noteN - 1) - 8;
 
     /* 曲线：标签行在 tTop-28，绘图区 tTop..tBase。
-       上界受仪表让位（a.y+300），下界受结论让位；挤不下就压短，但不低于 96。 */
+       上界受仪表让位（横排 a.y+250、竖排 gaugeEnd+34），下界受结论让位；
+       挤不下就压短，但不低于 96。 */
     let tBase = Math.min(top, a.y + 452);
     let tTop = Math.min(a.y + 300, tBase - 96);
-    if (tTop < a.y + 250) tTop = a.y + 250;      // 不低于仪表栏的下沿
+    const tFloor = vert ? gaugeEnd + 34 : a.y + 250;
+    if (tTop < tFloor) tTop = tFloor;             // 不低于仪表栏的下沿
     if (tBase - tTop < 96) tBase = tTop + 96;
 
     return {
       bottom,
-      gaugeCy: a.y + 150,
+      gaugeCy,
       forkCy,
+      fork: !!fork,
       noteBase,
       tTop,
       tBase,
@@ -441,19 +457,32 @@ export class FieldScene {
 
   /** 环形仪表：整圈点云，前 value 段亮，其余压暗 */
   _gauge(spec, i, count, a, reuse) {
-    /* 横排要 (count-1) x 250 + 2R，三个仪表 750 宽 —— 半宽 668 装不下。
-       所以窄的时候改**竖排**：一列贴着场景区左侧，曲线和选项环挪到右边。
-       这不是"顺手调间距"：250 的间距缩到 200 会让两个圆环的刻度叠在一起。 */
-    const vert = a.w < 820;
-    const R = vert ? 44 : 52;
+    /* 三种排法，由"多宽"和"有没有选项环"决定：
+     *
+     *   宽屏            → 一行横排，间距 250（三个要 750）
+     *   窄屏            → 竖排一列，贴场景区左侧 26%
+     *   窄屏 + 有 fork  → **收到环心**，一行横排间距 110、半径 40
+     *
+     * 第三种不是审美：半宽 668 装不下"一列仪表 + 一个 r=250 的环"。环的左边缘在
+     * cx-250，仪表列在 cx-166 —— 仪表整个落在环内，而"过去"那条连线要从环心
+     * 拉到左边，正好**穿过圆环中心**（实拍：一条线横着穿过了磁盘表）。
+     * 这就是 §6.1 那条"有 fork 时把主图收到中心 300×260"真正的理由。
+     */
+    const fork = !!this.L?.fork;
+    const vert = a.w < 820 && !fork;
+    const R = fork ? 40 : vert ? 44 : 52;
     const gap = 250;
     const baseCy = this.L?.gaugeCy ?? a.y + 150;
-    const cx = vert
-      ? a.x + a.w * 0.26
-      : a.x + a.w / 2 + (i - (count - 1) / 2) * gap;
-    const cy = vert
-      ? baseCy + (i - (count - 1) / 2) * 168
-      : baseCy;
+    const cx = fork
+      ? a.x + a.w / 2 + (i - (count - 1) / 2) * 110
+      : vert
+        ? a.x + a.w * 0.26
+        : a.x + a.w / 2 + (i - (count - 1) / 2) * gap;
+    const cy = fork
+      ? a.y + a.h / 2
+      : vert
+        ? baseCy + (i - (count - 1) / 2) * 140
+        : baseCy;
     const N = 180;
     const v = clamp(spec.value ?? 0, 0, 1);
     const lit = Math.max(0, Math.min(N, Math.round(v * N)));
@@ -496,6 +525,9 @@ export class FieldScene {
       layer.cap = new ParticleText({
         field: f, alloc: this.alloc, x: cx, y: cy + 33, size: 16, max: 4,
         color: '#93b8d8', align: 'center', font: FONT, label: `gc-${spec.id}`,
+        /* 场景里的 CJK 标签走**可读密度**："CPU"、"内容" 这几个字是
+           看这块仪表的唯一线索，糊掉的话 71% 这个数字就无所指。 */
+        budget: glyphBudget(16, true),
       });
     }
     /* 小于 0.5% 的不要写成 "0%"。
@@ -574,6 +606,7 @@ export class FieldScene {
       layer.label = new ParticleText({
         field: f, alloc: this.alloc, x: x0, y: y - 22, size: 17, max: 12,
         color: '#93b8d8', font: FONT, label: `s-${spec.id}`,
+        budget: glyphBudget(17, true),
       });
       layer.pct = new ParticleText({
         field: f, alloc: this.alloc, x: x1, y: y - 22, size: 16, max: 6,
@@ -728,6 +761,7 @@ export class FieldScene {
     const title = new ParticleText({
       field: f, alloc: this.alloc, x: cx, y: cy - 78, size: 17, max: 12,
       color: '#93b8d8', align: 'center', font: FONT, label: `f-${spec.id}`,
+      budget: glyphBudget(17, true),
     });
     title.set(fit(spec.label, 12));
     layer.title = title;
@@ -780,6 +814,7 @@ export class FieldScene {
         const txt = new ParticleText({
           field: f, alloc: this.alloc, x: bx, y: by, size: 16, max: 8,
           color: COLOR[key], align: 'center', font: FONT, label: `fo-${o.id}`,
+          budget: glyphBudget(16, true),
         });
         txt.set(fit(o.label, 8));
         layer.branches.push({
@@ -809,6 +844,7 @@ export class FieldScene {
          在满屏环境粒子上几乎看不见 —— 字被背景点吃掉了，
          用户只会觉得"这里好像有点东西"。 */
       color: hasFork ? '#93b8d8' : '#8ab4d8', align: 'center', font: FONT, label: `c-${spec.id}`,
+      budget: glyphBudget(17, true),
     });
     t.set(spec.text || '');
     this.texts.push(t);
@@ -839,6 +875,7 @@ export class FieldScene {
       layer.text = new ParticleText({
         field: this.field, alloc: this.alloc, x: cx, y: cy + 46, size: 16, max: 7,
         color: COL.warn, align: 'center', font: FONT, label: `tb-${spec.id}`,
+        budget: glyphBudget(16, true),
       });
       layer.text.set(fit(spec.label, 8));
     }
@@ -866,6 +903,7 @@ export class FieldScene {
       layer.detailText = new ParticleText({
         field: f, alloc: this.alloc, x: p.x, y: p.y + 40, size: 17, max: 14,
         color: COL.ink, align: 'center', font: FONT, label: `d-${s.id}`,
+        budget: glyphBudget(17, true),
       });
     }
     layer.detailText.set(txt);

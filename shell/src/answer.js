@@ -2,10 +2,12 @@
  * 答案块 —— 屏幕上真正要"读"的那几段字。
  *
  * 从"输入框上面一行 19px / 20 字"改过来，现在是一整块版面：
- *   20px、每行 33 字、14 行、**每页 400 字**，竖排在左半屏里居中。
+ *   20px、每行 29 字、12 行、**每页 300 字**，左对齐排在左半屏。
  *
- * 为什么是 20px：一个字吃 `glyphBudget = size × 2` 颗粒子，32px 就是 64 颗，
- * 18000 颗槽位只够 281 字 —— 一页排不下三段。20px 是"能成篇"和"读得清"的交叉点。
+ * 为什么是 20px / 300 字：一个汉字要 `glyphBudget(size, true)` ≈ 90 颗才读得出来
+ * （这笔账见 pui.js），300 × 90 = 27000，加上"每行按上限预留"的浪费后
+ * 正好是 56000 的粒子池减去场景之后能匀给答案的部分（32400）。
+ * 字号再大不会更省 —— 可读密度下每个字的点数**与字号无关**。
  *
  * 四条要守住的：
  *   1. **按字数分页，不按行分页**。按行切会在句子中间断开。
@@ -14,20 +16,26 @@
  *   4. **逐字生长保留**：一行行凝出来是这套界面的语法，DOM 里没有对应的东西。
  */
 
-import { ParticleText } from './pui.js';
+import { ParticleText, glyphBudget } from './pui.js';
 import { FONT } from './draw.js';
 
 const CJK = /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/;
 const BREAK = '，。、；：!?！？ ';
 const PAGE_BREAK = '。！？；\n';
 
-/** 每页字数。400 是 33 字 × 14 行（=462）留出段落间距后的保守值。 */
-export const PAGE_CHARS = 400;
+/** 每页字数。300 × 90 颗 = 27000 槽位，留出行预留的浪费（见 ensureRows）。 */
+export const PAGE_CHARS = 300;
+
+/** 字距系数，必须和 ParticleText.spacing 一致（0.06em）—— 量宽比排版窄就会压过中线。 */
+const SPACING = 0.06;
 
 /** 粗略字宽：汉字占一个字号，拉丁/数字约 0.56。够换行用，不用真量。 */
 function widthOf(ch, size) {
-  return CJK.test(ch) ? size : size * 0.56;
+  return (CJK.test(ch) ? size : size * 0.56) + size * SPACING;
 }
+
+/** 行首禁则：这些字符**不能出现在行首**（中文排版的硬规矩）。 */
+const NO_START = '，。、；：！？）】》」』”,.!?;:)]}%';
 
 /**
  * 按宽度换行，最多 maxLines 行。
@@ -60,6 +68,17 @@ export function wrapText(text, { size, maxWidth, maxLines, maxChars = 99 }) {
     w += cw;
   }
   flush();
+
+  /* 行首禁则：满宽切行时，"。"常常正好落在下一行的第一个字上 ——
+     屏幕上就是"…关注的位置 / 。整体负载不高"，读起来像排错了版。
+     改法是把那个标点**拉回上一行**（宁可那行超出一格），而不是硬留个孤零零的句号。 */
+  for (let i = 1; i < lines.length; i++) {
+    let head = Array.from(lines[i]);
+    while (head.length > 1 && NO_START.includes(head[0])) {
+      lines[i - 1] += head.shift();
+    }
+    lines[i] = head.join('');
+  }
 
   if (lines.length > maxLines) {
     const keep = lines.slice(0, maxLines);
@@ -107,11 +126,12 @@ export function createAnswer({ field, alloc, reserve }) {
 
   let size = 20;
   let lh = 26;
-  let rows = 14;
-  let maxChars = 33;
+  let rows = 12;
+  let maxChars = 29;
   let maxWidth = 636;
   let cx = 0;
   let centerY = 0;
+  let align = 'left';
   let color = '#eaf3ff';
   let full = '';
   let pages = [''];
@@ -127,12 +147,25 @@ export function createAnswer({ field, alloc, reserve }) {
     sub.next = start;
   }
 
+  /**
+   * 建行。
+   *
+   * 行宽取 `maxChars + 1`：多出来的那一个字是**行首禁则**回拉标点用的
+   * （见 wrapText）。不留这一格，那行会被 ParticleText 截成 "…"，
+   * 屏幕上就是"这句话怎么少了个句号"。
+   *
+   * 预留是按 max 算的（ParticleText 在构造时定死每字槽位），所以
+   * `行数 × (maxChars+1) × 90` 必须 ≤ reserve —— 12 × 30 × 90 = 32400，
+   * 这就是 deskagent 里 ANS_SLOTS 的来处。行数不能随手加。
+   */
   function ensureRows(n) {
     while (block.length < n) {
       block.push(new ParticleText({
         field, alloc: sub, x: cx, y: centerY,
-        size, max: maxChars, color, align: 'center', font: FONT,
-        weight: 500,
+        size, max: maxChars + 1, color, align, font: FONT,
+        weight: 400,
+        /* 可读密度：90 颗/字。用小字号省槽位、用大字号省不了 —— 见 pui.js */
+        budget: glyphBudget(size, true),
         /* 和 pui 那条公式同源：1.0 + size × 0.05（20px → 2.0）。
            之前写 size × 0.085 只有 1.7，比默认还小 —— 笔画被切成两排点，远看发灰。 */
         dot: Math.min(2.8, 1.0 + size * 0.05), label: `ans${block.length}`,
@@ -193,6 +226,7 @@ export function createAnswer({ field, alloc, reserve }) {
       maxChars = geom.maxChars;
       maxWidth = geom.maxWidth;
       cx = geom.cx;
+      align = geom.align || align;
       centerY = geom.centerY ?? geom.baseY ?? centerY;
       if (reflow) {
         dispose();

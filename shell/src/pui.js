@@ -36,14 +36,26 @@ function ctx2d() {
 }
 
 /**
- * 每字点数预算。
+ * 每字点数预算。**两种密度，由调用方显式选**。
  *
- * 这个系数是实测出来的：1.6 时每个 24px 汉字只有 36 颗点，字被打成一团碎渣；
- * 2.0 时约 48 颗、点距落到 2.2~2.5px，笔画才连得上。
- * 上限受 6400 槽位约束 —— 一屏约 95 个字 + 框线，平均每字 50 上下就是天花板。
+ * 采样是"按格子取质心"，格子边长 `cell` 被预算逼出来：预算越小格子越大。
+ * 而"能不能读"只取决于 **笔画宽 ÷ cell**，不取决于字号 —— 实测（20px、DengXian Light）：
+ *
+ *   预算 40（= size×2）→ cell 2.55，笔画 1.3px，比值 0.51 → 笔画落不到格子上，整行碎成渣
+ *   预算 64           → cell 2.01，比值 0.65 → 长句仍糊
+ *   预算 90（= size×4.5）→ cell 1.70，比值 0.76 → 能读
+ *
+ * 而且这个数**与字号无关**：cell 与笔画都随字号线性放大，点数只由 cell/size 决定。
+ * 所以旧公式 `size×2` 是错的形状 —— 20px 只有 40 颗（必糊）、32px 有 64 颗（还行）。
+ *
+ * @param {number} size
+ * @param {boolean} [read] true = 要读的字（答案、问句、场景里的 CJK 标签）；
+ *   false = 装饰性文字（轴标、单位），读个大概就够，别跟答案抢槽位。
  */
-export function glyphBudget(size) {
-  return Math.round(clamp(size * 2.0, 26, 240));
+export function glyphBudget(size, read = false) {
+  return read
+    ? Math.round(clamp(size * 4.5, 56, 200))
+    : Math.round(clamp(size * 2.0, 26, 240));
 }
 
 /**
@@ -224,7 +236,9 @@ export class ParticleText {
        所以用"地基 + 斜率"：1.0 + size×0.045 → 16px→1.72、18px→1.81、
        22px→1.99、32px→2.44（封顶 2.4）。18px 实测 1.75 才连成一条笔画。 */
     this.dot = o.dot ?? Math.min(2.4, Math.max(1.0, 1.0 + o.size * 0.045));
-    this.budget = glyphBudget(o.size);
+    /* 密度由调用方定（见 glyphBudget 的注释）。默认是装饰密度 ——
+       这样场景里那些没显式要求的轴标不会突然把槽位吃光。 */
+    this.budget = o.budget ?? glyphBudget(o.size);
     /**
      * 槽位不够就**把字数上限往下压**，而不是抛异常。
      *
@@ -243,6 +257,11 @@ export class ParticleText {
       }
     }
     this.dead = this.base < 0;
+    /* 字距。measureText 给的 advance 是 1em，而字模的墨迹能伸到 advance 边上
+       （20px 实测 0.7~18.4）—— 加上 2px 直径的点，相邻两个字会黏成一片。
+       加 0.06em 就分得开，又不像"字距拉大了"。换行那一侧必须用同一个系数
+       （见 answer.js 的 widthOf），否则排出来比量出来的宽。 */
+    this.spacing = o.spacing ?? o.size * 0.06;
     this._slots = new Array(Math.max(1, this.max)).fill(null);   // 每格记 {ch, x}，用于跳过
     this._last = 0;
     this._wrote = 0;
@@ -267,7 +286,7 @@ export class ParticleText {
 
     /* 先量宽：按字符 advance 累加，用来做居中/右对齐 */
     const metrics = chars.map((ch) => glyph(ch, this.size, { weight: this.weight, font: this.font, budget: this.budget }));
-    const total = metrics.reduce((a, m) => a + m.advance, 0);
+    const total = metrics.reduce((a, m) => a + m.advance, 0) + Math.max(0, chars.length - 1) * this.spacing;
     let cx = this.x;
     if (this.align === 'center') cx = this.x - total / 2;
     else if (this.align === 'right') cx = this.x - total;
@@ -276,7 +295,7 @@ export class ParticleText {
     for (let i = 0; i < chars.length; i++) {
       const ch = chars[i];
       const gx = cx;
-      cx += metrics[i].advance;
+      cx += metrics[i].advance + this.spacing;
       const prev = this._slots[i];
       /* 同一个字、同一个位置 → 那段槽位早就对了，直接跳过。
          这是"打字不整屏重排"的全部秘密：跳过的字连采样都不做。

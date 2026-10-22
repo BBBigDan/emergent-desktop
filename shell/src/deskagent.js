@@ -19,7 +19,7 @@ import { FieldScene } from './scene.js';
 import { UI_ENV_DIM } from './field.js';
 import { renderSurface } from './surface.js';
 import { compileDraw } from './draw.js';
-import { ParticleText, SlotAllocator } from './pui.js';
+import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { createAnswer } from './answer.js';
 import { createFace } from './face.js';
 import { FONT } from './draw.js';
@@ -76,19 +76,39 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   typeEl.setAttribute('aria-label', '对 agent 说一句话');
 
   const inspEl = el('div', 'ag-insp');
-  const statEl = el('div', 'ag-stat', '<span class="dot"></span><b>connecting</b>');
-  const statTxt = statEl.querySelector('b');
-  /* token 账本角标。它是**开发态**的东西，不是 agent 的表达 ——
-     用户不需要知道一次问答花了多少 token，但调提示词的人必须知道：
-     上下文涨到 80% 时，模型开始丢失前几轮的信息，而那看起来像"模型变笨"。
-     没有这个数，所有"它怎么突然不听人话了"的排查都是猜的。 */
-  const tokEl = el('div', 'ag-tok');
+
+  /* ── 状态区（§3）：它是谁、还剩多少上下文、记得多少 ──
+   *
+   * 一行，36px，常驻。为什么是 DOM 而不是粒子：11px 汉字在点阵里的格距最小 1.5px，
+   * 而 11px 字的笔画只有 0.8px —— 笔画比格子还细，采样必然丢一半。这一行的全部
+   * 价值是"扫一眼就知道"，所以它和记录、页码一样，是有意不做成粒子的第三样东西。
+   *
+   * 三样数字各有各的来历，别混：
+   *   模型 → hello 的 model（启动常量，本期不可切）
+   *   上下文 → usage 的 ctx.tokens / limit（`?` 表示上限是猜的）
+   *   记忆 → hello 与每轮 idle 前的 {t:'mem'}（facts = 条数）
+   */
+  const barEl = el('div', 'ag-bar');
+  const barDot = el('i', 'ag-dot');
+  const barModel = el('b', 'ag-model', 'connecting');
+  const barCtx = el('span', 'ag-ctx');
+  const barCtxTrack = el('i', 'ag-ctx-track');
+  const barCtxFill = el('i', 'ag-ctx-fill');
+  const barCtxNum = el('b', 'ag-ctx-num');
+  barCtxTrack.appendChild(barCtxFill);
+  barCtx.append(barCtxTrack, barCtxNum);
+  const barMem = el('span', 'ag-mem');
+  /* 正在跑的工具名。它只在"那一下"出现 —— 常驻的话，用户会以为界面卡在那个工具上 */
+  const barTool = el('span', 'ag-tool');
+  barEl.append(barDot, barModel, barCtx, barMem, barTool);
+
   const gateEl = el('div', 'ag-gate');
   const a11yEl = el('div', 'ag-a11y');
   const hintEl = el('div', 'ag-hint', '回车发送 · 拖仪表 / 拖曲线 / 点元素 · Esc 收起');
 
-  layer.append(typeEl, inspEl, statEl, tokEl, gateEl, a11yEl, hintEl);
-  if (!DEV) { inspEl.hidden = true; statEl.hidden = true; tokEl.hidden = true; hintEl.hidden = true; }
+  layer.append(barEl, typeEl, inspEl, gateEl, a11yEl, hintEl);
+  /* 状态区常驻（§3 的第一句）。观察窗和提示行仍旧只在 ?dev=1 出现 */
+  if (!DEV) { inspEl.hidden = true; hintEl.hidden = true; }
   document.body.appendChild(layer);
 
   /* 唤起热区：桌面常驻，只有贴着底边才存在感 */
@@ -267,12 +287,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let face = null;   // loading 区：小表情 / 在想
   let scene = null;
 
-  /* 槽位总账（池子 32000，见 field.js 的 UI_POOL）：
-       问           22 字 × 36 = 792      —— 先拿，它在输入行、位置固定
+  /* 槽位总账（池子 56000，见 field.js 的 UI_POOL，账在 docs/interaction-spec.md §9）：
+       问           22 字 × 81 = 1782   —— 先拿，它在输入行、位置固定
        loading 区    300
-       答案         18600                —— 20px × 2 × 400 字
-       场景         11000                —— 仪表 / 曲线 / 分叉环
-       余量         ~1300                —— 某一层超配时不至于整屏不铺
+       答案         32400                —— 12 行 × 30 字 × 90 颗（§2.1 的可读密度）
+       场景         余下 ~21500           —— 仪表 / 曲线 / 分叉环
+       余量         ~500                 —— 某一层超配时不至于整屏不铺
      "问"必须先拿：被场景挤掉就等于用户看不到自己刚问过什么。 */
 
   /* 背景那 6400 颗还留多亮。这个数是**压暗比例**，越大越暗（见 field.js 的 drawDim）：
@@ -297,9 +317,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   const ASK_SIZE = 18;
   const ASK_CHARS = 22;
 
-  /* 答案块的槽位：20px x 2 = 40 颗/字。
-     一页 400 字 = 16000；上限 14 行 x 33 字 = 462 字 = 18480，所以给 18600。 */
-  const ANS_SLOTS = 18600;
+  /* 答案块的槽位：20px 在**可读密度**下一个字 90 颗（§2.1）。
+     12 行 × (29 字 + 1 格行首禁则) × 90 = 32400 —— 正好是一页 300 字的家。
+     行数与每行字数一变，这个数就得跟着变，否则最后两行会申请不到槽位。 */
+  const ANS_SLOTS = 32400;
 
   let areaA = null;   // 态 A：场景满宽
   let areaB = null;   // 态 B：场景只占右半
@@ -323,17 +344,21 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return { x: area.x + 52, y: area.y + 44, size: 48, slots: FACE_SLOTS };
   }
 
-  /* 答案块：左半屏居中，20px / 26 行高 / 33 字一行 / 14 行 / 400 字一页 */
+  /* 答案块：左半屏、左对齐，20px / 26 行高 / 29 字一行 / 12 行 / 300 字一页 */
   function ansGeom() {
     const a = contentArea();
     const half = (a.w - 24) / 2;
     return {
-      size: 20, lh: 26, lines: 14,
-      /* 每行字数要按"字宽 + 字距"算，不能只除字号：汉字之间有一格字距，
+      size: 20, lh: 26, lines: 12,
+      /* 每行字数要按"字宽 + 字距"算，不能只除字号：汉字之间有一格字距（0.06em），
          33 字 × 20 看着是 660，实际排出来 726 —— 会直接压过中线进到场景区。 */
-      maxChars: Math.max(8, Math.floor((half - 40) / (20 * 1.08))),
+      maxChars: Math.max(8, Math.floor((half - 40) / (20 * 1.06))),
       maxWidth: half - 32,
-      cx: Math.round(a.x + half / 2),
+      /* **左对齐**。这一块是"读一段话"，不是"念一句字幕"：
+         居中的多行文字每行起点都在动，眼睛每换一行都要重新找头，
+         读三百字就是三百次重新找头。左边留 20px，和问句行同一个起点。 */
+      align: 'left',
+      cx: Math.round(a.x + 20),
       centerY: Math.round(a.y + a.h / 2),
     };
   }
@@ -349,9 +374,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 态由"有没有答案"决定 —— 不是由场景有没有内容。
        用场景判断的话，模型只说话不出图时整屏会一直停在满宽，答案块没地方站。 */
     area = ans && ans.text ? areaB : areaA;
-    /* 记录 / 停止：贴输入行的右端，不再挂在场角 */
-    histBtn.style.top = `${lineY - 42}px`;
-    histBtn.style.right = '26px';
+
+    /* 状态区（§1）：和内容区左右对齐，36px 高，贴顶 20px */
+    barEl.style.left = `${a.x}px`;
+    barEl.style.top = '20px';
+    barEl.style.width = `${a.w}px`;
+    barEl.style.paddingRight = '128px';   // 右端让出记录/停止两个图标位
+
+    /* 记录 / 停止：状态区右端，不再挂在场角 —— 那里在答案铺开后会被字压住 */
+    histBtn.style.top = '24px';
+    histBtn.style.right = '40px';
     stopBtn.style.top = histBtn.style.top;
     stopBtn.style.right = histBtn.style.right;
   }
@@ -369,6 +401,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       field, alloc: head, x: Math.round(innerWidth / 2), y: lineY,
       size: ASK_SIZE, max: ASK_CHARS, color: ASK_COLOR, align: 'center',
       font: FONT, weight: 300, label: 'ask',
+      /* 你刚说的那句必须是**要读**的：它和答案同一档密度，只是更暗更小。
+         22 字 × 81 = 1782，池子里这点钱不能省。 */
+      budget: glyphBudget(ASK_SIZE, true),
     });
     /* loading 区先于答案块分配：位置固定、只占 300 格。
        被答案挤掉就等于"它不在了"，而这张小脸是屏幕上唯一的在场信号。 */
@@ -519,34 +554,61 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
    * 两个数字上的讲究：
    *   · 数字一律走同一个缩写函数 —— "3598" 和 "32.0k" 并排会让人误判比例；
    *   · 估算值前面加 `~`。服务端回了真实 usage 才是账单上的数，
-   *     按字数推出来的数长得一样是这个功能最坏的失败方式。 */
+   *     按字数推出来的数长得一样是这个功能最坏的失败方式。
+   *
+   * 位置换了：以前是右下角一块三行角标（?dev=1 才有），现在是状态区里的
+   * 「水位条 + 数字」，细账进 tooltip。理由有两条：屏幕上那一条本来就是
+   * "它现在怎么样"；而右下角在答案铺开之后正好压在字上。
+   */
   const tokNum = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(2)}M`
     : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : String(v));
 
   function renderTok(u) {
-    if (!DEV || !u) return;
-    const pct = u.ctx?.pct ?? 0;
+    if (!u) return;
+    const pct = Math.max(0, Math.min(100, u.ctx?.pct ?? 0));
     const est = u.turn?.est || u.session?.est;
     const tilde = est ? '~' : '';
-    const money = u.price
-      ? (u.price.free ? '免费' : `¥${(u.day?.cost ?? 0).toFixed(4)}`)
-      : '单价未配置';
     /* 上限后面加 `?` = 这个窗口大小是**缺省值猜的**，不是查到的。
        水位百分比全靠它当分母，猜错的话那个百分比就是假的 —— 必须看得出来。 */
     const lim = `${tokNum(u.limit || 0)}${u.limitSrc === 'default' ? '?' : ''}`;
+    const used = tokNum(u.ctx?.tokens || 0);
+    barCtxNum.textContent = `${tilde}${used} / ${lim}`;
+    barCtxFill.style.width = `${pct}%`;
+    /* 颜色是第二信号，数字永远同时在场。三档：够用 / 要留意 / 快满了 */
+    barCtxFill.dataset.lv = pct >= 85 ? 'hot' : pct >= 60 ? 'warm' : '';
+
+    const money = u.price
+      ? (u.price.free ? '免费' : `¥${(u.day?.cost ?? 0).toFixed(4)}`)
+      : '单价未配置';
     const p = u.ctx?.parts;
     /* 构成那一行是给"想省 token"的人看的：12k 里 9k 是系统提示词，
        那裁历史一点用都没有 —— 不知道这件事，优化就会做在最没用的地方。 */
-    const partsLine = p
-      ? `<span>系统 ${tokNum(p.sys)} · 工具 ${tokNum(p.tools)} · 历史 ${tokNum(p.hist)}</span>`
-      : '';
-    const cache = u.turn?.cached ? ` · 缓存 ${tokNum(u.turn.cached)}` : '';
-    tokEl.innerHTML =
-      `<b class="${pct >= 75 ? 'hot' : ''}">ctx ${tilde}${tokNum(u.ctx?.tokens || 0)} / ${lim} · ${pct}%</b>`
-      + partsLine
-      + `<span>本轮 ↑${tilde}${tokNum(u.turn?.in || 0)} ↓${tilde}${tokNum(u.turn?.out || 0)} · ${u.turn?.calls || 0} 步${cache}</span>`
-      + `<span>今日 ↑${tokNum(u.day?.in || 0)} ↓${tokNum(u.day?.out || 0)} · ${money}</span>`;
-    tokEl.classList.toggle('est', !!est);
+    barCtx.title = [
+      `上下文 ${pct}%（${tilde}${used} / ${lim}）`,
+      p ? `系统 ${tokNum(p.sys)} · 工具 ${tokNum(p.tools)} · 历史 ${tokNum(p.hist)}` : '',
+      `本轮 ↑${tilde}${tokNum(u.turn?.in || 0)} ↓${tilde}${tokNum(u.turn?.out || 0)}`
+        + ` · ${u.turn?.calls || 0} 步` + (u.turn?.cached ? ` · 缓存 ${tokNum(u.turn.cached)}` : ''),
+      `今日 ↑${tokNum(u.day?.in || 0)} ↓${tokNum(u.day?.out || 0)} · ${money}`,
+    ].filter(Boolean).join('\n');
+  }
+
+  /* 记忆：条数常驻、内容进 tooltip。它不是模型上下文的一部分，
+     是"我记得多少事"这样一个给人看的数字。 */
+  function renderMem(m) {
+    if (!m) { barMem.textContent = ''; return; }
+    if (!m.on) {
+      barMem.textContent = '记忆关';
+      barMem.title = '记忆侧车没连上';
+      return;
+    }
+    barMem.textContent = `${m.facts ?? 0} 条`;
+    barMem.title = m.recent ? `${m.recent}\n（${m.last || ''}）` : '还没有记住什么';
+  }
+
+  /** 连接点：青=通、琥珀=在想、红=断。它是这一行里唯一的状态，所以不用文字 */
+  function setLink(kind) {
+    barDot.classList.toggle('off', kind === 'off');
+    barDot.classList.toggle('on', kind === 'busy');
   }
 
   /* ───────────────── 与服务端 ───────────────── */
@@ -585,8 +647,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       onEvent(m);
     };
     es.onerror = () => {
-      statEl.classList.add('off');
-      statTxt.textContent = 'disconnected';
+      setLink('off');
+      barTool.textContent = '断线了';
     };
     /* 服务端那份记录才是"真相"：刷新、换标签页、隔夜回来都还在。
        resume 只在有上一屏时才带 log，所以这里再补一次。 */
@@ -619,6 +681,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     busy = v;
     stopBtn.hidden = !v || open === false;
     histBtn.hidden = v || log.length < 2 || open === false;
+    /* 表情跟着一轮走：跑起来是"说话"（嘴随字开合），停下来才轮换。
+       §7.3 那条"思考与输出期间不换表情"就落在这里 —— 不通知它，它会在
+       模型说话的十几秒里自己换三次脸。 */
+    face?.setBusy(v);
   }
 
   let spinTimer = 0;
@@ -655,8 +721,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       clearInterval(spinTimer);
       spinTimer = 0;
     }
-    statEl.classList.toggle('off', thinking > 0);
-    statTxt.textContent = thinking > 0 ? 'thinking' : busy ? 'running' : 'ready';
+    /* 状态区只表达两件事：连着没有、是不是在等。工具名由下面单独写 */
+    setLink(thinking > 0 ? 'busy' : 'ok');
+    if (!thinking) barTool.textContent = '';
   }
 
   /** 「在想」时背景该多亮：空屏亮一点（云才看得见），有内容时只轻轻抬一下 */
@@ -671,7 +738,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     clearInterval(spinTimer);
     spinTimer = 0;
     field.setCoherence(1);
-    statEl.classList.remove('off');
+    setLink('ok');
+    barTool.textContent = '';
   }
 
   /* 背景亮度要渐变：0.65 → 0.94 一帧跳过去，整个球面会闪一下，像屏幕抖了 */
@@ -693,10 +761,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     switch (m.t) {
       case 'hello':
         t0 = performance.now();
-        statEl.classList.remove('off');
-        statTxt.textContent = 'ready';
+        setLink('ok');
+        barTool.textContent = '';
+        if (m.model) barModel.textContent = m.model;
         insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
         renderTok(m.usage);
+        renderMem(m.mem);
         /* 提示语只在用户还没说话时出现 —— 它占的是"那一行"，不是额外一行 */
         if (!askText) echo('');
         break;
@@ -744,9 +814,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
           /* 参数只取一小截：完整 JSON 一排下去能横穿半个屏幕，
              而观察窗要的是"它在干什么"，不是它发了什么报文。 */
           insp('tool', `${m.name} ${JSON.stringify(m.args).slice(0, 46)}`, 'tool');
-          statTxt.textContent = m.name;
+          barTool.textContent = m.name;
         } else {
           insp('·', `${m.name} → ${m.note || m.state}${m.ms != null ? ` (${m.ms}ms)` : ''}`, 'tool');
+          /* 跑完就撤：常驻的话，用户会以为界面卡在那个工具上 */
+          if (barTool.textContent === m.name) barTool.textContent = '';
+          /* 工具失败 / 被拒：脸红一下（§7.2 的「警觉」）。其余状态不打扰 */
+          if (m.state === 'err' || m.state === 'denied') face?.alert();
         }
         break;
 
@@ -802,8 +876,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 兜底：即使 think:off 因为断线丢了，一轮结束也必须让场重新成形 */
         clearThink();
         setBusy(false);
-        statTxt.textContent = 'ready';
+        barTool.textContent = '';
         break;
+
+      /* 记忆条数：每轮结束后服务端会重数一遍（可能刚抽出一条新的） */
+      case 'mem': renderMem(m); break;
 
       case 'note': insp('note', m.message); break;
       case 'busy': insp('busy', '上一轮还没结束，这一步先排队'); break;
@@ -845,7 +922,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         speak(friendly(m.message));
         insp('error', m.message);
         setBusy(false);
-        statTxt.textContent = 'ready';
+        barTool.textContent = '';
+        /* 出错了它自己也该变脸（§7.2 的「警觉」）：屏幕上一句话说清原因，
+           角落那张脸同时红一下 —— 两条通道说的是同一件事，但不重复。 */
+        face?.alert();
         break;
 
       default:
@@ -1041,16 +1121,22 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   typeEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
-    /* ↑ 看刚才说过什么（输入框空着才让位：里面有字时 ↑ 是"我要改这句话"） */
-    if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing) { e.preventDefault(); openHist(); }
+    /* 空格翻页（§8）。只在输入框**空着**时接管：里面有字时空格就是空格，
+       抢了就会出现"打着打着突然翻页"。 */
+    if (e.key === ' ' && !typeEl.value && !e.isComposing && !histOpen) {
+      if (ans?.goPage(1)) { e.preventDefault(); updateFooter(); return; }
+    }
     if (e.key === 'ArrowDown' && histOpen) { e.preventDefault(); closeHist(); return; }
-    /* 输入框空着时 ↓/↑ 翻答案的页。里面有字时 ↓/↑ 属于"我要改这句话"，
-       不去抢 —— 抢了就会出现"打着字突然翻页"。 */
+    /* ↓/↑ 翻答案的页；输入框里有字时这两个键属于"我要改这句话"，不去抢。
+       ↑ 还有一个身份是"看记录" —— 顺序是**先翻页、翻到头再看记录**：
+       有上一页时 ↑ 的语义是"往上翻"，那时候弹记录面板等于把正文盖掉。 */
     if (e.key === 'ArrowDown' && !typeEl.value && !e.isComposing) {
       if (ans?.goPage(1)) { e.preventDefault(); updateFooter(); }
     }
-    if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing && !histOpen) {
-      if (ans?.goPage(-1)) { e.preventDefault(); updateFooter(); }
+    if (e.key === 'ArrowUp' && !typeEl.value && !e.isComposing) {
+      if (ans && ans.goPage(-1)) { e.preventDefault(); updateFooter(); return; }
+      e.preventDefault();
+      openHist();
     }
   });
   typeEl.addEventListener('input', () => {
@@ -1062,16 +1148,25 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /* ───────────────── 翻页 ─────────────────
    * 页码是**导航信息**，不是内容：用 DOM 一行小字，不占粒子槽位。
    * 画成粒子的话它会和正文抢同一段槽位，而且"还有几页"不需要长在点阵里。
+   *
+   * 它在**答案块**的底边（左半、左对齐页码、右对齐提示），不是屏幕底边 ——
+   * 挂屏幕底边时它离正文有两百多像素，读的人不知道那个「1 / 3」是谁的页。
    */
   let pageEl = null;
   function updateFooter() {
     if (!pageEl) {
-      pageEl = document.createElement('div');
-      pageEl.className = 'ag-page';
+      pageEl = el('div', 'ag-page', '<b></b><span>空格翻页</span>');
       document.body.appendChild(pageEl);
     }
+    const a = contentArea();
+    const half = (a.w - 24) / 2;
     const n = ans?.pageCount ?? 1;
-    pageEl.textContent = n > 1 ? `${(ans?.page ?? 0) + 1} / ${n}   ↓ 翻页` : '';
+    /* 只有一页时不出现：页脚唯一的意义是"还有没有下一页" */
+    pageEl.classList.toggle('on', n > 1);
+    pageEl.querySelector('b').textContent = `${(ans?.page ?? 0) + 1} / ${n}`;
+    pageEl.style.left = `${a.x + 16}px`;
+    pageEl.style.top = `${a.y + a.h - 24}px`;
+    pageEl.style.width = `${half - 32}px`;
   }
 
   /* ───────────────── 手势 → 意图 ───────────────── */
@@ -1119,6 +1214,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       }
       if (i.target) insp('hand', describe(i));
       histPush('i', describe(i));
+      /* 点选项 = 又说了一句话（§10）：上一轮的答案已经过时，这一屏要回到"在想"。
+         和回车走同一段清理，只是"问句行"里放的是选项的标签 —— 屏幕上看得出
+         你刚才挑了哪一条，而不是凭空消失。 */
+      if (i.kind === 'pick') {
+        if (i.optionLabel) echo(i.optionLabel);
+        sayText = '';
+        ans?.set('', { instant: true });
+        updateFooter();
+        applyMode();
+      }
       send({ t: 'intent', intent: i });
     },
   });
