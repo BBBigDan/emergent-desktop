@@ -425,6 +425,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let ringRAF = 0;
   let ringT0 = 0;
   let ringFade = 0;
+  let ringLit = false;   // 环真的亮过（决定收的时候要不要补那一脚）
 
   function ringFrame() {
     const cx = innerWidth / 2;
@@ -468,12 +469,20 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (scene && scene.layers.size > 0) return;
     ringT0 = performance.now();
     ringFade = 0;
+    ringLit = true;
     ringRAF = requestAnimationFrame(ringFrame);
   }
 
   function ringOff() {
+    /* 没在转就什么都不做。这个函数会在每条 say / 每次场景落地时被调用，
+       而它下面那个冲量会真的把环境点往外推一下 —— 平白无故让屏幕"噗"一下
+       （实测：模型只说一句话，背景也抖了一下）。 */
+    const was = ringRAF || ringLit;
     if (ringRAF) { cancelAnimationFrame(ringRAF); ringRAF = 0; }
+    if (!was && ringBase < 0) return;
     if (ringBase >= 0) field.slotBlank(ringBase, RING_SLOTS);
+    ringLit = false;
+    if (!was) return;
     /* 涡停下的地方会留一坨挤在一起的点 —— 因为涡把它们甩到圆心附近，
        停了之后没有东西再把它们推回去，屏幕上就是一块"不该在那儿的雾"
        （实测：回答出现后，圆心位置浮着一片读不出来的残字）。
