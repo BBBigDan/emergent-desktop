@@ -5,6 +5,14 @@ FROM node:22-alpine
 # 命令要跟 TZ 一致，差那 3MB 不值得为它留个"怎么日志时间是 UTC"的疑问。
 RUN apk add --no-cache tzdata
 
+# 官方 olares-cli：系统管理能力（应用/设置/备份/用户/集群）的唯一入口。
+# 28MB 单二进制，Go 静态编译，alpine 直接能跑。
+# **版本要跟着 Olares 后端走**：CLI 的 settings 子命令按 1.12.5 / 1.12.6+ 切
+# （gpu vs compute），比后端新太多会拿到不存在的动词。
+ARG OLARES_CLI_VER=1.12.8-20261021
+ARG OLARES_CLI_TAG=ec54ad4
+RUN wget -q -O /tmp/cli.tgz       "https://github.com/beclab/Olares/releases/download/${OLARES_CLI_VER}/olares-cli-v${OLARES_CLI_VER}_linux_amd64.${OLARES_CLI_TAG}.tar.gz"  && tar xzf /tmp/cli.tgz -C /usr/local/bin olares-cli  && chmod +x /usr/local/bin/olares-cli  && rm -f /tmp/cli.tgz  && /usr/local/bin/olares-cli version | head -2
+
 WORKDIR /app
 
 # 代码。`.dockerignore` 已经把 .env / .kube / sessions / usage / memory 挡在外面 ——

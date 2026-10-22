@@ -20,6 +20,7 @@ import {
 } from './scene.schema.mjs';
 import { createK8s } from './sources/k8s.mjs';
 import { createFs } from './sources/fs.mjs';
+import { OPS, OP_DOC } from './olares.mjs';
 
 const GB = 1024 ** 3;
 
@@ -223,6 +224,9 @@ export function buildShow(args) {
 export function makeTools(o = {}) {
   const source = o.source || 'host';
   const memory = o.memory || null;
+  /* 官方 olares-cli 的封装（见 agent/olares.mjs）。
+     由 server 注入：它要在启动时探一次"这个镜像里有没有这个二进制"。 */
+  const olares = o.olares || null;
   const forge = o.forge || null;
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
@@ -263,6 +267,37 @@ export function makeTools(o = {}) {
   }
   const noFs = () => ({
     error: '这台机器上还没挂用户目录，看不到文件。别猜文件名，直接告诉用户这一块还没接。',
+  });
+
+  /* ── Olares 系统层（官方 CLI） ──
+   *
+   * **一个工具 + op 枚举**，不是十几个平铺工具：每个工具的 schema 进上下文约 150 token，
+   * 32k 窗口里最贵的就是这块。而模型记得住"olares 能查系统"，记不住十二个名字。
+   *
+   * 数据全部来自官方 `olares-cli -o json`，和 Olares 自己的设置页 / 市场页是同一份。
+   * 所以"我装了哪些应用、什么版本、n8n 从哪进"这类问题，答案不该由 k8s 拼出来。
+   */
+  add('olares', {
+    level: 'safe',
+    describe: '查这台 Olares 的系统层（官方 CLI 的口径）：装了哪些应用/版本/状态/来源、'
+      + '市场里有什么可装、某个应用的配置与入口、整机负载、谁在吃资源、用户、当前 K8s 视野。'
+      + '**问"我装了哪些应用""n8n 从哪进""机器忙不忙"先调它** —— 不要自己从 pod 拼，'
+      + '那会漏掉版本号和入口地址。',
+    schema: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', enum: OPS, description: OP_DOC },
+        name: { type: 'string', description: 'op=app 或 appcfg 时必填：应用名，例如 n8n' },
+      },
+      required: ['op'],
+      additionalProperties: false,
+    },
+    run: async ({ op, name } = {}) => {
+      if (!olares) {
+        return { error: '这台机器上没有 olares-cli（镜像里没装）。改用 sys_status / app_list 回答，并且告诉用户"系统层还没接"。' };
+      }
+      return await olares.read(op, name);
+    },
   });
 
   add('sys_status', {
@@ -342,6 +377,14 @@ export function makeTools(o = {}) {
       additionalProperties: false,
     },
     run: async ({ includeSystem } = {}) => {
+      /* 优先官方 CLI：它能给版本号、来源、市场分类，而 k8s 只能给"pod 在不在"。
+         失败（没装 / 没授权）才回落到老的 k8s 口径 —— 回落要在返回值里说出来，
+         否则模型会把"两份数据的差别"当成用户的应用变了。 */
+      if (olares) {
+        const r = await olares.read('apps');
+        if (!r.error) return { ...r, source: 'olares-cli' };
+        if (!cluster) return r;            // 没有 k8s 兜底时，把 CLI 的错原样交给模型
+      }
       if (!cluster) return { apps: MOCK_APPS };
       const r = await cluster.apps({ includeSystem: !!includeSystem });
       const st = await cluster.nodeMetrics().catch(() => null);

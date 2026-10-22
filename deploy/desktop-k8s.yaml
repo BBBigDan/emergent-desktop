@@ -259,6 +259,11 @@ spec:
               value: http://127.0.0.1:7801
             - name: TZ
               value: Asia/Shanghai
+            # olares-cli 的 profile 与 token 存在 $HOME 下（.olares-cli + .local/share）。
+            # 指到 state 卷上：**授权一次就够**，pod 重建不用重新登录。
+            # 落在镜像层的话每次重建都要重来一遍，而"什么时候重建"是 CI 决定的。
+            - name: HOME
+              value: /app/state/home
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -279,6 +284,9 @@ spec:
             - name: state
               mountPath: /app/agent/usage
               subPath: usage
+            - name: state
+              mountPath: /app/state/home
+              subPath: home
           readinessProbe:
             httpGet:
               path: /agent/api/health

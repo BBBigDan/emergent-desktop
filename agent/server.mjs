@@ -32,6 +32,7 @@ import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
 import { trimHistory } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
+import { createOlares } from './olares.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -86,6 +87,12 @@ const APPROVAL_MS = 90_000;
 /* ───────────────────────── 会话 ───────────────────────── */
 
 /** @type {Map<string, any>} */
+/* 官方 olares-cli 的封装。**全局一个**，不是每会话一个 ——
+   它只是 exec + 审计，没有会话状态（身份在 CLI 自己的 profile 里）。
+   探一次"装没装、有没有身份"，把结论打到启动日志：
+   没有它的时候系统层会退化成 k8s 视角，而那必须让人看得见。 */
+const olares = createOlares();
+
 const sessions = new Map();
 
 /* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
@@ -249,7 +256,7 @@ async function getSession(sid) {
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
       messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: padded(buildSystemPrompt()) }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS, memory, forge }),
+      tools: makeTools({ source: SYS, memory, forge, olares }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
       abortCtl: null,       // 这一轮的中断开关（用户按停）
@@ -1861,6 +1868,17 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 server.listen(PORT, () => {
   console.log(`emergent-agent  http://127.0.0.1:${PORT}/agent/`);
   console.log(`  model=${MODEL_ID}  data=${SYS}  base=${process.env.MODEL_BASE || 'https://api.siliconflow.cn/v1'}`);
+  /* 系统层的两个状态要分开报：**有没有这个二进制**、**有没有身份**。
+     混成一句的话，"没装"和"没授权"在日志里长得一样，排障时会白跑一圈。 */
+  olares.available()
+    .then(async (has) => {
+      if (!has) { console.log('[olares] 没有 olares-cli：系统层退化为 k8s 视角'); return; }
+      const p = await olares.probe();
+      console.log(p.ok
+        ? `[olares] CLI 就绪 · ${p.who}${p.role ? ` (${p.role})` : ''}`
+        : `[olares] CLI 就绪但没身份（${p.code}）：系统层要授权后才能用`);
+    })
+    .catch(() => console.log('[olares] 探测失败，按"没有"处理'));
   if (MODEL_ID !== 'mock' && !process.env.MODEL_KEY) {
     console.warn('  ⚠ 没有 MODEL_KEY，连上后会报错。在 agent/.env 里写 MODEL_KEY=sk-...');
   }
