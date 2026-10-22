@@ -57,12 +57,21 @@ export function wrapText(text, { size, maxWidth, maxLines, maxChars = 99 }) {
     if (ch === '\n') { flush(); continue; }
     const cw = widthOf(ch, size);
     if ((w + cw > maxWidth || cur.length >= maxChars) && cur.length) {
+      /* 回退找标点：只为"别把词从中间切开"，最多退一个词（3~6 个字符）。
+         **窗口不能按行长的百分比开** —— 以前是 `cur.length * 0.6`，29 字的一行
+         会一路退到第 20 字那个"、"，一行白丢 9 个字：
+         屏幕上 20 字只占 345px，而可用宽度是 636px，每行都短一截，
+         一段 66 字的话被排成 4 行（实测 2026-10-22）。
+         标点回退和"排满"是两个目标，前者只该有最后几个字符的话语权。 */
       let cut = -1;
-      for (let k = cur.length - 1; k >= Math.floor(cur.length * 0.6); k--) {
+      for (let k = cur.length - 1; k >= Math.max(0, cur.length - 6); k--) {
         if (BREAK.includes(cur[k])) { cut = k + 1; break; }
       }
       if (cut > 0) {
+        /* rest 要 trimStart：回退点落在一个空格上时，下一行会以空格开头 ——
+           左对齐下看起来像"这一行缩进了一格"，而它只是把空格算进了一个字的位置。 */
         const rest = cur.slice(cut);
+        while (rest.length && rest[0] === ' ') rest.shift();
         lines.push(cur.slice(0, cut).join('').trimEnd());
         cur = rest;
         w = rest.reduce((a, c) => a + widthOf(c, size), 0);
@@ -70,6 +79,11 @@ export function wrapText(text, { size, maxWidth, maxLines, maxChars = 99 }) {
         flush();
       }
     }
+    /* 行首不排空格：断行恰好落在词间空格上时，那个空格会成为新行的第一个字符，
+       左对齐下看起来像"这一行缩进了一格"。它本来只是词间距，不该占一个字的位置。
+       **必须放在断行之后** —— 断行发生在"处理这个空格"的时候，那时 cur 还是满的，
+       在断行前判断 `!cur.length` 永远为假（踩过一次）。 */
+    if (ch === ' ' && !cur.length) continue;
     cur.push(ch);
     w += cw;
   }
@@ -272,6 +286,21 @@ export function createAnswer({ field, alloc, reserve }) {
       field.slotBlank(start, reserve);
       startTyping({ instant: true });
       return true;
+    },
+
+    /**
+     * 调试：这一页实际排出来的行 + 排版参数。
+     *
+     * `answerGeom()` 是**外面算的**，这里是**里面记的** —— 两者不一致时
+     * （外面 636、里面按 337 排），看截图永远查不出来，只有把两份摆在一起才行。
+     */
+    debugLines: () => {
+      const ls = lines();
+      return {
+        maxWidth, maxChars, size, rows,
+        lines: ls.map((l) => `${Array.from(l).length}|${l.slice(0, 6)}`),
+        block: block.slice(0, 2).map((t) => ({ size: t.size, max: t.max, dead: t.dead })),
+      };
     },
 
     clear() { clearInterval(typer); full = ''; pages = ['']; page = 0; shown = total = 0; paint([''], 0); },

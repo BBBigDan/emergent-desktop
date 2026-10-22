@@ -1643,6 +1643,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       /* 调试用：几何是这一屏所有"看起来不对"的第一现场 */
       area: area ? { x: area.x, y: area.y, w: area.w, h: area.h } : null,
       face: faceGeom(),
+      /* 答案块的排版参数：字排不下时，先看这里是不是 maxWidth 小了，
+         而不是去猜字号或者截断逻辑（那一猜就是半小时）。 */
+      answerGeom: ans ? ansGeom() : null,
+      answerLines: ans ? ans.debugLines?.() : null,
       sceneArea: scene ? { x: scene.area.x, w: scene.area.w, busy: scene.busy, n: scene.spec?.layers?.length ?? -1 } : null,
     }),
   };

@@ -30,6 +30,29 @@ import { UI_ENV_DIM } from './field.js';
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
+/**
+ * 把标签压进给定宽度（px），超了就截断补 `…`。
+ *
+ * 为什么不能只给个 max 字数：`navidrome` 8 个拉丁字符只占 72px（9px/字），
+ * 而 4 个汉字就占 64px —— 同一个字数上限对两种文字是两种不同的宽度。
+ * 按 max: 4 给的时候屏幕上就是 `navi`/`qbit`，用户认不出那是哪个应用
+ * （实测 2026-10-22 线上）。所以按**宽度**算，不按字数。
+ *
+ * 系数 1.06 是字距（0.06em），和 answer.js 的 widthOf 同源。
+ */
+function fitLabel(text, size, maxW) {
+  const chars = Array.from(String(text ?? ''));
+  let w = 0;
+  const out = [];
+  for (const ch of chars) {
+    const cw = /[⺀-鿿豈-﫿＀-￯]/.test(ch) ? size : size * 0.56;
+    if (w + cw * 1.06 > maxW) return `${out.join('')}…`;
+    out.push(ch);
+    w += cw * 1.06;
+  }
+  return out.join('');
+}
+
 const COL = {
   ink: '#a9d4f7',
   dim: '#5d7fa4',
@@ -560,7 +583,9 @@ export class FieldScene {
         color: COL.ink, align: 'center', font: FONT_LAT, label: `gn-${spec.id}`,
       });
       layer.cap = new ParticleText({
-        field: f, alloc: this.alloc, x: cx, y: cy + 33, size: 16, max: 4,
+        /* max 给 10 而不是 4：真正的截断由 fitLabel 按**宽度**做（见上面那段）。
+           ParticleText 的 max 只是槽位预留的上限，给足了才不会二次截断。 */
+        field: f, alloc: this.alloc, x: cx, y: cy + 33, size: 16, max: 10,
         color: '#93b8d8', align: 'center', font: FONT, label: `gc-${spec.id}`,
         /* 场景里的 CJK 标签走**可读密度**："CPU"、"内容" 这几个字是
            看这块仪表的唯一线索，糊掉的话 71% 这个数字就无所指。 */
@@ -572,7 +597,11 @@ export class FieldScene {
        两个 0% 并排，看起来像"这两个应用没在跑"—— 而它们其实在跑，
        只是小。四舍五入到 0 是在用显示精度撒谎。 */
     layer.num.set(v > 0 && v < 0.005 ? '<1%' : `${Math.round(v * 100)}%`);
-    layer.cap.set(spec.label || '');
+    /* 竖排间距 140，标签 120 以内不会和上下两个仪表贴上；
+       横排三个仪表时间距 110，所以只给 96。
+       88（圆环直径）对拉丁名太紧：`qbittorrent` 11 个字符要 110px，
+       按环宽裁就是 `qbittorr…` —— 用户认不出是哪个应用。 */
+    layer.cap.set(fitLabel(spec.label, 16, vert ? 120 : 96));
     layer.detail = true;
     return layer;
   }
