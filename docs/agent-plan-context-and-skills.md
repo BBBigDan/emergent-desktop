@@ -1,12 +1,14 @@
 # 上下文管理 与 系统技能：方案
 
-> **落地状态（2026-10-22 晚）**：P1 / P2 / P3 / P4 已做，P5（写操作）没做。
+> **落地状态（2026-10-22 晚）**：P1~P5 都做了。
 > · 上下文 → `agent/history.mjs` 的 `compactPlan`/`applyCompact`、`server.mjs` 的
 >   `compactSession`/`newSession`，入口 `/compact` 与 `/new`（见 `agent/README.md`）。
 > · 技能 → `agent/skills.mjs` + 构建时 `olares-cli skills export`；`skill_use` 按需展开，
 >   并且**同时返回 ops**（文档是动词表，op 是能执行的那一小撮）。
 > · 系统层 → `agent/olares.mjs` 的 op 从 10 个扩到 16 个（加 appinfo/categories/pods/
 >   events/images/backup），形状对着线上真数据单测（`agent/olares.test.mjs`）。
+> · 写操作 → 单独的 `olares_act` 工具（danger 级），停/开/重启/装/升级/卸载/取消；
+>   实测 navidrome stop→stopped→resume→running。
 > 下面保留当初的判断过程，方便回头核对"为什么这么做"。
 
 > 提出的问题（2026-10-22）：
