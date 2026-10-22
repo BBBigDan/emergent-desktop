@@ -928,6 +928,11 @@ async function runTurn(s, goal) {
         .split('\n')
         .map((l) => l.trim())
         .filter(Boolean)
+        /* 以自造标注开头的行整行丢掉：`{手势} 把「内存」从 48% 拖到 34%`、
+           `【建议】...` —— 那是它给自己写的舞台提示，不是给用户的话。
+           实测原话就是这么上屏的（2026-10-22 线上实拍，答案最后一行）。
+           只认行首的短标注（≤8 字），免得误伤正文里正常的括号。 */
+        .filter((l) => !HEAD_TAG.test(l))
         /* 列表符号、序号都去掉：屏幕不解释 "-" 和 "1." */
         .map((l) => l.replace(/^\s*[-*·]\s*/, '').replace(/^\s*\d+[.、)]\s*/, ''))
         .join('\n')
@@ -1579,6 +1584,12 @@ const safeJSON = (v) => {
 };
 
 /* 工具名出现在"说的话"里 = 它在自言自语（"请调用 scene_ask ……"），不该给用户看 */
+/* 行首的自造标注：`{手势}`、`【建议】`、`(注)` 这类短括注。
+   模型会给自己写舞台提示，然后它一起被当成正文上屏 ——
+   实测原话："{手势} 把「内存」从 48% 拖到 34%"，就挂在答案最后一行。
+   只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
+const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
+
 const TOOL_WORDS = /(sys_status|app_list|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
