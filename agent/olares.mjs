@@ -68,6 +68,39 @@ const READ = {
 /** 需要 `name` 的 op */
 const NEED_NAME = new Set(['app', 'appcfg', 'appinfo', 'events']);
 
+/**
+ * 写操作 —— **单独一张表，不是 READ 的延伸**。
+ *
+ * 三条硬规矩（也写在 tools.mjs 的 olares_act 里）：
+ *   1. 每个动词都是固定 argv，模型只给应用名，拼不了 flag；
+ *   2. 全部走 danger 级审批门（`needsGate`），用户点头才跑；
+ *   3. `--watch` 有超时：等不到终态就返回"还没结束"，绝不当成失败。
+ *      装一个应用要拉镜像，90 秒等不到很正常 —— 把它报成失败会让人重试，
+ *      而重试一个正在跑的任务只会多一条排队。
+ */
+const WRITE = {
+  stop: (name) => ['market', 'stop', name],
+  resume: (name) => ['market', 'resume', name],
+  restart: (name) => ['market', 'restart', name],
+  install: (name) => ['market', 'install', name, '--watch', '--watch-timeout', '90s'],
+  upgrade: (name) => ['market', 'upgrade', name, '--watch', '--watch-timeout', '90s'],
+  uninstall: (name) => ['market', 'uninstall', name],
+  cancel: () => ['market', 'cancel'],
+};
+
+/** 可写的动词 */
+export const ACTS = Object.keys(WRITE);
+
+export const ACT_DOC = [
+  'stop=停掉一个应用（可 resume 回来）',
+  'resume=把停掉的应用开回来',
+  'restart=重启一个应用中',
+  'install=从市场装一个应用(name=市场里的名字)，最多等 90 秒',
+  'upgrade=升级到最新版',
+  'uninstall=卸载（数据一般保留，但入口没了）',
+  'cancel=取消正在进行的装/卸/升级',
+].join(' · ');
+
 /** 可用的 op 列表（工具 schema 的 enum 从这里来，别在两个地方各写一份） */
 export const OPS = Object.keys(READ);
 
@@ -618,10 +651,54 @@ export function createOlares(o = {}) {
     return data;
   }
 
+  /** 写一个 op（stop / resume / restart / install / upgrade / uninstall / cancel） */
+  async function act(op, name) {
+    const make = WRITE[op];
+    if (!make) return { error: `不能执行「${op}」。能写的只有：${ACTS.join(' / ')}` };
+    if (op !== 'cancel' && !name) return { error: `${op} 要给 name（应用名，例如 n8n）` };
+
+    const p = await probe();
+    if (!p.ok) return NOAUTH();
+
+    /* 装 / 升级要等 `--watch`，所以 exec 的超时必须**大于** watch-timeout，
+       否则 CLI 还没说话就被我们掐了，报出来的是"超时"而不是"还在装"。 */
+    const long = op === 'install' || op === 'upgrade';
+    const r = await run(make(name), { timeout: long ? 130_000 : 60_000 });
+    /* 写完必须让读缓存全失效 —— 否则下一次 apps 拿到的还是写之前那 15 秒的快照，
+       用户会看到"我明明停了它，怎么还显示 running"。 */
+    cache.clear();
+    if (!r.ok) {
+      return { error: r.error.message, code: r.error.code, op, name };
+    }
+    const d = r.data || {};
+    /* 实测（1.12.8，2026-10-22 线上，navidrome stop→resume）：
+     *   stop   → {app, operation:"stop", status:"accepted", message:"stop requested"}
+     *   resume → {app, operation:"resume", status:"accepted", message:"resume requested"}
+     *   随后 `market status` 才是 {name, state:"stopped"|"resuming", version, opType, message}
+     * 也就是说：**写操作自己不带终态**，`accepted` 只代表服务端收下了。
+     * `--watch` 才有 finalState；没有它的时候绝不能把 accepted 说成"好了"。 */
+    /* `--watch` 的语义：`.status` 判的是**这次动词**成不成功，`.finalState` 才是
+       应用落在哪。没有 `--watch` 时只有 `accepted` —— 那是"服务端收下了"，不是"好了"。 */
+    const status = d.status || '';
+    return {
+      done: true,
+      op,
+      name,
+      status,
+      finalState: d.finalState || d.state || '',
+      message: d.message || '',
+      /* 说人话的下一步。模型拿到这句话就不会把 accepted 说成"已经装好了"。 */
+      hint: status === 'accepted'
+        ? '服务端收下了这个请求，但还没结束。过几秒用 op=app 看它的状态，别当成功。'
+        : undefined,
+    };
+  }
+
   return {
     bin,
     probe,
     read,
+    act,
     /* 给自测用：拿真实 CLI 的原始输出喂进来，看压出来的形状对不对。
        这一层最容易错（字段名是猜的），而错了屏幕上不会报错，只会少一个数。 */
     shape,

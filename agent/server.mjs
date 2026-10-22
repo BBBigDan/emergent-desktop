@@ -510,8 +510,10 @@ function needsGate(s, name) {
 /* 这句话里有"托付动作"吗。
    中文里请求和疑问的边界很细：「能帮我把 x 挪走吗」是请求（带"挪"），
    「n8n 正常吗」是疑问（没有任何动作词）。所以先找动作词，再找疑问词 ——
-   顺序很重要，反过来所有客气的请求都会被误判成疑问。 */
-const ACT_WORDS = /(帮我|帮忙|替我|给我|麻烦|把|挪|移|删除|删掉|删了|清掉|清理|重装|装个|卸载|重启|重启一下|写|创建|新建|保存|压缩|改个名|重命名)/;
+   顺序很重要，反过来所有客气的请求都会被误判成疑问。
+   应用层的几个动词（停/开/装/升级）也要算动作 —— 少一个，"帮我停掉 n8n"
+   就会被判成"只是问问"，于是它查完状态就停在那里，用户以为自己说清楚了。 */
+const ACT_WORDS = /(帮我|帮忙|替我|给我|麻烦|把|挪|移|删除|删掉|删了|清掉|清理|重装|装个|卸载|重启|重启一下|停掉|停一下|停了它|关掉|开回|开一下|启动|装上|装一下|升级|取消|写|创建|新建|保存|压缩|改个名|重命名)/;
 const ASK_WORDS = /([?？]|吗|呢|是不是|有没有|为什么|为何|怎么|如何|什么|哪)/;
 
 function asksOnly(s) {
@@ -608,6 +610,22 @@ function describeDanger(s, name, args, extraNet) {
   }
   if (name === 'k8s_restart') {
     return { label: `重启「${args.app}」？`, detail: '它正在做的事会中断，十几秒不可用' };
+  }
+  if (name === 'olares_act') {
+    /* 卡片上那句短的进分叉（场里字很少），长的那句进日志。
+       四个动词的代价不一样，别统一说成"会改变这台机器上的东西" ——
+       "停"和"卸载"在下一次点击之后就分不出区别了。 */
+    const n = String(args?.name || '').trim();
+    const acts = {
+      stop: { label: `停掉「${n}」？`, detail: '它会在应用列表里变成已停止，随时能开回来' },
+      resume: { label: `开回「${n}」？`, detail: '会重新占内存，起来要十几秒' },
+      restart: { label: `重启「${n}」？`, detail: '正在跑的任务会中断，十几秒不可用' },
+      install: { label: `装「${n}」？`, detail: '会从市场拉镜像并创建它自己的命名空间，最慢几分钟' },
+      upgrade: { label: `升级「${n}」？`, detail: '会拉新版本并重启它，正在跑的任务会中断' },
+      uninstall: { label: `卸载「${n}」？`, detail: '入口会消失、数据一般保留，但重装不一定能接回原来的配置' },
+      cancel: { label: '取消当前操作？', detail: '停在半截的装/卸/升级会留在那个状态' },
+    };
+    return acts[args?.op] || { label: `${args?.op}「${n}」？`, detail: '会改变这台机器上的东西' };
   }
   if (name === 'tool_try') {
     const m = s.tools.all?.[String(args?.name || '')] || {};
@@ -1796,7 +1814,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：

@@ -20,7 +20,7 @@ import {
 } from './scene.schema.mjs';
 import { createK8s } from './sources/k8s.mjs';
 import { createFs } from './sources/fs.mjs';
-import { OPS, OP_DOC } from './olares.mjs';
+import { OPS, OP_DOC, ACTS, ACT_DOC } from './olares.mjs';
 
 const GB = 1024 ** 3;
 
@@ -305,6 +305,42 @@ export function makeTools(o = {}) {
         return { error: '这台机器上没有 olares-cli（镜像里没装）。改用 sys_status / app_list 回答，并且告诉用户"系统层还没接"。' };
       }
       return await olares.read(op, name);
+    },
+  });
+
+  /* ── 写操作：单独一个工具，**不给 op 枚举混在读里** ──
+   *
+   * 为什么不复用 olares 的 op 枚举：那个工具的 level 是 safe，而审批门是按
+   * **工具名**判 level 的（`s.tools.level(name)`）。把一个 danger 动词混进 safe 的
+   * 枚举里，等于给自己开一个"看参数决定要不要审批"的口子 —— 那种判据迟早会漏。
+   * 分成两个工具，谁危险一眼就能看出来，schema 也短。
+   */
+  add('olares_act', {
+    level: 'danger',
+    describe: '**改变这台机器**的动作：停/开/重启/装/升级/卸载一个应用，或取消正在进行的操作。'
+      + '只有用户**明确让你做**的时候才调（"帮我停掉 n8n"）；他只是问情况、问有没有问题时，'
+      + '一个都不要调 —— 先回答，再问要不要动手。每次调用都会让用户点头。',
+    schema: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', enum: ACTS, description: ACT_DOC },
+        name: { type: 'string', description: '应用名（op=cancel 时不用给）例如 n8n / navidrome' },
+      },
+      required: ['op'],
+      additionalProperties: false,
+    },
+    run: async ({ op, name } = {}) => {
+      if (!olares) {
+        return { error: '这台机器上没有 olares-cli，改不了任何东西。照实告诉用户。' };
+      }
+      if (!olares.act) return { error: '这个版本还没接写操作。' };
+      const r = await olares.act(op, name);
+      /* 写完之后"屏幕上那些读数"全都过期了：下一次 sys_status 会重取，
+         但这一轮已经铺出去的屏不会自己变 —— 让模型知道该重铺。 */
+      if (r && !r.error) {
+        return { ...r, next: '这一屏的读数是写之前的。要展示新状态就重新调 olares 的 apps/app。' };
+      }
+      return r;
     },
   });
 
