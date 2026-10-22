@@ -1890,9 +1890,11 @@ server.listen(PORT, () => {
   olares.available()
     .then(async (has) => {
       if (!has) { console.log('[olares] 没有 olares-cli：系统层退化为 k8s 视角'); return; }
-      const p = await olares.probe();
+      /* warm 而不是 probe：顺带把内存配额预取掉（overview 要 8.5 秒，
+         放在这里跑等于用户第一次提问不用等它）。 */
+      const p = await olares.warm();
       console.log(p.ok
-        ? `[olares] CLI 就绪 · ${p.who}${p.role ? ` (${p.role})` : ''}`
+        ? `[olares] CLI 就绪 · ${p.who}${p.role ? ` (${p.role})` : ''} · 配额预热中`
         : `[olares] CLI 就绪但没身份（${p.code}）：系统层要授权后才能用`);
     })
     .catch(() => console.log('[olares] 探测失败，按"没有"处理'));

@@ -81,6 +81,24 @@ export function createOlares(o = {}) {
   const ttl = o.ttl ?? 30_000;
 
   let probeCache = null;   // { at, ok, code, message, who }
+  /* 读结果缓存（见 read 里那段注释）。键是 `op:name`，只存成功的读。 */
+  const cache = new Map();
+  const RES_TTL = Number(process.env.OLARES_CACHE_MS || 15000);
+
+  /* 节点内存总量（算应用占比的分母）。
+
+     **实测两者完全一致**：`/proc/meminfo` 的 MemTotal 是 16375776 kB，
+     `dashboard overview` 的 memory.total 是 15992 MB —— 同一个数。
+     而前者 0 ms、后者 8.5 秒（它去查 Prometheus）。
+
+     所以分母读本机，overview 只做兜底（非 Linux、或容器没挂 procfs 时）。
+     这一条把"第一次问应用清单"从 9 秒降到 4 秒。
+
+     为什么非要分母：模型画仪表要 0~1 的占比，只有清单时会拿 0 顶上去 ——
+     屏幕上就是"n8n / navidrome / qbittorrent 全 0%"，那是**假数**。 */
+  let quota = null;      // { at, memTotal }
+  const QUOTA_TTL = 30 * 60_000;
+  let quotaInflight = null;
   let inflight = null;     // 同一刻只探一次（一轮里四个工具同时调很常见）
 
   /**
@@ -197,6 +215,19 @@ export function createOlares(o = {}) {
     if (!make) return { error: `不认识的 op：${op}。可用：${Object.keys(READ).join(' / ')}` };
     if (NEED_NAME.has(op) && !name) return { error: `${op} 要给 name（应用名）` };
 
+    /* **模型会重复调同一个 op**，不是偶尔，是实测每一轮都这样：一轮里
+       `market list --mine` 跑了两遍（日志里并排两条），每次 4~6 秒，
+       45 秒都收不了尾。缓存不是为了省时间，是为了让"重复调"这件事不产生代价 ——
+       它重复调是因为拿不准第一次的结果够不够，罚它 6 秒只会让它更慢。
+
+       TTL 8 秒 ≈ 一轮的长度。同一轮里是**同一时刻的读数**，不违反"只认本轮读数"；
+       跨轮（8 秒以上）自然重取。命中的结果带 `cached: true`，模型知道这不是新取的。 */
+    const key = `${op}:${name || ''}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < RES_TTL) {
+      return { ...hit.data, cached: true, ageMs: Date.now() - hit.at };
+    }
+
     const p = await probe();
     if (!p.ok) return NOAUTH();
 
@@ -204,7 +235,7 @@ export function createOlares(o = {}) {
        三个 exec **并行**跑，总耗时约等于最慢那个（~2s）；串行要 5s 以上。
        为什么非要合并：模型画仪表要 0~1 的占比，只有清单时会拿 0 顶上去 ——
        屏幕上就是"n8n / navidrome / qbittorrent 全 0%"，那是**假数**。 */
-    if (op === 'apps') return await readApps();
+    if (op === 'apps') return remember(key, await readApps());
 
     const r = await run(make(name));
     if (!r.ok) {
@@ -215,22 +246,63 @@ export function createOlares(o = {}) {
       }
       return { error: r.error.message, code: r.error.code };
     }
-    return shape(op, r.data, name);
+    return remember(key, shape(op, r.data, name));
+  }
+
+  /** /proc/meminfo 的 MemTotal（字节）。读不到就返回 null，不抛 */
+  async function readMemTotal() {
+    try {
+      const fs = await import('node:fs/promises');
+      const txt = await fs.readFile('/proc/meminfo', 'utf8');
+      const m = /^MemTotal:\s+(\d+)\s+kB/m.exec(txt);
+      return m ? Number(m[1]) * 1024 : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 节点内存总量（字节）：本机优先，overview 兜底 */
+  async function memTotal(wait = true) {
+    if (quota && Date.now() - quota.at < QUOTA_TTL) return quota.memTotal;
+
+    const local = await readMemTotal();
+    if (local) {
+      quota = { at: Date.now(), memTotal: local };
+      return local;
+    }
+
+    if (!quotaInflight) {
+      quotaInflight = (async () => {
+        const r = await run(['dashboard', 'overview'], { timeout: 30_000 });
+        const t = r.ok
+          ? (r.data?.sections?.physical?.items || []).find((x) => x?.raw?.metric === 'memory')?.raw?.total
+          : null;
+        if (t) quota = { at: Date.now(), memTotal: t };
+        quotaInflight = null;
+        return t || null;
+      })();
+    }
+    return wait ? quotaInflight : null;
+  }
+
+  /** 写缓存（只缓存成功的读；错误是"此刻的状态"，不该被记忆 15 秒） */
+  function remember(key, data) {
+    if (data && !data.error) cache.set(key, { at: Date.now(), data });
+    return data;
   }
 
   /** apps：清单 + 占用 + 总量，合成一份 */
   async function readApps() {
-    const [mk, ap, ov] = await Promise.all([
+    const [mk, ap, totalBytes] = await Promise.all([
       run(['market', 'list', '--mine']),
       run(['dashboard', 'applications']),
-      run(['dashboard', 'overview'], { timeout: 30_000 }),
+      /* 分母走配额缓存（启动时已预取）。冷启动时才真去等那 8.5 秒 */
+      memTotal(true),
     ]);
     if (!mk.ok) {
       if (mk.error.code?.startsWith('auth_')) return { error: `Olares 不认这个身份了（${mk.error.code}），要重新授权。` };
       return { error: mk.error.message };
     }
-    const totalBytes = (ov.ok ? (ov.data?.sections?.physical?.items || []) : [])
-      .find((x) => x?.raw?.metric === 'memory')?.raw?.total || null;
     const usage = new Map(((ap.ok ? ap.data?.items : []) || []).map((it) => [it?.raw?.app, it.raw || {}]));
     const list = Array.isArray(mk.data) ? mk.data : (mk.data?.items || []);
     return {
@@ -370,6 +442,24 @@ export function createOlares(o = {}) {
     bin,
     probe,
     read,
+
+    /**
+     * 启动预热：探身份 + 把内存分母读进来。
+     *
+     * 探身份要 0.9 秒（起一个进程 + 读配置文件），而且 token 有效期内结论不变。
+     * 放在启动时做，用户第一次提问就不用付这笔钱 —— 而"pod 起来"到
+     * "用户打开页面开始问"之间通常有十几秒，正好装得下。
+     *
+     * 失败不抛：预热是**优化**，不是前置条件。
+     */
+    async warm() {
+      const p = await probe();
+      if (!p.ok) return { ok: false, code: p.code };
+      /* 只触发不等 —— 用户第一次问 apps 时如果配额还没到，readApps 会等它 */
+      memTotal(false);
+      return { ok: true, who: p.who, role: p.role };
+    },
+
     /** 命令行本身在不在（镜像装没装）。给自检和启动日志用 */
     async available() {
       const r = await run(['version'], { timeout: 6000 });
