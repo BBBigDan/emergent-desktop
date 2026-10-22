@@ -77,7 +77,10 @@ export function createOpenAIModel(o = {}) {
    JSON 外壳就贴着 2000 的天花板），中文长回答会在最后一句中途断掉 ——
    屏幕上就是"没写完"，而 `finish_reason=length` 只在服务端打一行日志。 */
   const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 4096);
-  const timeoutMs = Number(o.timeoutMs ?? process.env.MODEL_TIMEOUT ?? 45_000);
+  /* 45s → 90s。7B 写 1000 字中文 + JSON 外壳大约 40~60 秒（实测一轮 1200 字的回答
+     在 45 秒那道坎上被砍，屏幕上只剩"模型没响应"）。
+     超时的代价是**整轮白等**，所以宁可多等一会；用户按停能立刻打断（见下面的 signal）。 */
+  const timeoutMs = Number(o.timeoutMs ?? process.env.MODEL_TIMEOUT ?? 90_000);
   const retries = Number(o.retries ?? 2);
 
   if (!apiKey) {

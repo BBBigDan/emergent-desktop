@@ -299,6 +299,44 @@ function shrinks(next, prev) {
   return !newAsk && !newNote;
 }
 
+/**
+ * 兜底铺一屏：模型没给出这一屏（空回复、超时、429）时，用**这一轮已经拿到的读数**铺。
+ *
+ * 两条触发路径共用它：
+ *   · 模型回了空 —— 出现在正常流程末尾（原来那段内联代码就在这儿）；
+ *   · 模型抛异常 —— 出现在 catch 里。**这一条以前没有**，所以超时的时候
+ *     屏幕上只有"模型没响应"，而工具其实 4 秒前就把 3 个应用和它们的版本
+ *     递到手上了。信息在手里、却因为"最后一个环节失败"整个丢掉，是最亏的一种失败。
+ *
+ * 返回 true 表示铺了。`s.salvaged` 挡住重复：空回复路径铺过之后，
+ * catch 里不该再铺一次（屏幕上会闪两下）。
+ */
+async function salvage(s) {
+  if (s.salvaged || s.drew) return false;
+  if (s.goal?.kind !== 'ask') return false;
+  const freshStatus = s.statusTurn === s.turn ? s.lastStatus : null;
+  const freshApps = s.appsTurn === s.turn ? (s.lastApps || []) : [];
+  if (!freshStatus && !freshApps.length) return false;
+
+  s.salvaged = true;
+  const line = s.lastVoice
+    || (freshStatus
+      ? `CPU ${Math.round((freshStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((freshStatus.mem ?? 0) * 100)}%`
+      : `${freshApps.length} 个应用在跑`);
+  /* 曲线只在有**本轮**节点读数时才配。应用列表那类问题如果也挂一条 CPU 曲线，
+     屏幕上就是"三个应用 + 一条不相干的 CPU 走势"，比没有更让人困惑。 */
+  const built = defaultOverview(
+    freshStatus || {}, freshApps, line,
+    freshStatus ? await trendSeries(s.tools) : null,
+    { note: !s.spoke },
+  );
+  if (!built) return false;
+  if (!s.spoke) { s.spoke = true; speak(s, built.say); }
+  emit(s, { t: 'scene', op: 'set', spec: built.spec });
+  emit(s, { t: 'note', message: '模型没有给出这一屏，由系统按读数兜底铺开' });
+  return true;
+}
+
 async function trendSeries(tools) {
   if (!tools.series) return null;
   try {
@@ -729,6 +767,7 @@ async function runTurn(s, goal) {
   s.sets = 0;
   s.lastSpecSig = null;
   s.drew = false;           // 这一轮模型有没有自己铺屏（没铺就由系统兜底）
+  s.salvaged = false;       // 这一轮有没有已经兜底铺过（见 salvage）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
   s.traced = null;          // 这一轮它有没有把注入的旧事说出来（说了就记下编号）
@@ -1464,26 +1503,18 @@ async function runTurn(s, goal) {
       });
     }
 
-    if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') {
-      const line = s.lastVoice
-        || (freshStatus
-          ? `CPU ${Math.round((s.lastStatus.cpu ?? 0) * 100)}% · 内存 ${Math.round((s.lastStatus.mem ?? 0) * 100)}%`
-          : `${s.lastApps.length} 个应用在跑`);
-      /* 曲线只在有**本轮**节点读数时才配。应用列表那类问题如果也挂一条 CPU 曲线，
-         屏幕上就是"三个应用 + 一条不相干的 CPU 走势"，比没有更让人困惑。 */
-      const built = defaultOverview(
-        freshStatus ? s.lastStatus : {}, s.lastApps || [], line,
-        freshStatus ? await trendSeries(s.tools) : null,
-        { note: !s.spoke },
-      );
-      if (built) {
-        if (!s.spoke) { s.spoke = true; speak(s, built.say); }
-        emit(s, { t: 'scene', op: 'set', spec: built.spec });
-        emit(s, { t: 'note', message: '模型没有给出这一屏，由系统按读数兜底铺开' });
-      }
-    }
+    if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') await salvage(s);
   } catch (e) {
-    if (e !== ABORT_TURN) emit(s, { t: 'error', message: String(e?.message || e) });
+    if (e !== ABORT_TURN) {
+      /* 模型挂了（超时 / 429 / 连不上）时，**先把已经拿到的数据铺出来**。
+         用户问"我装了哪些应用"，工具明明 4 秒就跑完了，屏幕上却只有
+         "模型没响应" —— 那是把已经到手的信息扔掉了。
+         （实测：60 秒超时，2 个应用、版本、CPU 全在手里，屏幕一片黑。） */
+      try {
+        await salvage(s);
+      } catch { /* 兜底再失败就算了，别把原始错误盖掉 */ }
+      emit(s, { t: 'error', message: String(e?.message || e) });
+    }
   } finally {
     if (aborted) {
       healToolCalls(s);
