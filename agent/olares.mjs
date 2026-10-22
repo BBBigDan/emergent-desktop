@@ -200,6 +200,12 @@ export function createOlares(o = {}) {
     const p = await probe();
     if (!p.ok) return NOAUTH();
 
+    /* apps 要三份数据才够用：清单（版本/来源）、占用（cpu/内存）、总量（算占比）。
+       三个 exec **并行**跑，总耗时约等于最慢那个（~2s）；串行要 5s 以上。
+       为什么非要合并：模型画仪表要 0~1 的占比，只有清单时会拿 0 顶上去 ——
+       屏幕上就是"n8n / navidrome / qbittorrent 全 0%"，那是**假数**。 */
+    if (op === 'apps') return await readApps();
+
     const r = await run(make(name));
     if (!r.ok) {
       /* 认证类错误要说得比 CLI 原文更像人话，并且**提示可恢复** */
@@ -210,6 +216,48 @@ export function createOlares(o = {}) {
       return { error: r.error.message, code: r.error.code };
     }
     return shape(op, r.data, name);
+  }
+
+  /** apps：清单 + 占用 + 总量，合成一份 */
+  async function readApps() {
+    const [mk, ap, ov] = await Promise.all([
+      run(['market', 'list', '--mine']),
+      run(['dashboard', 'applications']),
+      run(['dashboard', 'overview'], { timeout: 30_000 }),
+    ]);
+    if (!mk.ok) {
+      if (mk.error.code?.startsWith('auth_')) return { error: `Olares 不认这个身份了（${mk.error.code}），要重新授权。` };
+      return { error: mk.error.message };
+    }
+    const totalBytes = (ov.ok ? (ov.data?.sections?.physical?.items || []) : [])
+      .find((x) => x?.raw?.metric === 'memory')?.raw?.total || null;
+    const usage = new Map(((ap.ok ? ap.data?.items : []) || []).map((it) => [it?.raw?.app, it.raw || {}]));
+    const list = Array.isArray(mk.data) ? mk.data : (mk.data?.items || []);
+    return {
+      apps: list.map((a) => {
+        const u = usage.get(a.name) || {};
+        const memPct = (u.memory != null && totalBytes)
+          ? Math.round((u.memory / totalBytes) * 1000) / 1000
+          : undefined;
+        return {
+          name: a.name,
+          title: a.title || a.name,
+          version: a.version || '',
+          state: a.state || u.state || '',
+          source: a.source || '',
+          /* cpu 是 0~1；memMB 是无量纲的"多少兆"；memPct 是相对总内存 —— 
+             两个都给，因为模型看到 memMB 会自己除 1000（记忆里踩过），
+             而仪表要的是 memPct。 */
+          cpu: typeof u.cpu === 'number' ? Math.round(u.cpu * 1000) / 1000 : undefined,
+          memMB: typeof u.memory === 'number' ? Math.round(u.memory / 1024 / 1024) : undefined,
+          memPct,
+        };
+      }),
+      count: list.length,
+      /* 总内存一起给：没有它，memPct 就是一个无法核对的百分比 */
+      memTotalMB: totalBytes ? Math.round(totalBytes / 1024 / 1024) : undefined,
+      usageAt: ap.ok ? ap.data?.meta?.fetched_at : undefined,
+    };
   }
 
   /**
