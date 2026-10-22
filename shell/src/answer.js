@@ -125,10 +125,14 @@ export function createAnswer({ field, alloc, reserve }) {
       const t = block[i];
       t.x = cx;
       t.y = baseY - (ls.length - 1 - i) * lh;
-      const s = ls[i] ?? '';
       if (i >= ls.length) { t.set('', { force: true }); continue; }
-      const take = Math.min(s.length, Math.max(0, left));
-      t.set(s.slice(0, take), { force: true, color, scl: 1.25 });
+      let chars = Array.from(ls[i] ?? '');
+      /* 槽位不够时 ParticleText 会把自己的 max 压小（第二行常只剩十几格），
+         于是一句话被**静默**截在半路 —— 读的人会以为它本来就在那儿结束。
+         截断处补一个省略号，让"没说完"这件事看得见。 */
+      if (chars.length > t.max) chars = chars.slice(0, Math.max(1, t.max - 1)).concat('…');
+      const take = Math.max(0, Math.min(chars.length, left));
+      t.set(chars.slice(0, take).join(''), { force: true, color, scl: 1.25 });
       left -= take;
     }
   }
