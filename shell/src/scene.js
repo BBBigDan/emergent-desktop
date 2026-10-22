@@ -127,6 +127,11 @@ export class FieldScene {
     this.rev = 0;
     this.tr = null;              // 进行中的相变
     this.a11y = o.a11y || null;  // 可访问性镜像层（见 aria.js）
+    /* 场打开时背景那 6400 颗环境粒子还留多亮。
+       0.84 是"桌面球面还在，但不抢戏"；但一旦屏幕上要读几行大字，0.84 就是
+       "在点阵上写字"—— 字的缝里全是背景点，实测非常糊。所以桌面里的 agent
+       传一个更低的数（见 deskagent 的 ENV_DIM_AGENT），让背景真的退成底噪。 */
+    this.envDim = o.envDim ?? UI_ENV_DIM;
     /* 系统级降低动态：场的"活着"本身是动态，所以这里只能减幅不能归零，
        否则"流到哪了"这种信息就没了。 */
     this.reduced = typeof matchMedia === 'function'
@@ -154,7 +159,7 @@ export class FieldScene {
      * 原来是 0.97：桌面球面和场几乎一样亮，两套点阵叠在一起，分不清哪层是界面。
      * 场展开时桌面本该让位 —— 让球退成很淡的底噪，它还在（用户知道桌面没走），
      * 但不再和仪表抢注意力。具体数值见 field.js 的 UI_ENV_DIM（只能有一个出处）。 */
-    f.slotBegin({ dim: UI_ENV_DIM, dot: 0.95 });
+    f.slotBegin({ dim: this.envDim, dot: 0.95 });
 
     const list = (spec.layers || []).filter((x) => x && x.kind);
     /* 只有 focus 那一个进 L2（凝聚成字），其余只给形状 —— 这是注意力分层，
@@ -164,23 +169,31 @@ export class FieldScene {
     /* 先排带，再让各层进带。每层自己往上加常数的做法，加法一多必然撞。 */
     this.L = this._bands(list, a);
 
+    /* 每种层单独兜底：槽位是一条有限的直线，某一层（尤其是装饰性的乱团、
+       分叉流光）铺不下时，**丢那一层**，不要整屏不铺。
+       实测过一次：turbulence 差 138 颗就抛异常，screen 上什么反应都没有 ——
+       看不见的错误比少画一个乱团严重得多。 */
+    const guard = (label, fn) => {
+      try { fn(); } catch (e) { console.warn(`[scene] ${label} 铺不下：${e.message}`); }
+    };
+
     const gauges = list.filter((l) => l.kind === 'gauge');
-    gauges.forEach((l, i) => this._gauge(l, i, gauges.length, a));
+    guard('gauge', () => gauges.forEach((l, i) => this._gauge(l, i, gauges.length, a)));
 
-    list.filter((l) => l.kind === 'stream').forEach((l, i) => this._stream(l, i, a));
+    guard('stream', () => list.filter((l) => l.kind === 'stream').forEach((l, i) => this._stream(l, i, a)));
 
-    list.filter((l) => l.kind === 'trace').forEach((l, i) => this._trace(l, i, a));
+    guard('trace', () => list.filter((l) => l.kind === 'trace').forEach((l, i) => this._trace(l, i, a)));
 
     const forks = list.filter((l) => l.kind === 'fork');
-    forks.forEach((l) => this._fork(l, a));
+    guard('fork', () => forks.forEach((l) => this._fork(l, a)));
 
-    list.filter((l) => l.kind === 'condense').forEach((l, i) => this._condense(l, i, a));
+    guard('condense', () => list.filter((l) => l.kind === 'condense').forEach((l, i) => this._condense(l, i, a)));
 
-    list.filter((l) => l.kind === 'turbulence').forEach((l) => this._turbulence(l, a));
+    guard('turbulence', () => list.filter((l) => l.kind === 'turbulence').forEach((l) => this._turbulence(l, a)));
 
     /* focus 的细节：任何 kind 都可以有一个 valueText，挂在它的锚点上 */
     const fl = list.find((l) => l.id === focus);
-    if (fl) this._detail(this.layers.get(fl.id) || { spec: fl, anchor: null }, a);
+    guard('detail', () => { if (fl) this._detail(this.layers.get(fl.id) || { spec: fl, anchor: null }, a); });
 
     this.spec = spec;
     this.focus = focus;
@@ -724,10 +737,17 @@ export class FieldScene {
         const p = path((k + 0.5) / N);
         arr.push({ x: p.x, y: p.y, ink: 0.6 });
       }
-      const base = this.alloc.alloc(N, `fork-${o.id}`);
-      f.slotPut(base, arr, rgb(si === 0 ? COL.ok : COL.dim), 0.9);
-      const idx = Uint16Array.from(arr, (_, k) => ((base + k) * 7919 + 13) % 6400);
-      this.flows.push({ id: `${spec.id}:${o.id}`, idx, s0: 0, path, speed: 0.16, jitter: 0.4 });
+      /* 槽位不够时**丢掉这条流光，留住文字** —— 分叉的文字是能点的，
+         流光只是"这条路通向哪"的提示。为一条装饰线让整屏铺不出来是最坏的选择
+         （实测：预算差 52 颗就抛异常，screen 上直接什么都不剩）。 */
+      let base = -1;
+      let idx = null;
+      try {
+        base = this.alloc.alloc(N, `fork-${o.id}`);
+        f.slotPut(base, arr, rgb(si === 0 ? COL.ok : COL.dim), 0.9);
+        idx = Uint16Array.from(arr, (_, k) => ((base + k) * 7919 + 13) % 6400);
+        this.flows.push({ id: `${spec.id}:${o.id}`, idx, s0: 0, path, speed: 0.16, jitter: 0.4 });
+      } catch { /* 挤不下就不画这条线 */ }
 
       const txt = new ParticleText({
         field: f, alloc: this.alloc, x: cx + dir * 240, y: cy + 96, size: 16, max: 7,

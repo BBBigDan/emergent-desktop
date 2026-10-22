@@ -213,7 +213,13 @@ export class ParticleText {
     this.align = o.align ?? 'left';
     this.font = o.font || '';
     this.weight = o.weight ?? 300;
-    this.dot = o.dot ?? 1;
+    /* 点径倍数。实测两件事：
+       1. gl_PointSize 的**可见芯**大约只有标称值的 0.43（叠了柔光晕），
+          所以 1.0 的倍率在屏幕上就是一颗 ~1px 的芯；
+       2. 点格间距 ≈ size/10，所以**字号越大，点越该大**，否则笔画成"一串珠子"。
+       按 size×0.075 给：16px → 1.2（标签刚好接住），32px → 2.4（大字是实线），
+       22px → 1.65。写死成一个数必然一边糊一边断 —— 两种字号都试过。 */
+    this.dot = o.dot ?? Math.min(2.4, Math.max(0.8, o.size * 0.075));
     this.budget = glyphBudget(o.size);
     /**
      * 槽位不够就**把字数上限往下压**，而不是抛异常。
@@ -269,8 +275,12 @@ export class ParticleText {
       cx += metrics[i].advance;
       const prev = this._slots[i];
       /* 同一个字、同一个位置 → 那段槽位早就对了，直接跳过。
-         这是"打字不整屏重排"的全部秘密：跳过的字连采样都不做。 */
-      if (!opt.force && prev && prev.ch === ch && Math.abs(prev.x - gx) < 0.01) continue;
+         这是"打字不整屏重排"的全部秘密：跳过的字连采样都不做。
+         **y 必须一起比。** 只比 x 的话，一行字整体上移/下移（换档、改行数、
+         窗口缩放）时会被判成"没变"而跳过 —— 旧位置那行字留在原地，
+         新位置那行字画不出来，屏幕上出现两块叠着的残字（实测踩过）。 */
+      if (!opt.force && prev && prev.ch === ch && prev.y === this.y
+        && Math.abs(prev.x - gx) < 0.01) continue;
       const pts = metrics[i].pts.map((p) => ({ x: gx + p.x, y: this.y + p.y, ink: p.ink }));
       /* spawn：新字在这一格附近凝结，而不是从球面某处飞过来 ——
          观感上是"笔尖落墨、墨自己收成字"，DOM 里没有对应的东西。
@@ -278,7 +288,7 @@ export class ParticleText {
       const spawn = opt.spawn
         ? { x: gx + metrics[i].advance * 0.5, y: this.y - this.size * 0.34, r: this.size * 0.55 }
         : null;
-      this.field.slotPut(this.base + i * this.budget, pts, rgb, opt.scl ?? 1, spawn);
+      this.field.slotPut(this.base + i * this.budget, pts, rgb, opt.scl ?? 1, spawn, this.dot);
       /**
        * 每格必须"写满或清空"。
        *
@@ -290,7 +300,7 @@ export class ParticleText {
       if (pts.length < this.budget) {
         this.field.slotBlank(this.base + i * this.budget + pts.length, this.budget - pts.length);
       }
-      this._slots[i] = { ch, x: gx };
+      this._slots[i] = { ch, x: gx, y: this.y };
       wrote++;
     }
 

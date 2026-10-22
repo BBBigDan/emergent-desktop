@@ -1866,7 +1866,7 @@ export class Field {
    * @param {{x:number,y:number,ink:number}[]} pts 屏幕坐标（相对视口左上）
    * @param {number[]} col [r,g,b] 0..1
    */
-  slotPut(base, pts, col, scl = 1, spawn = null) {
+  slotPut(base, pts, col, scl = 1, spawn = null, dotScale = 1) {
     const n = AMBIENT_N;
     const cx = this.W * 0.5;
     const cy = this.H * 0.5;
@@ -1884,7 +1884,10 @@ export class Field {
       this.drawX[i] = p.x - cx;
       this.drawY[i] = cy - p.y;           // canvas 的 y 向下、场的 y 向上
       this.drawA[i] = (0.55 + 0.45 * ink) * scl;
-      this.drawS[i] = (1.9 + 0.8 * ink) * dot;
+      /* dotScale：给大字用的点径倍数。32px 的汉字点格约 3.2px，而默认点径只有
+         2.2 —— 笔画是"一串珠子"，远看发灰。放大到点和格相接（约 1.5 倍）才成线。
+         这条只对调用方显式传的生效，场景里的读数/标签保持原样。 */
+      this.drawS[i] = (1.9 + 0.8 * ink) * dot * dotScale;
       this.drawD[i] = 0;
       this.drawCol[i * 3] = col[0];
       this.drawCol[i * 3 + 1] = col[1];

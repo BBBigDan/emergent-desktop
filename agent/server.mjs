@@ -1073,9 +1073,9 @@ async function runTurn(s, goal) {
           }
           if (!result.duplicate && result.say) {
             s.spoke = true;
-            s.lastVoice = String(result.say).slice(0, 40);
+            s.lastVoice = String(result.say).slice(0, 64);
             s.lastLine = s.lastVoice;
-            speak(s, String(result.say).slice(0, 40));
+            speak(s, String(result.say).slice(0, 64));
           }
           if (!result.duplicate) {
             s.drew = true;
