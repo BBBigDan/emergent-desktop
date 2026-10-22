@@ -28,6 +28,12 @@ COPY shell/ /app/shell/
 # 在没有 nginx 时也能跑起来（`?dev=1` 那条路）。同源同内容，不会漂移。
 ENV WEB_ROOT=/app/shell
 
+# 官方技能包：12 份 SKILL.md 编在二进制里，`skills export` 落成文件。
+# **构建时导出、运行时不 spawn** —— skills.mjs 只读盘、按需压缩。
+# 这是"技能和二进制同版本"的唯一保证：文档改了，一定是跟着这次构建改的。
+RUN /usr/local/bin/olares-cli skills export /app/agent/olares-skills \
+ && ls /app/agent/olares-skills | wc -l
+
 # 两个运行时要写目录，清单里会挂 hostPath 盖掉（会话存档 + token 日账本，
 # 属于"跨重启该留下的数据"，不该跟着镜像版本来回变）。这里先建出来，
 # 保证单独跑这个镜像时也能起来。

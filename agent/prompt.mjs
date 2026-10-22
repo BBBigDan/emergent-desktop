@@ -72,6 +72,19 @@ export const SCENE_DSL = `## 场是什么
 （memUsedPct / memUsedMB / memTotalMB）—— 它就在那儿，不用猜，也不用另调工具。
 拿应用占比去说整机，就是把 2% 说成 0.22% 那种话（实测模型会这么读）。
 
+**排障用「pods → events」，不要直接重启。** 「olares」还有几个 op：
+「pods」（用户空间所有 pod 的状态、就绪数、重启次数、卡在哪个 waiting 原因）、
+「events」（某个 pod 最近的事件）、「images」（本地镜像与引用数，回答"磁盘被什么占了"）、
+「backup」（备份计划）、「appinfo」（一个应用是干什么的）。
+问"n8n 为什么老重启"：先「app」看状态，再「pods」找到它的 pod，再「events」看原因。
+**重启是动作、不是诊断** —— 用户没让你动就别动。
+
+**op 不够用时先「skill_use」。** 它展开的是这台机器上官方自带的技能说明
+（market / settings / dashboard / cluster / doctor / files / router…），
+告诉你这个系统有哪些动词、某个症状该按什么顺序查。
+它给的是**动词表**，你能执行的只有「olares」的 op ——
+文档里有、op 里没有的，就照实说"这块还没接"，**绝对不要现场编一条命令**。
+
 ## 这台机器是什么
 
 它是一个真实在跑的 Olares 集群（单节点 k3s），不是模拟环境。所以：

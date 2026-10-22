@@ -33,6 +33,11 @@ import { createMeter, estTokens, ymd } from './usage.mjs';
 import { trimHistory } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
+import { createSkills } from './skills.mjs';
+import {
+  compactPlan, applyCompact, transcriptFor,
+  COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
+} from './history.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');            // 仓库根
@@ -93,6 +98,11 @@ const APPROVAL_MS = 90_000;
    没有它的时候系统层会退化成 k8s 视角，而那必须让人看得见。 */
 const olares = createOlares();
 
+/* 官方技能包（12 份 SKILL.md，构建时从 olares-cli 里 export 出来）。
+   索引在启动时读一次（`await skills.index()`，见 listen 之前），
+   因为工具 schema 的 enum 用的是**同步**拿到的名字表。 */
+const skills = createSkills();
+
 const sessions = new Map();
 
 /* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
@@ -114,11 +124,14 @@ async function loadSession(sid) {
 
 let saveTimer = null;
 function scheduleSave(s) {
+  /* 已经归档的会话不该再写回来（见 newSession）。 */
+  if (s.dead) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => { saveNow(s).catch(() => {}); }, 800);
 }
 
 async function saveNow(s) {
+  if (s.dead) return;
   try {
     await fs.mkdir(SESS_DIR, { recursive: true });
     const data = {
@@ -256,7 +269,7 @@ async function getSession(sid) {
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
       messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: padded(buildSystemPrompt()) }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS, memory, forge, olares }),
+      tools: makeTools({ source: SYS, memory, forge, olares, skills }),
       model: null,
       pending: null,        // 审批挂起：{id, resolve}
       abortCtl: null,       // 这一轮的中断开关（用户按停）
@@ -711,6 +724,174 @@ function healToolCalls(s) {
  *  为什么必须在这里做：工具表 6k token 是**每一次调用**都要重发的，
  *  而造工具那六件 + 1500 token 的规程，三十轮里难得用一次。
  */
+/* ───────────── 上下文：压缩（摘要）与会话（换 sid） ───────────── */
+
+const COMPACT_MIN = Number(process.env.COMPACT_MIN || 6);   // 少于这么多条就别压（压了也是空话）
+
+/** 现在的水位（百分比）。给状态条和"压缩一下"的反馈用。 */
+function ctxPct(s) {
+  const snap = s.meter?.snap();
+  if (!snap?.limit) return 0;
+  return Math.round((snap.ctx.tokens / snap.limit) * 100);
+}
+
+/**
+ * 把"更早的那段"讲成一段话，替换进去。
+ *
+ * 和 trimHistory 的分工：
+ *   · trimHistory 是**兜底**（接口 400 的最后一道），丢掉最老的消息；
+ *   · 这个是**正解**（用户想接着聊），先摘要再丢。
+ * 顺序也是这个：先试压缩，失败或没得压才回落到丢。
+ *
+ * 为什么不等"满了再说"：压缩本身要一次模型调用，而调用发生在**下一轮开始前**。
+ * 所以它必须在 78% 这个阈值上动手，给摘要留出时间 —— 等真满了，
+ * 那一轮已经被 400 挡在门外了。
+ */
+async function compactSession(s, { manual = false } = {}) {
+  if (!s.model) return { ok: false, reason: 'no-model' };
+  if ((s.messages || []).length < COMPACT_MIN) return { ok: false, reason: 'short' };
+
+  const plan = compactPlan(s.messages, { tail: 4 });
+  if (!plan) return { ok: false, reason: 'short' };
+
+  const txt = transcriptFor(plan.head);
+  /* 上下文很小时压缩是纯亏（一次调用的钱换不到几百 token）——
+     手动压是用户的要求，照做；自动压只在真的长起来之后才动。 */
+  if (!manual && txt.length < 1200) return { ok: false, reason: 'short' };
+
+  const t0 = Date.now();
+  let out;
+  try {
+    out = await s.model.complete({
+      messages: [
+        { role: 'system', content: COMPACT_SYS },
+        { role: 'user', content: txt },
+      ],
+      tools: [],
+    });
+  } catch (e) {
+    console.warn('[ctx] 压缩失败：' + e.message);
+    return { ok: false, reason: 'model', error: e.message };
+  }
+  const applied = applyCompact(s.messages, plan, out.content);
+  if (!applied) return { ok: false, reason: 'empty' };
+
+  const before = s.messages.length;
+  s.messages = applied.messages;
+  s.compactedAt = Date.now();
+  /* 这一次调用也要进账本 —— 不然"压缩省了钱"是个无法核对的说法 */
+  try { recordUsage(s, out, [{ role: 'system', content: COMPACT_SYS }, { role: 'user', content: txt }], []); } catch { /* 记账失败不影响对话 */ }
+
+  console.log(`[ctx] 压缩 ${before}→${s.messages.length} 条，摘要 ${applied.summary.length} 字，${Date.now() - t0}ms`);
+  return { ok: true, summarized: applied.summarized, summary: applied.summary, before, after: s.messages.length };
+}
+
+/**
+ * 开一个新会话。
+ *
+ * 三件事缺一不可（少一件用户就会觉得"它把我刚说的忘了"）：
+ *   ① 把上一段压成**一条记忆**（episode）—— 新会话里问"上次那个日志"，recall 能取到；
+ *   ② 换 sid、清屏、重建系统提示（新会话的第一条就是 system）；
+ *   ③ 旧会话**归档**，不删（"能回溯"比"能切回"便宜得多，本期只做前者）。
+ *
+ * 摘要**不**塞进新会话的第一条 system：那会让"新会话"没那么新，还重复占上下文。
+ * 需要时它自己 memory_recall —— 符合"记忆是相关才取，不是常驻"。
+ */
+async function newSession(s, { reason = '' } = {}) {
+  const old = s.sid;
+  /* ① episode：整段对话压成一行。失败也要开新会话（用户点了，就得开）。 */
+  let episode = '';
+  if ((s.messages || []).length > 2 && s.model) {
+    try {
+      const txt = transcriptFor(s.messages.filter((m) => m.role !== 'system'), { head: 1500, tail: 3500 });
+      if (txt.length > 60) {
+        const out = await s.model.complete({
+          messages: [
+            { role: 'system', content: EPISODE_SYS },
+            { role: 'user', content: txt },
+          ],
+          tools: [],
+        });
+        try { recordUsage(s, out, [], []); } catch { /* 记账失败不影响开新会话 */ }
+        /* 一行、无换行、不带引号；长度卡在记忆的形状上限内（60） */
+        episode = String(out.content || '')
+          .replace(/^["'「]|["'」]$/g, '')
+          .split('\n').map((x) => x.trim()).filter(Boolean)[0] || '';
+        episode = episode.replace(/\s+/g, ' ').slice(0, 58);
+      }
+    } catch (e) {
+      console.warn('[ctx] 新会话的 episode 没写成：' + e.message);
+    }
+  }
+  if (episode) {
+    try {
+      await memory.remember({ text: episode, about: [], kind: 'episode', valence: 0 }, `episode:${old}`);
+    } catch (e) {
+      console.warn('[ctx] episode 落库失败：' + e.message);
+    }
+  }
+
+  /* ② 归档旧会话（不删） */
+  try {
+    await saveNow(s);
+    const dir = path.join(SESS_DIR, 'archive');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.rename(path.join(SESS_DIR, `${old}.json`), path.join(dir, `${old}.json`)).catch(() => {});
+  } catch (e) {
+    console.warn('[ctx] 归档失败：' + e.message);
+  }
+  /* 归档之后**禁止再落盘**：回合结束时的 idle 保存（scheduleSave）会把
+     刚移走的那份又写回来，下一次 /new 就会看到两份同名会话。 */
+  s.dead = true;
+
+  /* ③ 换 sid。**先告诉前端**，再让它的 SSE 断掉重连 ——
+     顺序反过来的话，前端会先收到一屏属于旧会话的事件。 */
+  const sid = newSid();
+  emit(s, { t: 'session', sid, episode: episode || undefined, reason });
+  for (const r of s.reses) { try { r.end(); } catch { /* 已经断了 */ } }
+  s.reses.clear();
+  /* 从内存表里摘掉，也**不要**再 saveNow —— 否则刚归档的文件会被原样写回来一份。 */
+  sessions.delete(old);
+
+  /* 新会话立刻建好、立刻落盘：刷新之后回到的必须是**这个**新会话，
+     而不是"文件不存在 → 客户端再随机一个 id"（那样一刷就是另一段了）。 */
+  try {
+    const ns = await getSession(sid);
+    await saveNow(ns);
+  } catch (e) {
+    console.warn('[ctx] 新会话落盘失败：' + e.message);
+  }
+
+  return { sid, episode };
+}
+
+/** 新会话 id：时间 + 随机，肉眼可排序、又不会撞 */
+function newSid() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-`
+    + Math.random().toString(36).slice(2, 8);
+}
+
+/* ───────────────────── 用户的两种"整理"指令 ───────────────────── */
+
+/** 「压缩一下」/「/compact」*/
+const CMD_COMPACT = /^\/?(compact|压缩(一下|上下文)?|收一收|整理一下上下文)$/i;
+/** 「开个新会话」/「/new」*/
+const CMD_NEW = /^\/?(new|新会话|开个新会话|开个新(的)?对话|换个话题吧|重新开始)$/i;
+
+function isCompactCmd(t) { return CMD_COMPACT.test(String(t || '').trim()); }
+function isNewCmd(t) { return CMD_NEW.test(String(t || '').trim()); }
+
+/** 这一轮要不要把"冷门工具组"和它们的说明书发出去。
+ *
+ *  判据是**用户这句话**，不是模型的自述。两个方向的代价不对称：
+ *  漏判 = 它明明能做却说做不到（用户直接损失一次）；误判 = 多花 2.6k token。
+ *  所以关键词宁可宽。
+ *
+ *  为什么必须在这里做：工具表 6k token 是**每一次调用**都要重发的，
+ *  而造工具那六件 + 1500 token 的规程，三十轮里难得用一次。
+ */
 function coldAllow(goal) {
   const text = goal.kind === 'ask'
     ? String(goal.text || '')
@@ -742,24 +923,42 @@ async function runTurn(s, goal) {
   s.turn++;
   s.meter?.beginTurn();
 
-  /* 上下文满窗自收：用**上一轮结束时**量到的水位，在**这一轮开始前**裁。
+  /* 上下文满窗自收：用**上一轮结束时**量到的水位，在**这一轮开始前**处理。
      放在这里而不是"请求失败后重试"，是因为满窗的失败发生在工具跑到一半，
-     用户看到的是"做了一半不动了" —— 比一开始就拒绝还难理解。 */
+     用户看到的是"做了一半不动了" —— 比一开始就拒绝还难理解。
+     两条路：先试**压缩**（摘要，能接着聊），不行才**丢**（保命）。 */
   {
     const snap = s.meter?.snap();
-    const trim = snap && trimHistory(s.messages, {
-      used: snap.ctx.tokens, limit: snap.limit, parts: snap.ctx.parts,
-      at: CTX_TRIM_AT, to: CTX_TRIM_TO,
-    });
-    if (trim) {
-      s.messages = trim.messages;
-      const pct = Math.round((trim.before / snap.limit) * 100);
-      emit(s, {
-        t: 'note',
-        message: trim.cramped
-          ? `上下文 ${pct}%：系统提示和工具表本身就把窗口占满了，历史已清到最少`
-          : `上下文 ${pct}%：丢了最早 ${trim.dropped} 条消息（更早的事靠 memory_recall）`,
-      });
+    const over = snap && snap.limit && (snap.ctx.tokens / snap.limit) >= CTX_TRIM_AT;
+    if (over) {
+      const pct = Math.round((snap.ctx.tokens / snap.limit) * 100);
+      /* 同一段水位只压一次：压缩后水位会掉下来；掉不下来的话别每轮都花一次调用 */
+      const cool = s.compactedAt && Date.now() - s.compactedAt < 60_000;
+      let done = false;
+      if (!cool) {
+        emit(s, { t: 'compact', on: true, auto: true, pct });
+        const c = await compactSession(s).catch(() => ({ ok: false }));
+        done = !!c.ok;
+        emit(s, { t: 'compact', on: false, auto: true, ok: done });
+        if (done) {
+          emit(s, { t: 'note', message: `上下文 ${pct}%：把更早的 ${c.summarized} 条压成了一段，接着聊` });
+        }
+      }
+      if (!done) {
+        const trim = trimHistory(s.messages, {
+          used: snap.ctx.tokens, limit: snap.limit, parts: snap.ctx.parts,
+          at: CTX_TRIM_AT, to: CTX_TRIM_TO,
+        });
+        if (trim) {
+          s.messages = trim.messages;
+          emit(s, {
+            t: 'note',
+            message: trim.cramped
+              ? `上下文 ${pct}%：系统提示和工具表本身就把窗口占满了，历史已清到最少`
+              : `上下文 ${pct}%：丢了最早 ${trim.dropped} 条消息（更早的事靠 memory_recall）`,
+          });
+        }
+      }
     }
   }
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
@@ -1706,7 +1905,35 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(202, { 'Content-Type': 'application/json' }).end('{"ok":true}');
 
     if (body.t === 'ask' && body.text) {
-      runTurn(s, { kind: 'ask', text: String(body.text).slice(0, 2000) });
+      const text = String(body.text).slice(0, 2000);
+      /* 两条"整理"指令走旁路，不占模型一轮。
+         为什么用指令而不是按钮：它们说的是"这段对话怎么处理"，
+         和"问一件事"不是同一个层级；写进输入行还能被 ↑ 记录翻到。 */
+      if (isNewCmd(text)) {
+        (async () => {
+          hear(s, text);
+          emit(s, { t: 'note', message: '开个新会话（上一段会变成一条记忆）' });
+          const r = await newSession(s, { reason: text }).catch((e) => ({ error: String(e?.message || e) }));
+          if (r?.error) emit(s, { t: 'note', message: '新会话没开成：' + r.error });
+        })();
+      } else if (isCompactCmd(text)) {
+        (async () => {
+          hear(s, text);
+          emit(s, { t: 'compact', on: true, pct: ctxPct(s) });
+          const r = await compactSession(s, { manual: true }).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+          emit(s, { t: 'compact', on: false, ok: !!r?.ok, pct: ctxPct(s) });
+          if (r?.ok) speak(s, `收好了：${r.summarized} 条压成一段`);
+          else {
+            speak(s, r?.reason === 'short'
+              ? '这段还短，不用收'
+              : '没收成，先把这一段留着');
+            emit(s, { t: 'note', message: `压缩失败：${r?.error || r?.reason || '未知'}` });
+          }
+          emit(s, { t: 'idle' });
+        })();
+      } else {
+        runTurn(s, { kind: 'ask', text });
+      }
     } else if (body.t === 'intent' && body.intent) {
       runTurn(s, { kind: 'intent', intent: body.intent });
     } else if (body.t === 'approve') {
@@ -1922,6 +2149,17 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     await memory.stop();
     process.exit(0);
   });
+}
+
+/* 技能索引要在开门之前读好：工具 schema 的 enum 用的是**同步**拿到的名字表，
+   读晚了第一轮就只有一个技能可选（而模型会以为系统只有这一块能力）。 */
+try {
+  const list = await skills.index();
+  console.log(list.length
+    ? `[skills] ${list.length} 份官方技能：${list.map((x) => x.name.replace(/^olares-/, '')).join(' / ')}`
+    : '[skills] 没有技能包（构建时没 export），skill_use 不可用');
+} catch (e) {
+  console.warn('[skills] 索引失败：' + e.message);
 }
 
 server.listen(PORT, () => {

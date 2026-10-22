@@ -67,6 +67,8 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
   let link = 'off';
   let pct = 0;
   let warn = false;
+  /* 压缩中（见 drawWater） */
+  let compacting = false;
   let t = 0;
   let dirty = true;
 
@@ -134,8 +136,13 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
   }
 
   function drawWater() {
+    /* 压缩中：水位条换成**一条来回扫的带子**。
+       摘要要多久取决于模型，我们并不知道进度 —— 所以不能画进度条
+       （画了就是在编数字），但必须让人看出"它在动"。 */
     const lit = Math.round((WATER_N * Math.max(0, Math.min(100, pct))) / 100);
-    const c = hexRgb(warn ? COL.hot : COL.water);
+    const lead = compacting ? (Math.sin(t * 2.2) * 0.5 + 0.5) * (WATER_N - 8) : -1;
+    const isOn = (i) => (compacting ? (i >= lead && i < lead + 8) : i < lit);
+    const c = hexRgb(compacting ? COL.busy : (warn ? COL.hot : COL.water));
     /* 已用 / 未用**分两批写**：slotPut 的亮度是整批一个 scl，
        同一批里只能靠 ink 区分，而 ink 的映射是 0.55+0.45×ink ——
        就算 ink=0 也还有 0.55 的亮度，"未用"那段会亮成一条完整的线，
@@ -146,7 +153,7 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
     const off = [];
     for (let i = 0; i < WATER_N; i++) {
       const p = { x: wx + (i * WATER_W) / (WATER_N - 1), y: g.y, ink: 1 };
-      (i < lit ? on : off).push(p);
+      (isOn(i) ? on : off).push(p);
     }
     const blank = (n) => Array.from({ length: n }, (_, k) => ({ x: wx + (k * WATER_W) / (WATER_N - 1), y: g.y, ink: 0 }));
 
@@ -217,6 +224,11 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
 
     setLink(kind) {
       if (kind !== link) link = kind;
+    },
+
+    /** 压缩中：水位条改画"来回扫的带子"（见 drawWater） */
+    setCompact(on) {
+      compacting = !!on;
     },
 
     /** 每帧：连接点呼吸 + 水位线。字不重写（ParticleText 自己缓存） */

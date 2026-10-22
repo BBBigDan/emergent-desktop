@@ -106,7 +106,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   const gateEl = el('div', 'ag-gate');
   const a11yEl = el('div', 'ag-a11y');
-  const hintEl = el('div', 'ag-hint', '回车发送 · 拖仪表 / 拖曲线 / 点元素 · Esc 收起');
+  const hintEl = el('div', 'ag-hint',
+    '回车发送 · /new 开新会话 · /compact 收上下文 · Esc 收起');
 
   layer.append(barEl, typeEl, inspEl, gateEl, a11yEl, hintEl);
   /* 状态区常驻（§3 的第一句）。观察窗和提示行仍旧只在 ?dev=1 出现 */
@@ -744,8 +745,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /* ───────────────── 与服务端 ───────────────── */
 
   /* sid 存 localStorage：刷新、收起再展开都还是同一段会话。
-     服务端把它落盘，于是每次唤出都先看到"刚才那一屏"，而不是一片空白。 */
-  const sid = localStorage.getItem('sid')
+     服务端把它落盘，于是每次唤出都先看到"刚才那一屏"，而不是一片空白。
+     **可变的**：`/new` 之后服务端会推一个 `session` 事件过来，这里换掉它。 */
+  let sid = localStorage.getItem('sid')
     || (crypto.randomUUID?.() ?? String(Math.random()).slice(2));
   localStorage.setItem('sid', sid);
 
@@ -1013,6 +1015,48 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         clearThink();
         setBusy(false);
         barTool.textContent = '';
+        break;
+
+      /* 换会话（`/new` 或「开个新会话」）。
+       *
+       * 服务端已经把上一段压成一条记忆、把旧会话归档，然后推这个事件。
+       * 前端要做的只有四件，顺序不能反：
+       *   ① 断开旧 SSE（它还挂在旧 sid 上）；
+       *   ② 换 sid 并落 localStorage（刷新之后回到的还是新会话）；
+       *   ③ 清场 —— 场景、问、答、记录全清（新会话的首屏是空的，不打任何招呼）；
+       *   ④ 重连。
+       * ③ 放在 ② 之后，是因为 resume 是重连时才来的；先清后连才不会
+       * 把旧会话的最后一屏又恢复一遍。 */
+      case 'session': {
+        disconnect();
+        sid = m.sid;
+        localStorage.setItem('sid', sid);
+        scene?.clear();
+        applyMode();
+        askText = '';
+        sayText = '';
+        echo('');
+        ans?.set('', { instant: true });
+        ringOff();
+        clearThink();
+        log = [];
+        histBtn.hidden = true;
+        setBusy(false);
+        setLink('off');
+        connect();
+        insp('session', `新会话 ${sid.slice(0, 13)}${m.episode ? ' · 上一段记成：' + m.episode : ''}`);
+        break;
+      }
+
+      /* 压缩上下文（手动 / 自动）。
+       * 屏幕上**不动内容** —— 压缩是"记得更少但还在聊"，不是换题。
+       * 只有状态条变一下：水位条换成"正在收"，收完数字自己掉回去。 */
+      case 'compact':
+        abar?.setCompact(!!m.on);
+        barCtxFill.classList.toggle('busy', !!m.on);
+        insp('ctx', m.on
+          ? `压缩${m.auto ? '（自动）' : ''}… 现在 ${m.pct ?? '?'}%`
+          : `压缩${m.ok ? '完成' : '没成'}${m.pct != null ? ` · ${m.pct}%` : ''}`);
         break;
 
       /* 记忆条数：每轮结束后服务端会重数一遍（可能刚抽出一条新的） */

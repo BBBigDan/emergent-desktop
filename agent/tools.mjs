@@ -231,6 +231,10 @@ export function makeTools(o = {}) {
      由 server 注入：它要在启动时探一次"这个镜像里有没有这个二进制"。 */
   const olares = o.olares || null;
   const forge = o.forge || null;
+  /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
+     没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
+  const skills = o.skills || null;
+  const skillNames = skills ? skills.names() : [];
   const T = {};
   const add = (name, def) => { T[name] = { name, ...def }; };
   /* 自造工具是**运行时**长出来的：这一轮刚 tool_keep 一个，下一轮就该能用。
@@ -283,14 +287,15 @@ export function makeTools(o = {}) {
   add('olares', {
     level: 'safe',
     describe: '查这台 Olares 的系统层（官方 CLI 的口径）：装了哪些应用/版本/状态/来源、'
-      + '市场里有什么可装、某个应用的配置与入口、整机负载、谁在吃资源、用户、当前 K8s 视野。'
+      + '市场里有什么可装、某个应用的配置与入口、整机负载、谁在吃资源、用户、pod 与事件、'
+      + '镜像占盘、备份计划、当前 K8s 视野。'
       + '**问"我装了哪些应用""n8n 从哪进""机器忙不忙"先调它** —— 不要自己从 pod 拼，'
-      + '那会漏掉版本号和入口地址。',
+      + '那会漏掉版本号和入口地址。op 不够用时用 skill_use 看这个系统还能干什么。',
     schema: {
       type: 'object',
       properties: {
         op: { type: 'string', enum: OPS, description: OP_DOC },
-        name: { type: 'string', description: 'op=app 或 appcfg 时必填：应用名，例如 n8n' },
+        name: { type: 'string', description: 'op=app / appcfg / appinfo / events 时必填：应用名或 pod 名，例如 n8n' },
       },
       required: ['op'],
       additionalProperties: false,
@@ -300,6 +305,49 @@ export function makeTools(o = {}) {
         return { error: '这台机器上没有 olares-cli（镜像里没装）。改用 sys_status / app_list 回答，并且告诉用户"系统层还没接"。' };
       }
       return await olares.read(op, name);
+    },
+  });
+
+  /* ── 官方技能（12 份 SKILL.md 编在 olares-cli 里） ──
+   *
+   * 这不是"再学一遍 olares 怎么用"：它是**动词表**。op 枚举是我们允许执行的，
+   * 技能文档是这台机器真有的。两者不一致时，至少要能对用户说清楚差在哪 ——
+   * 之前它只会说"我查不了"，而系统明明有 `market upgrade`。
+   *
+   * 展开后约 2k 字符（英文），**读完就该用掉**：所以返回里带一句"现在用 olares 执行"。
+   */
+  add('skill_use', {
+    level: 'safe',
+    describe: '展开一份 Olares 官方技能，看这个系统到底有哪些动词、某个症状该按什么顺序查。'
+      + '当 olares 的 op 不够用、或者要排障（装不上/起不来/打不开/慢）时先展开，再动手。'
+      + '不要凭印象猜命令。',
+    schema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          enum: skillNames.length ? skillNames : ['olares-shared'],
+          description: '技能名。market=应用商店 · settings=设置 · dashboard=指标 · cluster=容器 · '
+            + 'doctor=排障 · files=文件 · router=模型网关 · search=全局搜索 · backup 在 settings 里',
+        },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    run: async ({ name } = {}) => {
+      if (!skills) return { error: '这个镜像里没有技能包（构建时没 export）。直接按 olares 的 op 回答。' };
+      const r = await skills.read(name);
+      if (r.error) return r;
+      /* 技能文档是**动词表**，op 是**能执行的那一小撮**。两个都递过去，
+         模型才知道"这个系统能干这件事，但现在我只能看到这几样"。 */
+      return {
+        name: r.name,
+        doc: r.doc,
+        ops: r.ops,
+        hint: r.ops.length
+          ? `这些场合现在能用 olares 的 ${r.ops.join(' / ')} 完成；文档里别的动词还没接，别自己编命令。`
+          : '这块能力还没接（规则见文档，但这里执行不了）。照实告诉用户，不要现场编命令。',
+      };
     },
   });
 

@@ -383,6 +383,15 @@ body.launching .rail-zone { display: none; }
 }
 .ag-bar .ag-ctx-fill[data-lv="warm"] { background: rgba(255, 196, 120, .9); }
 .ag-bar .ag-ctx-fill[data-lv="hot"] { background: rgba(255, 124, 147, .95); }
+/* 压缩中：整条变成一条来回扫的浅琥珀 —— 和粒子那条带子说的是同一件事 */
+.ag-bar .ag-ctx-fill.busy {
+  /* 压缩不看百分比（进度不可知），所以整条都扫 —— 宽度必须盖掉内联的 width */
+  width: 100% !important;
+  background: linear-gradient(90deg, rgba(255,207,107,.25), rgba(255,207,107,.95), rgba(255,207,107,.25));
+  background-size: 200% 100%;
+  animation: ag-sweep 1.1s linear infinite;
+}
+@keyframes ag-sweep { from { background-position: 200% 0; } to { background-position: 0 0; } }
 .ag-bar .ag-ctx-num { font-weight: 400; color: rgba(163, 198, 228, .72); }
 .ag-bar .ag-mem { pointer-events: auto; cursor: default; }
 .ag-bar .ag-tool { color: rgba(255, 178, 87, .62); overflow: hidden; text-overflow: ellipsis; }

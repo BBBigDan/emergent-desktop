@@ -77,3 +77,103 @@ export function trimHistory(messages, o = {}) {
     cramped,
   };
 }
+
+/* ─────────────────── 压缩（摘要，不是丢） ───────────────────
+ *
+ * 78% 时直接丢最老的消息，解决的是"接口 400"，不是"用户还想接着聊"。
+ * 压缩是同一个位置的另一种处理：**先把这段讲成一段话，再替换进去**。
+ *
+ * 三条纪律（写在这里，因为实现的人容易在实现里忘掉）：
+ *   1. 摘要必须标身份。不标的话模型会把摘要当原话引用 ——
+ *      而我们不允许"模型自己的话"变成事实。
+ *   2. 只留三类：用户说过的结论/偏好、做过的动作及结果、还没做完的事。
+ *      读数不留（每轮都变）、模型的推测不留。
+ *   3. 摘要那条用 **user 角色**，不改 system —— 改 system 会把前缀缓存整个打掉，
+ *      而且 system 是"我是谁"，不是"我们聊过什么"。
+ */
+
+export const SUMMARY_TAG = '（以下是更早对话的摘要，不是原话。要细节用 memory_recall 查。）';
+
+/** 压缩用的系统提示。短，是因为它要处理的是已经很长的一段上下文。 */
+export const COMPACT_SYS = `你把一段对话压成**一段**接得上话的摘要。
+
+只写这三类：
+- 用户明确说过的结论、偏好、忌讳（"不想在半夜被重启"）
+- 已经做过的动作和它的结果（"把 n8n 挪到 5679，起来了"）
+- 还没做完的事（"建议 7 天轮转日志，用户还没动手"）
+
+不写：任何读数（CPU 18%、内存 41%）、寒暄、你打算做什么、屏幕上铺了几个仪表。
+用第三人称，中文，150 字以内，一段话，不要分点、不要开场白。`;
+
+/**
+ * 算压缩方案：哪一段拿去摘要，留哪几条当"最近的上下文"。
+ * @returns {null | {head: Array, tail: Array, cut: number}}  head 是 1..cut-1
+ */
+export function compactPlan(messages, { tail = 4 } = {}) {
+  if (!Array.isArray(messages) || messages.length < 6) return null;
+  if (messages[0]?.role !== 'system') return null;
+  let cut = Math.max(1, messages.length - tail);
+  /* 切点必须落在 user（assistant(tool_calls)+tool 链断一处就 400） */
+  while (cut < messages.length && messages[cut].role !== 'user') cut++;
+  if (cut >= messages.length) {
+    /* 窗口太窄，往后找不到 user 了：**往回**退到最近的那一条。
+       踩过：直接兜底成 `length - 2`，那一条可能是 tool —— 切在那里，
+       下一次请求就是"tool_call_id 找不到对应的 assistant"，而报错看起来像接口坏了。 */
+    cut = messages.length - 1;
+    while (cut > 1 && messages[cut].role !== 'user') cut--;
+    if (cut <= 1 || messages[cut].role !== 'user') return null;
+  }
+  const head = messages.slice(1, cut);
+  if (head.length < 3) return null;
+  return { head, tail: messages.slice(cut), cut };
+}
+
+/**
+ * 把摘要替换进去。
+ * @param {Array} messages 原消息（第 0 条是 system）
+ * @param {object} plan    compactPlan 的返回
+ * @param {string} summary 模型给的摘要
+ */
+export function applyCompact(messages, plan, summary) {
+  const s = String(summary || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+  if (!s) return null;
+  return {
+    messages: [
+      messages[0],
+      { role: 'user', content: `${SUMMARY_TAG}\n${s}` },
+      ...plan.tail,
+    ],
+    summarized: plan.head.length,
+    summary: s,
+  };
+}
+
+/** 摘要调用的输入：整段对话的流水。头尾都要 —— 头是"为什么开始聊这件事"。 */
+export function transcriptFor(messages, { head = 1800, tail = 4200 } = {}) {
+  const lines = [];
+  for (const m of messages || []) {
+    if (!m || m.role === 'system') continue;
+    const c = String(m.content || '').replace(/\s+/g, ' ').trim();
+    if (m.role === 'user') lines.push('用户说：' + c.slice(0, 220));
+    else if (m.role === 'assistant') {
+      if (c) lines.push('我说：' + c.slice(0, 160));
+      for (const t of m.tool_calls || []) {
+        lines.push(`（我调了 ${t?.function?.name || '工具'}）`);
+      }
+    } else if (m.role === 'tool') {
+      lines.push(`工具返回：${c.slice(0, 120)}`);
+    }
+  }
+  const all = lines.join('\n');
+  if (all.length <= head + tail) return all;
+  return `${all.slice(0, head)}\n…（中间省略）…\n${all.slice(-tail)}`;
+}
+
+/** 新会话时写进记忆的那一条 episode 的提示。 */
+export const EPISODE_SYS = `把这段对话压成**一行**，用来让下一次会话想起"上次聊了什么"。
+
+格式：上次+主题+关键结论/结果+是否收尾。不超过 38 个字，中文，第三人称，不要引号，不要句号之外的标点。
+例：上次查磁盘，n8n 日志两周涨 3.2G，建议 7 天轮转，用户还没动手。`;
+
+/** 新会话时插给模型的第一句（不进历史，只当一次性的系统提示）。 */
+export const NEW_SESSION_MARK = '[新会话]';

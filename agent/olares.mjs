@@ -36,6 +36,11 @@ const READ = {
   catalog: () => ['market', 'list'],
   /* 单个应用的生命周期状态（含 entranceStatuses） */
   app: (name) => ['market', 'status', name],
+  /* 市场条目详情：一句话介绍、分类、版本历史、chart 来源。
+     **原始输出 32KB**（一整个 app_info），必须 shape 之后再交给模型。 */
+  appinfo: (name) => ['market', 'get', name],
+  /* 市场分类与各类数量（"有没有能记账的应用"先看这个） */
+  categories: () => ['market', 'categories'],
   /* 整机负载：physical / user / ranking 三段 envelope */
   overview: () => ['dashboard', 'overview'],
   /* 按应用排资源占用 */
@@ -49,10 +54,19 @@ const READ = {
   appcfg: (name) => ['settings', 'apps', 'get', name],
   /* 用户空间的 k8s 视图（不是系统全部命名空间） */
   context: () => ['cluster', 'context'],
+  /* 这个用户能看见的所有 pod（跨命名空间，比 kubectl 那套视口宽）。
+     原始 366KB —— 只有 name/状态/重启次数有用。 */
+  pods: () => ['cluster', 'pod', 'list'],
+  /* 一个 pod 最近的事件：CrashLoopBackOff / 拉不到镜像 的根因都在这儿 */
+  events: (name) => ['cluster', 'pod', 'events', name],
+  /* 本地 containerd 镜像与引用数（"磁盘被什么占了"的最后一块） */
+  images: () => ['doctor', 'images'],
+  /* 备份计划（有没备、备到哪、上次什么时候） */
+  backup: () => ['settings', 'backup', 'plans', 'list'],
 };
 
 /** 需要 `name` 的 op */
-const NEED_NAME = new Set(['app', 'appcfg']);
+const NEED_NAME = new Set(['app', 'appcfg', 'appinfo', 'events']);
 
 /** 可用的 op 列表（工具 schema 的 enum 从这里来，别在两个地方各写一份） */
 export const OPS = Object.keys(READ);
@@ -61,7 +75,9 @@ export const OPS = Object.keys(READ);
 export const OP_DOC = [
   'apps=装了哪些应用(版本/状态/来源/CPU/内存)，并附整机内存 node；每个应用的 cpu/memPct 是 0~1、指它自己占节点的比例（整机看 node）',
   'app=某个应用的状态(name)',
+  'appinfo=某个应用是什么、能干什么(name)',
   'catalog=市场有什么可装',
+  'categories=市场分类与数量',
   'overview=整机负载(CPU/内存/磁盘/网络)',
   'usage=哪个应用吃资源',
   'version=系统版本',
@@ -69,6 +85,10 @@ export const OP_DOC = [
   'users=用户列表',
   'appcfg=应用配置与入口(name)',
   'context=当前 K8s 视野',
+  'pods=用户空间里所有 pod 的状态与重启次数',
+  'events=某个 pod 最近发生了什么(name=pod 名)',
+  'images=本地镜像与引用数(占磁盘)',
+  'backup=备份计划',
 ].join(' · ');
 
 /**
@@ -445,6 +465,88 @@ export function createOlares(o = {}) {
         })),
         env: d?.env || undefined,
         state: d?.state || undefined,
+      };
+    }
+
+    if (op === 'appinfo') {
+      /* 原样给是 32KB —— 里面 90% 是 chart 的 CRD 定义和截图列表。
+         用户问"这个应用是干什么的"要的是 title/description/categories/最新版本。 */
+      const ai = data?.app_info || data?.appInfo || data || {};
+      const entry = ai.app_entry || ai.entry || ai;
+      const ver = ai.latest_version || ai.version || entry.version || '';
+      return {
+        name,
+        title: entry.title || ai.title || name,
+        description: String(entry.description || ai.description || '').slice(0, 240),
+        categories: entry.categories || undefined,
+        version: ver,
+        entrances: (entry.entrances || []).map((e) => e.name || e.host).filter(Boolean).slice(0, 6),
+      };
+    }
+
+    if (op === 'pods') {
+      const items = data?.items || (Array.isArray(data) ? data : []);
+      return {
+        pods: items.map((p) => {
+          const cs = p?.status?.containerStatuses || [];
+          return {
+            name: p?.metadata?.name,
+            ns: p?.metadata?.namespace,
+            phase: p?.status?.phase,
+            ready: cs.filter((c) => c.ready).length + '/' + (cs.length || (p?.spec?.containers || []).length),
+            restarts: cs.reduce((n, c) => n + (c.restartCount || 0), 0),
+            /* 起不来的两个真信号，别让模型从 phase 猜 */
+            waiting: cs.map((c) => c.state?.waiting?.reason).filter(Boolean).slice(0, 2).join(',') || undefined,
+          };
+        }).slice(0, 40),
+        count: items.length,
+      };
+    }
+
+    if (op === 'events') {
+      const items = data?.items || (Array.isArray(data) ? data : []);
+      return {
+        name,
+        events: items
+          .filter((e) => String(e?.type || '') !== 'Normal' || /Unhealthy|BackOff|Failed/i.test(String(e?.reason || '')))
+          .slice(-10)
+          .map((e) => ({
+            type: e.type, reason: e.reason,
+            msg: String(e.message || '').slice(0, 160),
+            count: e.count, at: e.lastTimestamp || e.eventTime,
+          })),
+      };
+    }
+
+    if (op === 'images') {
+      const items = data?.images || (Array.isArray(data) ? data : []);
+      const used = items.filter((i) => i.in_use || i.inUse || (i.used_by || i.usedBy || []).length);
+      /* 只给最大的 8 个：这一问的答案永远是"哪几个最占地方" */
+      return {
+        total: items.length,
+        unused: items.length - used.length,
+        biggest: items
+          .map((i) => ({
+            sizeMB: Math.round((i.size || 0) / 1024 / 1024),
+            tag: (i.repo_tags || i.repoTags || [])[0] || String(i.id || '').slice(7, 19),
+            used: !!(i.in_use || i.inUse || (i.used_by || i.usedBy || []).length),
+          }))
+          .sort((a, b) => b.sizeMB - a.sizeMB)
+          .slice(0, 8),
+      };
+    }
+
+    if (op === 'backup') {
+      const list = data?.backups || data?.items || (Array.isArray(data) ? data : []);
+      return {
+        plans: list.slice(0, 8).map((b) => ({
+          name: b.name, state: b.state || b.status,
+          last: b.lastBackupTime || b.last_backup_time || b.updatedAt,
+          schedule: b.schedule || b.cron,
+          target: b.location || b.target,
+        })),
+        count: list.length,
+        totalCount: data?.totalCount,
       };
     }
 

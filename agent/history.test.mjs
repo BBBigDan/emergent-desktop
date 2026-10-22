@@ -11,7 +11,7 @@
  *   4. 固定开销本身就把窗口占满时，不能假装裁过了（返回 cramped）。
  */
 
-import { trimHistory } from './history.mjs';
+import { trimHistory, compactPlan, applyCompact, transcriptFor, SUMMARY_TAG } from './history.mjs';
 
 let failed = 0;
 const ok = (cond, label, extra = '') => {
@@ -97,6 +97,49 @@ console.log('\n第一条不是 system');
 {
   const m = convo(10).slice(1);
   ok(trimHistory(m, { used: 15000, limit: 16000, parts }) === null, '没有 system 就不裁（否则会话失去身份）');
+}
+
+/* ───────────────── 压缩（摘要） ─────────────────
+ * 和裁剪验的是同一件事的两面：裁剪只要"不 400"，压缩还要"能接着聊"。
+ * 所以这里额外验两条：
+ *   5. 摘要那条**不是**原话（带身份标签）—— 否则模型会把摘要当事实引用；
+ *   6. 留下的那截仍然以 user 开头（配对完整）。 */
+console.log('\n压缩：切点与身份');
+{
+  const m = convo(10);                     // 1 + 40 条
+  const plan = compactPlan(m, { tail: 4 });
+  ok(!!plan, '给得出方案');
+  ok(plan.head.length > 0 && plan.tail.length >= 4, `头 ${plan.head?.length} 条 / 尾 ${plan.tail?.length} 条`);
+  ok(plan.tail[0]?.role === 'user', '尾巴从 user 起（配对完整）', plan.tail[0]?.role);
+
+  const r = applyCompact(m, plan, '用户问过磁盘，查了 n8n 日志，建议轮转，还没动手。');
+  ok(!!r, '应用成功');
+  ok(r.messages[0].role === 'system', 'system 还在');
+  ok(r.messages[1].role === 'user' && r.messages[1].content.startsWith(SUMMARY_TAG),
+    '摘要那条带身份标签（"不是原话"）');
+  ok(r.messages.length < m.length, `总条数下降 ${m.length} → ${r.messages.length}`);
+  ok(r.messages.slice(2)[0]?.role === 'user', '摘要之后紧接着是 user');
+  /* 摘要为空时不替换 —— 空摘要会让模型以为"前面什么都没发生" */
+  ok(applyCompact(m, plan, '   ') === null, '空摘要不替换');
+}
+
+console.log('\n压缩：太短不动');
+{
+  ok(compactPlan(convo(1), { tail: 4 }) === null, '只有一轮就不压（压了也是空话）');
+  /* 尾巴必须从 user 起：故意构造一个"尾巴落在 assistant 中间"的位置 */
+  const m = convo(6);
+  const plan = compactPlan(m, { tail: 2 });
+  ok(plan && plan.tail[0].role === 'user', 'tail 小的时候也会把切点推到 user 上', plan?.tail[0]?.role);
+}
+
+console.log('\n摘要的输入');
+{
+  const m = convo(10);
+  const t = transcriptFor(m);
+  ok(/用户说：问题 0/.test(t), '带上第一句（头是"为什么聊这件事"）');
+  ok(/用户说：问题 9/.test(t), '带上最后一句');
+  ok(!/system/.test(t), '不把系统提示塞进去（那是身份，不是对话）');
+  ok(t.length < 6500, `长度收敛在 ${t.length} 字`);
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');

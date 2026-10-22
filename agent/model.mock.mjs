@@ -104,6 +104,11 @@ export function createMockModel() {
     name: 'mock:v1',
 
     async complete({ messages, goal }) {
+      /* 压缩上下文 / 新会话的 episode 这两条调用**不带 goal** ——
+         它们不是"一轮对话"，是对话的整理。桩也要能回答，否则本地跑不通这两条路。 */
+      if (!goal) {
+        return { content: '用户问过磁盘，扫了 Downloads，建议清理没用的包，还没动手。', tool_calls: [] };
+      }
       const st = resultOf(messages, 'sys_status');
 
       /* ═══ 用户说了一句话 ═══ */
