@@ -663,13 +663,14 @@ export function makeTools(o = {}) {
   add('scene_show', {
     level: 'safe',
     describe: '铺一屏，或换一屏。这是最常用的输出方式：把要说的话和要显示的读数一次给它。'
-      + ' reading 会直接出现在用户眼前那一行，所以它必须是一句人话（≤20 字，不换行、不列清单）。'
-      + ' gauges 是此刻的几个比例（最多 3 个）；note 是一句结论；'
+      + ' reading 是**你的回答**，会上屏给人读：2~5 句，先给结论再给依据，200~400 字都正常'
+      + '（一页 400 字，超了自动分页）。**不要把回答写成一行读数** —— 数字由 gauges 承载，'
+      + ' reading 写判断、原因和下一步。 gauges 是此刻的几个比例（最多 3 个）；note 是一句结论；'
       + ' ask 是一个问题 + 两个选项，用户点哪个系统会告诉你。',
     schema: {
       type: 'object',
       properties: {
-        reading: { type: 'string', description: '用户眼前那一行话，≤20 字，例如 "CPU 3% · 内存 62%"' },
+        reading: { type: 'string', description: '你的回答，会上屏给人读。2~5 句，先结论再依据。例如 "机器不忙：CPU 只有 3%，内存 62% 里大半是页面缓存。真正在动的是 n8n，它刚重启过一次，可能有工作流在刷错误。要不要看它的日志？"。不要只写 "CPU 3% · 内存 62%" 这样一行读数。' },
         gauges: {
           type: 'array',
           description: '最多 3 个',

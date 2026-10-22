@@ -127,6 +127,15 @@ export class FieldScene {
     this.rev = 0;
     this.tr = null;              // 进行中的相变
     this.a11y = o.a11y || null;  // 可访问性镜像层（见 aria.js）
+    /* set() 会调 field.slotBegin 把**整块绘制区**清零（槽位是一条共用直线），
+       所以每次换屏之后都必须有人把问句行和答案块写回去。以前只有 afterScene()
+       手动补一次，可 transition 的 set 发生在 0.7 秒后的 step 里 —— 那次补写
+       早跑完了，字就凭空消失半个呼吸。把"写回去"钉在 set 末尾，谁来调都补得上。 */
+    this.onAfterSet = o.onAfterSet || null;
+    /* 相变**完全落定**（溶解 + 重组都走完）时回调一次。
+       清场之后要靠它把答案从半幅放回满宽：溶解中还"算有个场"，
+       等它真散完了才知道右边已经空了。 */
+    this.onSettled = o.onSettled || null;
     /* 场打开时背景那 6400 颗环境粒子还留多亮。
        0.84 是"桌面球面还在，但不抢戏"；但一旦屏幕上要读几行大字，0.84 就是
        "在点阵上写字"—— 字的缝里全是背景点，实测非常糊。所以桌面里的 agent
@@ -198,7 +207,31 @@ export class FieldScene {
     this.spec = spec;
     this.focus = focus;
     if (this.a11y && !this._noAnnounce) this.a11y.announce(spec, { force: true });
+    this.onAfterSet?.();
     return this;
+  }
+
+  /**
+   * 清场：这一屏到此为止。
+   *
+   * 用户的原话：「右边的场在不需要的时候应该刷掉，它现在始终停留在上一次
+   * 修改的状态」。问题换了、答案清了，右边还挂着上一题的仪表和曲线 ——
+   * 那读起来像"它没听见我在问新的"。
+   *
+   * 不用 `set(空)` 硬切：一整屏仪表在一帧里消失，观感是"闪了一下"。
+   * 走 transition 的溶解（0.5 秒），旧结构自己散掉，停在一个空场。
+   *
+   * @param {{outMs?:number}} [opt]
+   * @returns {boolean} 有没有东西可清（空场返回 false，可以安全地反复调用）
+   */
+  clear(opt = {}) {
+    /* 已经在散的路上就别再踢一脚（submit 与 turn 会各清一次）：
+       重复启动 transition 会让溶解从 0 重新开始，看起来像卡住了。 */
+    if (this.tr && this.tr.spec?.id === 'blank') return false;
+    if (!this.spec || !(this.layers.size || this.texts.length)) return false;
+    const blank = { id: 'blank', rev: (this.spec.rev ?? 0) + 1, layers: [] };
+    this.transition(blank, { outMs: opt.outMs ?? TIMING.out * 0.8 });
+    return true;
   }
 
   /**
@@ -336,6 +369,7 @@ export class FieldScene {
           f.setStiff(1);
           this.tr = null;
           if (this.a11y) this.a11y.announce(this.spec, { force: true });
+          this.onSettled?.();
         }
       }
     }
@@ -434,8 +468,11 @@ export class FieldScene {
 
     /* 曲线：标签行在 tTop-28，绘图区 tTop..tBase。
        上界受仪表让位（横排 a.y+250、竖排 gaugeEnd+34），下界受结论让位；
-       挤不下就压短，但不低于 96。 */
-    let tBase = Math.min(top, a.y + 452);
+       挤不下就压短，但不低于 96。
+       竖排时下界放到**内容区底沿**：这一列仪表已经占掉上半，答案块在左边的另半边，
+       曲线是这块区域里唯一还能长的东西 —— 还按横排的 452 收着，下半屏就空了一大片。 */
+    const tCeil = vert ? a.y + a.h - 30 : a.y + 452;
+    let tBase = Math.min(top, tCeil);
     let tTop = Math.min(a.y + 300, tBase - 96);
     const tFloor = vert ? gaugeEnd + 34 : a.y + 250;
     if (tTop < tFloor) tTop = tFloor;             // 不低于仪表栏的下沿

@@ -353,7 +353,11 @@ body.launching .rail-zone { display: none; }
   font: 11px/1 ui-monospace, Menlo, "Cascadia Mono", monospace;
   letter-spacing: .03em;
   color: rgba(147, 184, 216, .52);
-  pointer-events: none;
+  /* 这一行的**字**现在由粒子画（agentbar.js），DOM 只剩三件事：
+     悬停区域、tooltip（系统/工具/历史、本轮、今日花费）、给粒子定位的容器。
+     所以整条透明但保留 pointer-events —— 细账不该常驻，但排查时要能看见。 */
+  opacity: 0;
+  pointer-events: auto;
   white-space: nowrap;
 }
 /* 数字会跳，等宽 + 不换行才不会让后面那几项左右游 */

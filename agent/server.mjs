@@ -365,7 +365,10 @@ function speak(s, text) {
     .replace(/https?:\/\/\S{40,}/g, '')
     /* 行内 markdown 记号在点阵里就是几个多余的符号：「`~/Downloads`」会原样画出来 */
     .replace(/[*`_]{1,2}([^*`_]+)[*`_]{1,2}/g, '$1')
-    .replace(/\s+/g, ' ')
+    /* 只压空格与制表符，**保留换行**：一段回答的段落是内容的一部分，
+       全压成一行之后 400 字就是一块没有停顿的墙（wrapText 认 \n）。 */
+    .replace(/[ \t\u3000]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
   if (!t) return;
   /* 同一句话不记两次：一轮里"模型自由文本"和"兜底句"可能撞车 */
@@ -386,8 +389,38 @@ function speak(s, text) {
   emit(s, { t: 'say', text: t });
 }
 
-function hear(s, text, r = 'u') {
-  const t = String(text || '').trim();
+/**
+ * 把这一轮该说的那段话交给屏幕。
+ *
+ * 一轮里可能有两个说话来源：模型自由文本（content）和 scene_show 的 reading。
+ * 老规则是"一轮只说一句、后到的覆盖" —— 那是屏幕上只有一行 20 格时的产物。
+ * 答案块扩到 400 字一页之后，这条规则的后果是：
+ *   · reading 常常只有一行读数（提示词以前就这么教），它会把已经说出口的
+ *     整段回答**盖掉**；
+ *   · 于是用户看到的一直是"一行回复"（2026-10-22 的反馈，上一轮只改了字数上限
+ *     没动覆盖规则，所以看起来像"没修好"）。
+ * 新规则：先到的先上屏（不让用户干等），**后来那段明显更长才换掉它**。
+ * 换而不是拼：拼接会把同一句结论说两遍，读起来像两个人在说话。
+ *
+ * @param {object} s 会话
+ * @param {string} text 候选文本
+ * @param {{force?:boolean}} [opt]
+ * @returns {boolean} 有没有真的换掉屏幕上的话
+ */
+function putVoice(s, text, opt = {}) {
+  const t = String(text || '').trim().slice(0, 1200);
+  if (!t) return false;
+  const prev = s.lastVoice || '';
+  /* 1.5 倍 + 20 字：只是多一句客套（"好的，我看一下"）不该把长回答顶掉 */
+  if (s.spoke && !opt.force && t.length < prev.length * 1.5 + 20) return false;
+  s.spoke = true;
+  s.lastVoice = t;
+  s.lastLine = t;
+  speak(s, t);
+  return true;
+}
+
+function hear(s, text, r = 'u') {  const t = String(text || '').trim();
   if (t) pushLog(s, r, t);
 }
 
@@ -837,20 +870,23 @@ async function runTurn(s, goal) {
 
       const calls = out.tool_calls || [];
       /* 便宜模型会把示例里的记号一起抄出来（"content: ..."、"→ scene_set(...)"），
-         或者写一整段带换行和清单的计划。场里只有**一行** 20 格，这些都不该下去：
-         截到第一行、去掉列表符号，剩下的由前端按字数再压。 */
-      const rawSpeech = (String(out.content || '')
+         也会写一整段带换行和清单的计划。 */
+      const rawSpeech = String(out.content || '')
         .replace(/^\s*(content|回答|你说)\s*[:：]\s*/i, '')
         .replace(/^["'「](.*)["'」]$/, '$1')
-        /* 取**第一行非空**，不是第一行。实测 7B 会先吐一个换行再说话：
-           按第一行截，整句话就变成空字符串，用户看到的是它一声不吭
-           （而且没有任何"被过滤"的提示，因为过滤发生在更后面）。
-           这一条曾经把一句正确答案吃掉了两轮。 */
-        .split('\n').map((l) => l.trim()).filter(Boolean)[0] || ''
-      )
-        .replace(/^\s*[-*·]\s*/, '')
-        /* 先清掉它自己插的图，再截字数 —— 反过来的话 40 格的额度会被 base64 吃掉，
-           真正的那句话一个字都留不下。 */
+        /* 取**所有非空行**，不是第一行。
+           以前这里是 `.filter(Boolean)[0]` —— 那是"场里只有一行 20 格"时代的写法，
+           屏幕上放不下一段话，干脆只留第一句。答案块到 400 字以后，这个 [0] 的
+           后果是：模型写了五段，用户只看到第一行（原话："仍然只能看到一行回复"）。
+           上一轮只把 40 改成 1200，没动这个 [0]，等于没改 —— 这次一起改掉。 */
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        /* 列表符号、序号都去掉：屏幕不解释 "-" 和 "1." */
+        .map((l) => l.replace(/^\s*[-*·]\s*/, '').replace(/^\s*\d+[.、)]\s*/, ''))
+        .join('\n')
+        /* 先清掉它自己插的图，再截字数 —— 反过来的话 1200 字的额度会被 base64 吃掉，
+           真正的那段话一个字都留不下。 */
         .replace(/!\[[^\]]*\]\([^)]*\)?/g, '')
         .replace(/data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+/g, '')
         .trim();
@@ -863,24 +899,19 @@ async function runTurn(s, goal) {
       /* 手势回合干脆不要它说话：这一行该说"代价"，而代价（要重启谁）是系统知道的事，
          模型只会复述用户动作或复述自己的计划。要它表达的地方是 scene_ask 的问题本身。 */
       const isAdjust = s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust';
-      /* 40 字是"场里只有一行 20 格"时代的上限 —— 那时候多一个字就挤掉一个读数。
-         现在答案块是 400 字一页、最多三页，这个 40 把每一句用 content 说出口的回答
-         都切成了半句话（用户的原话："感觉都是没回答完的状态"，2026-10-22）。
-         上限跟 reading 那条对齐（1200 = 三页）：能不能给长回答由屏幕决定，
-         不由这里悄悄决定。 */
-      const speech = (isAdjust || looksLikeJSON || TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech))
-        ? '' : rawSpeech.slice(0, 1200);
-      /* 一轮只说一句话。
-         scene_show 的 reading 已经替它说过话了；之后模型再补一段
-         "机器当前负载情况是这样的……"，那不是给用户的话，是旁白。
-         场里只有一行，多说的每一句都要挤掉真正要看的东西 —— 所以后面的都咽掉，
-         但在观察窗留一条，免得以后查"它到底说了什么"时一头雾水。 */
-      const voice = speech && !s.spoke ? speech : '';
-      /* s.spoke 必须在这里也置上：模型的自由文本同样占了那一行。
-         之前只在 scene 工具的 say 里置位，于是"模型说一句 + 兜底再说一句"
-         会同时出现 —— 一行字被两句话争着写，最后看到的是后一句。 */
-      if (voice) { s.spoke = true; s.lastVoice = voice; speak(s, voice); }
-      else if (speech && !s.narrated) {
+      /* 工具名 / 旁白那两条只在**短句**上判。
+         它们要挡的是"请调用 scene_ask 把问题问出来"这种指令式短句；
+         而一段正经回答里提到 fs_scan、sys_status 是正常的说明，整段丢掉就变成
+         "它一声不吭"。 */
+      const short = rawSpeech.length < 60;
+      const junk = looksLikeJSON
+        || (short && (TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech)));
+      const speech = (isAdjust || junk) ? '' : rawSpeech.slice(0, 1200);
+      /* 一轮可能说一段，不只一句 —— 取舍规则见 putVoice。
+         以前这里是 `speech && !s.spoke`：模型先说的那段被 reading 一行读数
+         盖掉，屏幕就只剩一行。 */
+      const voice = putVoice(s, speech) ? String(speech).slice(0, 1200) : '';
+      if (!voice && speech && !s.narrated) {
         /* 只留第一条。实测一轮里模型会补三次旁白，每条的句式都一样，
            观察窗被刷得看不清工具调用 —— 而"它爱说旁白"这件事看一条就够了。 */
         s.narrated = true;
@@ -1098,12 +1129,11 @@ async function runTurn(s, goal) {
               s.lastSpecSig = sig;
             }
           }
-          if (!result.duplicate && result.say) {
-            s.spoke = true;
-            s.lastVoice = String(result.say).slice(0, 1200);
-            s.lastLine = s.lastVoice;
-            speak(s, String(result.say).slice(0, 1200));
-          }
+          /* reading 只是**候选之一**，不是"后到即盖"。
+             它常常只有一行读数（"CPU 18% · 内存 41%"），而模型在 content 里
+             已经说了一段完整回答 —— 直接覆盖的话，屏幕就只剩那一行读数。
+             取舍规则见 putVoice。 */
+          if (!result.duplicate && result.say) putVoice(s, result.say);
           if (!result.duplicate) {
             s.drew = true;
             /* 记住"眼睛现在看到的东西"，供刷新/重连时原样还原。

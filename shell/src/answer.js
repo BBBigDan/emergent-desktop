@@ -51,6 +51,10 @@ export function wrapText(text, { size, maxWidth, maxLines, maxChars = 99 }) {
   const flush = () => { if (cur.length) { lines.push(cur.join('').trimEnd()); cur = []; w = 0; } };
 
   for (const ch of chars) {
+    /* 换行就是换行：模型写的段落是内容的一部分。
+       以前 \n 被当成普通字符算宽度（约 0.56 字），屏幕上既不断行、
+       又白占一格 —— 段落那里就凭空多出一个空位。 */
+    if (ch === '\n') { flush(); continue; }
     const cw = widthOf(ch, size);
     if ((w + cw > maxWidth || cur.length >= maxChars) && cur.length) {
       let cut = -1;
@@ -73,22 +77,26 @@ export function wrapText(text, { size, maxWidth, maxLines, maxChars = 99 }) {
 
   /* 行首禁则：满宽切行时，"。"常常正好落在下一行的第一个字上 ——
      屏幕上就是"…关注的位置 / 。整体负载不高"，读起来像排错了版。
-     改法是把那个标点**拉回上一行**（宁可那行超出一格），而不是硬留个孤零零的句号。 */
+     改法是把那个标点**拉回上一行**（宁可那行超出一格），而不是硬留个孤零零的句号。
+     注意不能要求"这一行至少两个字"：句末的"。"正好是**整行的唯一内容**时，
+     那个条件会让它留在下一行 —— 实测屏幕上第二行只有一个句号。 */
   for (let i = 1; i < lines.length; i++) {
-    let head = Array.from(lines[i]);
-    while (head.length > 1 && NO_START.includes(head[0])) {
+    const head = Array.from(lines[i]);
+    while (head.length && NO_START.includes(head[0])) {
       lines[i - 1] += head.shift();
     }
     lines[i] = head.join('');
   }
+  /* 整行都是标点时会被搬空 —— 空行不参与排版，否则中间会多出一行空白 */
+  const kept = lines.filter((l) => l.length);
 
-  if (lines.length > maxLines) {
-    const keep = lines.slice(0, maxLines);
+  if (kept.length > maxLines) {
+    const keep = kept.slice(0, maxLines);
     const tail = keep[maxLines - 1];
     keep[maxLines - 1] = (tail.length > 1 ? tail.slice(0, -1) : tail) + '…';
     return keep;
   }
-  return lines.length ? lines : [''];
+  return kept.length ? kept : [''];
 }
 
 /** 按 400 字切页，切点优先落在句读上 */

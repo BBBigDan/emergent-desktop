@@ -23,6 +23,7 @@ import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { createAnswer } from './answer.js';
 import { createFace } from './face.js';
 import { createHalo } from './halo.js';
+import { createAgentBar } from './agentbar.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
 import { GestureTracker, describe } from './gesture.js';
@@ -287,6 +288,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let ans = null;   // 模型那一块（上面的大字）
   let face = null;   // loading 区：小表情 / 在想
   let halo = null;   // 输入行那一圈流光
+  let abar = null;   // 左上角的状态条（也是粒子，见 agentbar.js）
   let scene = null;
 
   /* 槽位总账（池子 56000，见 field.js 的 UI_POOL，账在 docs/interaction-spec.md §9）：
@@ -322,6 +324,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   /* 输入行光环：椭圆周长 ≈ 1383px，520 颗 → 点距 2.66，
      比点径 1.9 略松 —— 松一点才看得见"点"，紧了就成一条描边。 */
+  /* 状态条：13px 可读密度 58 颗/字，模型 18 + 数字 13 + 记忆 4 = 35 字 ≈ 2030，
+     加连接点 12 + 水位线 60。给 2200。它必须**先于场景**拿：
+     它是常驻的，被场景挤掉就等于状态消失了。 */
+  const ABAR_SLOTS = 2200;
+
   const HALO_SLOTS = 420;
 
   /* 答案块的槽位：20px 在**可读密度**下一个字 90 颗（§2.1）。
@@ -358,21 +365,27 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return { x: Math.round(innerWidth / 2), y: Math.round(lineY - 6), rx: 316, ry: 32 };
   }
 
-  /* 答案块：左半屏、左对齐，20px / 26 行高 / 29 字一行 / 14 行 / 400 字一页 */
+  /* 答案块：20px / 26 行高 / 29 字一行 / 14 行 / 400 字一页。
+     行宽固定按**半幅**排（636px ≈ 29 汉字，长文最舒服的行宽），
+     但满宽态（还没出场景）时整块**居中**，不是贴左 ——
+     贴左的话右边空出一大片，看起来像"回答只写了一半"（用户就是这么说的）。 */
   function ansGeom() {
     const a = contentArea();
-    const half = (a.w - 24) / 2;
+    const bw = (a.w - 24) / 2 - 32;
+    /* 分栏时答案在**左半**，场在右半（areaB 是场的位置，不是答案的位置 ——
+       把它拿来给答案，字就会和仪表叠在一起，实测整屏糊成一团）。 */
+    const split = hasScene();
     return {
       size: 20, lh: 26, lines: 14,
       /* 每行字数要按"字宽 + 字距"算，不能只除字号：汉字之间有一格字距（0.06em），
          33 字 × 20 看着是 660，实际排出来 726 —— 会直接压过中线进到场景区。 */
-      maxChars: Math.max(8, Math.floor((half - 40) / (20 * 1.06))),
-      maxWidth: half - 32,
+      maxChars: Math.max(8, Math.floor(bw / (20 * 1.06))),
+      maxWidth: bw,
       /* **左对齐**。这一块是"读一段话"，不是"念一句字幕"：
          居中的多行文字每行起点都在动，眼睛每换一行都要重新找头，
-         读三百字就是三百次重新找头。左边留 20px，和问句行同一个起点。 */
+         读三百字就是三百次重新找头。 */
       align: 'left',
-      cx: Math.round(a.x + 20),
+      cx: Math.round(split ? a.x + 20 : a.x + (a.w - bw) / 2),
       centerY: Math.round(a.y + a.h / 2),
     };
   }
@@ -387,13 +400,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     areaB = { x: a.x + half + 24, y: a.y, w: half, h: a.h };
     /* 态由"有没有答案"决定 —— 不是由场景有没有内容。
        用场景判断的话，模型只说话不出图时整屏会一直停在满宽，答案块没地方站。 */
-    area = ans && ans.text ? areaB : areaA;
+    area = hasScene() ? areaB : areaA;
 
     /* 状态区（§1）：和内容区左右对齐，36px 高，贴顶 20px */
     barEl.style.left = `${a.x}px`;
     barEl.style.top = '20px';
     barEl.style.width = `${a.w}px`;
     barEl.style.paddingRight = '128px';   // 右端让出记录/停止两个图标位
+    /* 粒子状态条和 DOM 那一行同一个起点同一条基线（38 = top 20 + 行高的一半）。
+       DOM 现在是透明的，只负责悬停和 tooltip。 */
+    abar?.layout({ x: a.x, y: 38 });
     halo?.layout(haloGeom());
 
     /* 记录 / 停止：状态区右端，不再挂在场角 —— 那里在答案铺开后会被字压住 */
@@ -423,6 +439,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* loading 区先于答案块分配：位置固定、只占 300 格。
        被答案挤掉就等于"它不在了"，而这张小脸是屏幕上唯一的在场信号。 */
     if (face) face.dispose();
+    if (abar) abar.dispose();
+    abar = createAgentBar({ field, alloc: head, slots: ABAR_SLOTS });
+    abar.layout({ x: contentArea().x, y: 38 });
     face = createFace({ field, alloc: head, slots: FACE_SLOTS });
     face.layout(faceGeom());
     /* 光环紧跟在脸之后拿：它也是"常驻且在固定位置"的东西，
@@ -433,27 +452,62 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     ans = createAnswer({ field, alloc: head, reserve: ANS_SLOTS });
     ans.layout(ansGeom());
 
-    /* 场从常驻元素之后开始分配：槽位是一条直线，两个分配器各开一个必然互相覆盖 */
-    scene = new FieldScene({ field, area, a11y, slotStart: head.used, envDim: ENV_DIM_AGENT });
+    /* 场从常驻元素之后开始分配：槽位是一条直线，两个分配器各开一个必然互相覆盖。
+       onAfterSet：每次换屏（含相变中途那次）之后把问句行与答案块写回去 ——
+       换屏会清空整块绘制区，而答案块只在文本变化时重绘，没人补就一直空着。 */
+    scene = new FieldScene({
+      field, area, a11y, slotStart: head.used, envDim: ENV_DIM_AGENT,
+      /* onAfterSet：每次换屏（含相变中途那次）之后把问句行与答案块写回去 ——
+         换屏会清空整块绘制区，而答案块只在文本变化时重绘，没人补就一直空着。
+         顺带重排一次：场景从"有"变成"空"时，答案该从半幅回到满宽。 */
+      onAfterSet: () => { applyMode({ noScene: true }); reassertLine(); abar?.repaint(); },
+      /* 相变落定：场景散完了，答案从半幅回满宽（空场不重铺） */
+      onSettled: () => { applyMode(); },
+    });
+  }
+
+  /* 这一屏有没有"场"。
+   *
+   * 分栏的判据是**场上有没有东西**，不是"有没有答案"。以前用 `ans.text`
+   * 判断，于是只说话不出图的那一轮也会分栏：答案挤在左半 668 里，
+   * 右半 668 一片空白，小表情孤零零挂在右上角 —— 用户的原话是
+   * "感觉你没有修完善，我仍然只能看到一行回复"（其实是右半空着、字被挤窄了）。
+   *
+   * 溶解中的场仍算有：否则清场那一瞬间字会从右半跳回满宽，再跳回来。 */
+  function hasScene() {
+    if (!scene) return false;
+    return scene.layers.size > 0 || scene.busy;
+  }
+
+  /**
+   * 切到分栏（右半给场）。
+   *
+   * **必须在铺之前调**。以前是铺完再切：场景先按满宽铺一遍（仪表横排、间隔 250），
+   * 然后再按半幅收缩一遍 —— 屏幕上闪两下；更糟的是第二次铺实测不生效，
+   * 因为 allocator 已经被第一次铺占满，重铺的层申请不到槽位，直接被 guard 丢掉。
+   * 现场表现就是"场永远停在满宽那一版"，看起来像布局根本没改。
+   */
+  function enterSplit() {
+    if (!scene || !areaB) return;
+    if (scene.area && scene.area.w === areaB.w && scene.area.x === areaB.x) return;
+    area = areaB;
+    scene.area = areaB;
+    face?.layout(faceGeom());
+    ans?.layout(ansGeom());
   }
 
   /* 场景出现/消失时，答案块要换档（big ⇄ compact）。换档只动字块，不动场景。
      只在档位**真的变了**时重排：每次 patch 都重排会让字闪一下，而 patch 是
      读数在跳的时候每秒都会来的东西。 */
-  /* 态切换（满宽 ⇄ 分栏）：不是"换字号档"，是**场景让出半边**。
-     场景要按新 area 重铺一次，答案块也跟着换到左半的中点。 */
-  function applyMode() {
+  /* 态切换（满宽 ⇄ 分栏）：这里**只切区、重排字**，不动场景的几何。
+     场景的铺法由 enterSplit（进分栏，铺之前调）和 onSettled（散完回满宽）负责 ——
+     在一个可能正处在别人调用栈里的函数里重铺场景，是上面那个 bug 的来源。 */
+  function applyMode(opt = {}) {
     if (!ans) return;
-    const want = ans.text ? areaB : areaA;
+    const want = hasScene() ? areaB : areaA;
     if (!want) return;
-    /* 比的是**场景当前用的** area，不是全局那个 —— 全局 area 在 measure 里早已
-       被改成新值，拿它比较会永远得出"没变"，场景就一直按旧的满宽铺着不收缩。 */
-    const changed = !scene || !scene.area || scene.area.w !== want.w || scene.area.x !== want.x;
     area = want;
-    if (scene) {
-      scene.area = area;
-      if (changed && scene.spec) scene.set(scene.spec);
-    }
+    if (scene) scene.area = area;
     face?.layout(faceGeom());
     ans.layout(ansGeom());
   }
@@ -465,6 +519,58 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 场景铺出来了：加载圈收掉（它只在空屏时代表"在想"），背景也降回
        有内容时的亮度 —— 内容一出现，屏幕上的主角就换成它 */
     if (thinking > 0) { ringOff(); ambientTo(ENV_DIM_THINK_BUSY); }
+  }
+
+  /* ───────────────── agent 自己的帧循环 ─────────────────
+   *
+   * 这一条是**必须**的，而且以前没有：`scene.step()` 全工程没有一处调用。
+   * 于是场里的相变（溶解 → 重新组合）、流的推进、曲线的扫掠头**从来没跑过** ——
+   * 仪表看着是"静态贴图"，而"清场"（transition 到空）就卡在第一步：
+   * 溶解时钟只存在 `this.tr` 里，没人推进它，于是旧屏永远挂在那儿
+   * （用户的原话："右边的场在不需要的时候应该刷掉，它现在始终停留在上一次的状态"）。
+   *
+   * 顺带把状态条的呼吸并进来：两条 rAF 意味着"谁先跑"是运气，
+   * 状态条先写、场景后清，那一下字会闪。
+   */
+  let tickRAF = 0;
+  let tickLast = 0;
+
+  function tick(now) {
+    const dt = Math.min(0.05, (now - tickLast) / 1000 || 0.016);
+    tickLast = now;
+    scene?.step(dt);
+    abar?.step(dt);
+    tickRAF = requestAnimationFrame(tick);
+  }
+
+  function startTick() {
+    if (tickRAF) return;
+    tickLast = performance.now();
+    tickRAF = requestAnimationFrame(tick);
+  }
+
+  function stopTick() {
+    if (!tickRAF) return;
+    cancelAnimationFrame(tickRAF);
+    tickRAF = 0;
+  }
+
+  /**
+   * 换题：上一屏不再相关，让它散掉。
+   *
+   * 用户的原话：「右边的场在不需要的时候应该刷掉，它现在始终停留在上一次
+   * 修改的状态」。问题换了、答案清了，右边还挂着上一题的仪表和曲线 ——
+   * 读起来像"它没听见我在问新的"。
+   *
+   * 只在**新问题**时做（submit 与 turn 的 ask）。手势不清：拖仪表、敲曲线
+   * 都是同一屏之内的操作，散掉等于把用户刚动过的东西收走。
+   */
+  function dropScene() {
+    if (!scene?.clear()) return false;
+    /* ans 已经清了（submit 里），这一句把 area 拨回满宽；
+       正在溶解的场景不会被打断 —— applyMode 对 busy 让路。 */
+    applyMode();
+    return true;
   }
 
   /* ───────────────── "在想"的那一圈 ─────────────────
@@ -593,6 +699,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     const lim = `${tokNum(u.limit || 0)}${u.limitSrc === 'default' ? '?' : ''}`;
     const used = tokNum(u.ctx?.tokens || 0);
     barCtxNum.textContent = `${tilde}${used} / ${lim}`;
+    abar?.setCtx({ text: `${tilde}${used}/${lim}`, pct });
     barCtxFill.style.width = `${pct}%`;
     /* 颜色是第二信号，数字永远同时在场。三档：够用 / 要留意 / 快满了 */
     barCtxFill.dataset.lv = pct >= 85 ? 'hot' : pct >= 60 ? 'warm' : '';
@@ -615,13 +722,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /* 记忆：条数常驻、内容进 tooltip。它不是模型上下文的一部分，
      是"我记得多少事"这样一个给人看的数字。 */
   function renderMem(m) {
-    if (!m) { barMem.textContent = ''; return; }
+    if (!m) { barMem.textContent = ''; abar?.setMem(''); return; }
     if (!m.on) {
       barMem.textContent = '记忆关';
       barMem.title = '记忆侧车没连上';
+      abar?.setMem('关');
       return;
     }
     barMem.textContent = `${m.facts ?? 0} 条`;
+    abar?.setMem(`${m.facts ?? 0} 条`);
     barMem.title = m.recent ? `${m.recent}\n（${m.last || ''}）` : '还没有记住什么';
   }
 
@@ -629,6 +738,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   function setLink(kind) {
     barDot.classList.toggle('off', kind === 'off');
     barDot.classList.toggle('on', kind === 'busy');
+    abar?.setLink(kind);
   }
 
   /* ───────────────── 与服务端 ───────────────── */
@@ -783,7 +893,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         t0 = performance.now();
         setLink('ok');
         barTool.textContent = '';
-        if (m.model) barModel.textContent = m.model;
+        if (m.model) { barModel.textContent = m.model; abar?.setModel(m.model); }
         insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
         renderTok(m.usage);
         renderMem(m.mem);
@@ -812,6 +922,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'turn':
         setBusy(true);
+        /* 新问题 = 上一屏作废（进"在想"时屏幕上只该有问 + 环）。
+           放在 turn 而不是只放 submit：手势回合也要走这里，而 adjust 不清。 */
+        if (m.kind !== 'intent') dropScene();
         insp(m.kind === 'intent' ? '→ 手势' : '→ 你问',
           m.kind === 'intent' ? describe(m.intent) : askText);
         break;
@@ -849,6 +962,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         closeSurface();
         /* 服务端的动作也走节拍器：mock 模型一秒钟能把四条指令全吐出来，
            但界面上必须有先后 —— 这就是"时序由前端强制"的意义。 */
+        /* 先切区、再铺。顺序反了就是"铺满宽 → 收缩"闪两下，而且第二次铺申请不到
+           槽位（allocator 被第一次占满），场上永远停在满宽那一版。 */
+        enterSplit();
         if (m.op === 'set') {
           /* 场上已经有东西时，"铺一屏"其实是换景。要不要有溶解重组，是**场的决定**，
              不是模型的参数 —— 它对用户说"再给我一屏"时不该还得分 set / transition。 */
@@ -1131,6 +1247,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     echo(text);
     sayText = '';
     ans?.set('', { instant: true });
+    /* 回车那一刻就让上一屏开始散 —— 不等服务端回 turn（网络慢时那几百毫秒
+       里，右边还挂着上一题的图，看起来像"没提交成功"）。 */
+    dropScene();
     insp('你', text);
     histPush('u', text);
     /* 回车那一下整圈亮一档，然后自己回落：它替"话发出去了"说话 */
@@ -1306,6 +1425,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     layer.hidden = false;
     face?.start();
     halo?.start();
+    abar?.start();
+    startTick();
     halo?.setLevel(1);
     document.body.classList.add('agent-open');
     /* 底边那条光已经完成了它的使命（用户就是点它进来的），
@@ -1355,6 +1476,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.vorts.length = 0;
     field.clearDraw();
     face?.stop();
+    abar?.stop();
+    stopTick();
     /* 光环跟着散：它不是"消失"，是亮度收回去 —— 和球面同一条 700ms 的时间感 */
     halo?.setLevel(0);
     /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
@@ -1512,11 +1635,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       open, thinking, busy, pendingApproval,
       slots: scene?.alloc.used ?? 0,
       ask: askText, say: sayText,
-      answer: ans ? { mode: ans.text ? 'split' : 'wide', page: ans.page, pages: ans.pageCount, used: ans.used, cap: ans.capacity, typing: ans.typing } : null,
+      answer: ans ? { mode: hasScene() ? 'split' : 'wide', page: ans.page, pages: ans.pageCount, used: ans.used, cap: ans.capacity, typing: ans.typing } : null,
       ring: !!face?.loading,
       mood: face?.mood,
       layers: scene ? [...scene.layers.keys()] : [],
       spec: scene?.spec?.layers?.map((l) => l.kind + ':' + l.id).join(' ') || '',
+      /* 调试用：几何是这一屏所有"看起来不对"的第一现场 */
+      area: area ? { x: area.x, y: area.y, w: area.w, h: area.h } : null,
+      face: faceGeom(),
+      sceneArea: scene ? { x: scene.area.x, w: scene.area.w, busy: scene.busy, n: scene.spec?.layers?.length ?? -1 } : null,
     }),
   };
 }
