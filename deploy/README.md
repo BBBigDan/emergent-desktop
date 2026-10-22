@@ -131,7 +131,8 @@ CI 最后会跑一次匿名探测，拉不到就在 Actions 里留 warning。
    日志说 `listening`、pod 永远 `2/3`，`describe` 里连个错都没有。
    现在用 `python3 -c "urllib...('/health')"`，在容器内部打回环。
 
-2. **`latest` 是可变标签，重拉时可能碰到边界。** 第一次自愈测试时，同一个
+2. **`latest` 是可变标签，重拉时可能碰到边界。**（现在 `install.sh` 预检时会把标签解析成
+   digest，按 `repo:tag@sha256:…` 部署 —— 下面这条是它修掉的那个现象。） 第一次自愈测试时，同一个
    `latest` 有一瞬间拉到了上一版 manifest，agent 起来 2 秒就崩（`memory.ok is
    not a function`），kubelet 重启后拉到新 manifest 又好了。冷启动高峰期别用
    `latest` 验收 —— **要确定就 `--tag sha-1a2b3c4`**，那是不可变的。

@@ -95,15 +95,28 @@ for I in shell agent memory; do
     M="https://@REG@/v2/$R/manifests/@TAG@"
   fi
   T=$(curl -s -m 10 "$U" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-  C=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -H "Authorization: Bearer $T" \
+  # 顺带把 digest 取回来：**标签是可变的**。实测两次了 —— `latest` 在 CDN 边缘
+  # 偶尔还指向上一版 manifest，agent 起来就崩（TypeError），重拉一次又好了。
+  # 按 digest 部署就没有这个窗口，而且日志里能看见到底跑的是哪一份。
+  H=$(curl -s -D - -o /dev/null -m 20 -H "Authorization: Bearer $T" \
       -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
-      "$M")
-  echo "  $I: HTTP $C"
+      "$M" | tr -d '\r')
+  C=$(printf '%s\n' "$H" | sed -n '1s/.* \([0-9]\{3\}\).*/\1/p')
+  D=$(printf '%s\n' "$H" | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | head -1)
+  echo "  $I: HTTP $C $D"
   [ "$C" = 200 ] || exit 7
 done
 EOS
 )
-"${SSH[@]}" sh -s <<<"$PROBE" || die "镜像 $IMAGE_TAG 拉不到 —— 线上没动过。先在 Actions 里看构建，或换 --tag"
+PROBE_OUT=$("${SSH[@]}" sh -s <<<"$PROBE") || die "镜像 $IMAGE_TAG 拉不到 —— 线上没动过。先在 Actions 里看构建，或换 --tag"
+echo "$PROBE_OUT"
+# 取每行的 digest（没取到就退回标签，不影响部署，只是少了那层保险）
+dig() { echo "$PROBE_OUT" | sed -n "s/^ *$1: HTTP [0-9]* \(sha256:[0-9a-f]\{64\}\)$/\1/p" | head -1; }
+D_SHELL=$(dig shell); D_AGENT=$(dig agent); D_MEMORY=$(dig memory)
+pin() { if [ -n "$2" ]; then printf '%s@%s' "$1" "$2"; else printf '%s' "$1"; fi; }
+IMG_SHELL=$(pin "$IMAGE_PREFIX-shell:$IMAGE_TAG" "$D_SHELL")
+IMG_AGENT=$(pin "$IMAGE_PREFIX-agent:$IMAGE_TAG" "$D_AGENT")
+IMG_MEMORY=$(pin "$IMAGE_PREFIX-memory:$IMAGE_TAG" "$D_MEMORY")
 
 # ── 1. 找用户 Home ─────────────────────────────────────
 say "找用户 Home"
@@ -142,9 +155,9 @@ fi
 say "apply 工作负载（ReplicaSet，$IMAGE_TAG）"
 sed -e "s|__USER_HOME__|$HOME_PATH|g" \
     -e "s|__STATE_DIR__|$STATE_DIR|g" \
-    -e "s|__IMAGE_SHELL__|$IMAGE_PREFIX-shell:$IMAGE_TAG|g" \
-    -e "s|__IMAGE_AGENT__|$IMAGE_PREFIX-agent:$IMAGE_TAG|g" \
-    -e "s|__IMAGE_MEMORY__|$IMAGE_PREFIX-memory:$IMAGE_TAG|g" \
+    -e "s|__IMAGE_SHELL__|$IMG_SHELL|g" \
+    -e "s|__IMAGE_AGENT__|$IMG_AGENT|g" \
+    -e "s|__IMAGE_MEMORY__|$IMG_MEMORY|g" \
     "$HERE/desktop-k8s.yaml" | "${SSH[@]}" "kubectl apply -f - 2>&1 | tail -6"
 
 # ReplicaSet 和 Deployment 的一个关键差别：改了 pod template **不会**替换已有的 pod，
