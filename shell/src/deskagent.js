@@ -22,6 +22,7 @@ import { compileDraw } from './draw.js';
 import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { createAnswer } from './answer.js';
 import { createFace } from './face.js';
+import { createHalo } from './halo.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
 import { GestureTracker, describe } from './gesture.js';
@@ -285,13 +286,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let ask = null;   // 用户那一行（输入行）
   let ans = null;   // 模型那一块（上面的大字）
   let face = null;   // loading 区：小表情 / 在想
+  let halo = null;   // 输入行那一圈流光
   let scene = null;
 
   /* 槽位总账（池子 56000，见 field.js 的 UI_POOL，账在 docs/interaction-spec.md §9）：
        问           22 字 × 81 = 1782   —— 先拿，它在输入行、位置固定
        loading 区    300
-       答案         32400                —— 12 行 × 30 字 × 90 颗（§2.1 的可读密度）
-       场景         余下 ~21500           —— 仪表 / 曲线 / 分叉环
+       输入行光环    420                —— 一圈流光的粒子，唯一"话往哪儿说"的线索
+       答案         37800                —— 14 行 × 30 字 × 90 颗（§2.1 的可读密度）
+       场景         余下 ~15600           —— 仪表 / 曲线 / 分叉环
        余量         ~500                 —— 某一层超配时不至于整屏不铺
      "问"必须先拿：被场景挤掉就等于用户看不到自己刚问过什么。 */
 
@@ -317,10 +320,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   const ASK_SIZE = 18;
   const ASK_CHARS = 22;
 
+  /* 输入行光环：椭圆周长 ≈ 1383px，520 颗 → 点距 2.66，
+     比点径 1.9 略松 —— 松一点才看得见"点"，紧了就成一条描边。 */
+  const HALO_SLOTS = 420;
+
   /* 答案块的槽位：20px 在**可读密度**下一个字 90 颗（§2.1）。
-     12 行 × (29 字 + 1 格行首禁则) × 90 = 32400 —— 正好是一页 300 字的家。
+     14 行 × (29 字 + 1 格行首禁则) × 90 = 37800 —— 一页 400 字（36000）的家。
      行数与每行字数一变，这个数就得跟着变，否则最后两行会申请不到槽位。 */
-  const ANS_SLOTS = 32400;
+  const ANS_SLOTS = 37800;
 
   let areaA = null;   // 态 A：场景满宽
   let areaB = null;   // 态 B：场景只占右半
@@ -344,12 +351,19 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return { x: area.x + 52, y: area.y + 44, size: 48, slots: FACE_SLOTS };
   }
 
-  /* 答案块：左半屏、左对齐，20px / 26 行高 / 29 字一行 / 12 行 / 300 字一页 */
+  /* 输入行的光环：椭圆，中心比文字基线高 6px（字的视觉中心在基线之上）。
+     横轴 340 比输入框（620 宽）宽 30，纵轴 36 比它（34 高）高 19 ——
+     写字时不会碰到环，不写字时环确实包住了那一行。 */
+  function haloGeom() {
+    return { x: Math.round(innerWidth / 2), y: Math.round(lineY - 6), rx: 316, ry: 32 };
+  }
+
+  /* 答案块：左半屏、左对齐，20px / 26 行高 / 29 字一行 / 14 行 / 400 字一页 */
   function ansGeom() {
     const a = contentArea();
     const half = (a.w - 24) / 2;
     return {
-      size: 20, lh: 26, lines: 12,
+      size: 20, lh: 26, lines: 14,
       /* 每行字数要按"字宽 + 字距"算，不能只除字号：汉字之间有一格字距（0.06em），
          33 字 × 20 看着是 660，实际排出来 726 —— 会直接压过中线进到场景区。 */
       maxChars: Math.max(8, Math.floor((half - 40) / (20 * 1.06))),
@@ -380,6 +394,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     barEl.style.top = '20px';
     barEl.style.width = `${a.w}px`;
     barEl.style.paddingRight = '128px';   // 右端让出记录/停止两个图标位
+    halo?.layout(haloGeom());
 
     /* 记录 / 停止：状态区右端，不再挂在场角 —— 那里在答案铺开后会被字压住 */
     histBtn.style.top = '24px';
@@ -410,6 +425,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (face) face.dispose();
     face = createFace({ field, alloc: head, slots: FACE_SLOTS });
     face.layout(faceGeom());
+    /* 光环紧跟在脸之后拿：它也是"常驻且在固定位置"的东西，
+       被答案块挤掉就等于输入框没了边 —— 那正是它要解决的问题。 */
+    if (halo) halo.dispose();
+    halo = createHalo({ field, alloc: head, slots: HALO_SLOTS });
+    halo.layout(haloGeom());
     ans = createAnswer({ field, alloc: head, reserve: ANS_SLOTS });
     ans.layout(ansGeom());
 
@@ -1113,11 +1133,19 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     ans?.set('', { instant: true });
     insp('你', text);
     histPush('u', text);
+    /* 回车那一下整圈亮一档，然后自己回落：它替"话发出去了"说话 */
+    halo?.setHot(1);
+    setTimeout(() => halo?.setHot(0), 420);
     send({ t: 'ask', text });
     typeEl.value = '';
     ingest(text);
     closeHist();
   }
+
+  /* 聚焦时那一圈亮一档。这是"现在可以打字"的唯一提示 ——
+     页面上没有可见的输入框，光标 1px 宽、还会闪，靠它找不到自己该看哪儿。 */
+  typeEl.addEventListener('focus', () => halo?.setHot(0.55));
+  typeEl.addEventListener('blur', () => halo?.setHot(0));
 
   typeEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); }
@@ -1277,6 +1305,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
     layer.hidden = false;
     face?.start();
+    halo?.start();
+    halo?.setLevel(1);
     document.body.classList.add('agent-open');
     /* 底边那条光已经完成了它的使命（用户就是点它进来的），
        场展开后它再亮着就成了"屏幕上多了一个控件"。 */
@@ -1325,6 +1355,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.vorts.length = 0;
     field.clearDraw();
     face?.stop();
+    /* 光环跟着散：它不是"消失"，是亮度收回去 —— 和球面同一条 700ms 的时间感 */
+    halo?.setLevel(0);
     /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
     field.setAgentMode(false);
     closeSurface();

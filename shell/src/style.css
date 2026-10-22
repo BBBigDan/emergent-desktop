@@ -352,7 +352,7 @@ body.launching .rail-zone { display: none; }
   display: flex; align-items: center; gap: 13px;
   font: 11px/1 ui-monospace, Menlo, "Cascadia Mono", monospace;
   letter-spacing: .03em;
-  color: rgba(147, 184, 216, .40);
+  color: rgba(147, 184, 216, .52);
   pointer-events: none;
   white-space: nowrap;
 }
@@ -366,7 +366,7 @@ body.launching .rail-zone { display: none; }
 .ag-bar .ag-dot.on { background: rgba(255, 196, 120, .95); box-shadow: 0 0 9px rgba(255, 196, 120, .55); }
 .ag-bar .ag-dot.off { background: rgba(255, 124, 147, .95); box-shadow: 0 0 9px rgba(255, 124, 147, .5); }
 
-.ag-bar .ag-model { font-weight: 400; color: rgba(170, 205, 235, .62); }
+.ag-bar .ag-model { font-weight: 400; color: rgba(184, 214, 240, .78); }
 .ag-bar .ag-ctx { display: flex; align-items: center; gap: 7px; pointer-events: auto; cursor: default; }
 .ag-bar .ag-ctx-track {
   display: inline-block; width: 54px; height: 3px; border-radius: 2px;
@@ -379,7 +379,7 @@ body.launching .rail-zone { display: none; }
 }
 .ag-bar .ag-ctx-fill[data-lv="warm"] { background: rgba(255, 196, 120, .9); }
 .ag-bar .ag-ctx-fill[data-lv="hot"] { background: rgba(255, 124, 147, .95); }
-.ag-bar .ag-ctx-num { font-weight: 400; color: rgba(147, 184, 216, .58); }
+.ag-bar .ag-ctx-num { font-weight: 400; color: rgba(163, 198, 228, .72); }
 .ag-bar .ag-mem { pointer-events: auto; cursor: default; }
 .ag-bar .ag-tool { color: rgba(255, 178, 87, .62); overflow: hidden; text-overflow: ellipsis; }
 
@@ -542,11 +542,11 @@ body.agent-open .stat-zone { pointer-events: none; }
   display: flex; justify-content: space-between; align-items: baseline;
   font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
   letter-spacing: 0.08em;
-  color: rgba(150, 180, 210, 0.42);
+  color: rgba(160, 192, 222, 0.55);
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.3s;
 }
 .ag-page.on { opacity: 1; }
-.ag-page b { font-weight: 400; color: rgba(150, 180, 210, 0.55); }
-.ag-page span { color: rgba(150, 180, 210, 0.28); }
+.ag-page b { font-weight: 400; color: rgba(178, 210, 238, 0.78); }
+.ag-page span { color: rgba(160, 192, 222, 0.42); }

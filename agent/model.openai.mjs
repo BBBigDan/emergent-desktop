@@ -70,11 +70,13 @@ export function createOpenAIModel(o = {}) {
   const apiKey = o.apiKey || process.env.MODEL_KEY || '';
   const model = o.model || process.env.MODEL || DEFAULT_MODEL;
   const temperature = Number(o.temperature ?? process.env.MODEL_TEMP ?? 0.3);
-  /* 2000 而不是 1200：这是一个**上限**，不是目标 —— 正常回话该停就停。
-   但 tool_write 要把一整段脚本装进一个 JSON 参数里，1200 会在半句代码上方
-   直接截断，而截断的表现是「参数不是合法 JSON」，看起来像模型的错（也确实是，
-   但它本来能对）。实测 7B 写 25 行脚本加参数就顶到 1200 的天花板。 */
-  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 2000);
+  /* 这是一个**上限**，不是目标 —— 正常回话该停就停。三次调整的来历：
+   1200 → 2000：tool_write 要把一整段脚本装进一个 JSON 参数里，1200 会在半句代码
+   上方直接截断，表现是「参数不是合法 JSON」，看起来像模型的错。
+   2000 → 4096：答案块现在一页 400 字、最多三页（1200 字 ≈ 1800 token，加上
+   JSON 外壳就贴着 2000 的天花板），中文长回答会在最后一句中途断掉 ——
+   屏幕上就是"没写完"，而 `finish_reason=length` 只在服务端打一行日志。 */
+  const maxTokens = Number(o.maxTokens ?? process.env.MODEL_MAX_TOKENS ?? 4096);
   const timeoutMs = Number(o.timeoutMs ?? process.env.MODEL_TIMEOUT ?? 45_000);
   const retries = Number(o.retries ?? 2);
 

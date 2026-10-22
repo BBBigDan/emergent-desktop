@@ -2,11 +2,11 @@
  * 答案块 —— 屏幕上真正要"读"的那几段字。
  *
  * 从"输入框上面一行 19px / 20 字"改过来，现在是一整块版面：
- *   20px、每行 29 字、12 行、**每页 300 字**，左对齐排在左半屏。
+ *   20px、每行 29 字、14 行、**每页 400 字**，左对齐排在左半屏。
  *
- * 为什么是 20px / 300 字：一个汉字要 `glyphBudget(size, true)` ≈ 90 颗才读得出来
- * （这笔账见 pui.js），300 × 90 = 27000，加上"每行按上限预留"的浪费后
- * 正好是 56000 的粒子池减去场景之后能匀给答案的部分（32400）。
+ * 为什么是 20px / 400 字：一个汉字要 `glyphBudget(size, true)` ≈ 90 颗才读得出来
+ * （这笔账见 pui.js），14 行 × 30 字 × 90 = 37800 是槽位上限，
+ * 而一页 400 字实际只占 36000 —— 留出来的那一千多是"每行按上限预留"的浪费。
  * 字号再大不会更省 —— 可读密度下每个字的点数**与字号无关**。
  *
  * 四条要守住的：
@@ -23,8 +23,10 @@ const CJK = /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/;
 const BREAK = '，。、；：!?！？ ';
 const PAGE_BREAK = '。！？；\n';
 
-/** 每页字数。300 × 90 颗 = 27000 槽位，留出行预留的浪费（见 ensureRows）。 */
-export const PAGE_CHARS = 300;
+/** 每页字数。400 × 90 颗 = 36000，行预留按 14 行 × 30 字算（见 ensureRows）。
+    为什么是 400 而不是 300：一页 300 字时，一段正常长度的回答就要翻三页，
+    用户读到第一页就没有下文了 —— 那和"没说完"是同一件事。 */
+export const PAGE_CHARS = 400;
 
 /** 字距系数，必须和 ParticleText.spacing 一致（0.06em）—— 量宽比排版窄就会压过中线。 */
 const SPACING = 0.06;
@@ -126,7 +128,7 @@ export function createAnswer({ field, alloc, reserve }) {
 
   let size = 20;
   let lh = 26;
-  let rows = 12;
+  let rows = 14;
   let maxChars = 29;
   let maxWidth = 636;
   let cx = 0;
@@ -155,7 +157,7 @@ export function createAnswer({ field, alloc, reserve }) {
    * 屏幕上就是"这句话怎么少了个句号"。
    *
    * 预留是按 max 算的（ParticleText 在构造时定死每字槽位），所以
-   * `行数 × (maxChars+1) × 90` 必须 ≤ reserve —— 12 × 30 × 90 = 32400，
+   * `行数 × (maxChars+1) × 90` 必须 ≤ reserve —— 14 × 30 × 90 = 37800，
    * 这就是 deskagent 里 ANS_SLOTS 的来处。行数不能随手加。
    */
   function ensureRows(n) {

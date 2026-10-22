@@ -863,8 +863,13 @@ async function runTurn(s, goal) {
       /* 手势回合干脆不要它说话：这一行该说"代价"，而代价（要重启谁）是系统知道的事，
          模型只会复述用户动作或复述自己的计划。要它表达的地方是 scene_ask 的问题本身。 */
       const isAdjust = s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust';
+      /* 40 字是"场里只有一行 20 格"时代的上限 —— 那时候多一个字就挤掉一个读数。
+         现在答案块是 400 字一页、最多三页，这个 40 把每一句用 content 说出口的回答
+         都切成了半句话（用户的原话："感觉都是没回答完的状态"，2026-10-22）。
+         上限跟 reading 那条对齐（1200 = 三页）：能不能给长回答由屏幕决定，
+         不由这里悄悄决定。 */
       const speech = (isAdjust || looksLikeJSON || TOOL_WORDS.test(rawSpeech) || META_TALK.test(rawSpeech))
-        ? '' : rawSpeech.slice(0, 40);
+        ? '' : rawSpeech.slice(0, 1200);
       /* 一轮只说一句话。
          scene_show 的 reading 已经替它说过话了；之后模型再补一段
          "机器当前负载情况是这样的……"，那不是给用户的话，是旁白。
