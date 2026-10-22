@@ -1184,6 +1184,23 @@ async function runTurn(s, goal) {
           if (Array.isArray(result.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
         }
         if (name === 'app_list' && Array.isArray(result?.apps)) { s.lastApps = result.apps; s.appsTurn = s.turn; }
+        /* 官方 CLI 那条路也要登记，否则"模型空回复"时系统不会兜底：
+           它只认 sys_status / app_list 这两个名字，而模型现在会先调 olares。
+           实测症状：模型调完 olares（3 个应用、4.5 秒、日志 ok），
+           第二轮吐空 → 屏幕上一句话都没有，而数据明明已经拿到了。 */
+        if (name === 'olares' && result && !result.error) {
+          if (result.apps?.length) { s.lastApps = result.apps; s.appsTurn = s.turn; }
+          if (result.physical) {
+            const ph = result.physical;
+            s.lastStatus = {
+              cpu: ph.cpu?.pct, mem: ph.memory?.pct, disk: ph.disk?.pct,
+              cores: ph.cpu?.total,
+              memTotal: ph.memory?.total, memUsed: ph.memory?.value,
+              /* 兜底屏的仪表要 0~1；CLI 给的就是 0~1，缺了就别猜 */
+            };
+            s.statusTurn = s.turn;
+          }
+        }
         /* 文件类问题（"什么占地方"、"下载了什么"）的答案是**文件**，不是仪表。
            标一下，兜底屏就别再拿内存读数去凑 —— 实测它会给"磁盘什么最占地方"
            铺出三个内存百分比，"n8n 占 2%"，语义全错而且看不出来。 */
