@@ -55,10 +55,21 @@ data:
         gzip_types text/plain text/css text/xml application/javascript application/json
                    application/xml application/wasm image/svg+xml application/manifest+json;
 
-        # 壳层本身：不缓存，改完刷新即生效
+        # 壳层本身：**不缓存**。
+        #
+        # `no-cache` 不够 —— 它只要求"用之前验证"，而验证要靠 ETag/Last-Modified；
+        # 实测部署后刷新，浏览器仍然跑上一版的 ES Module（renderer 里那份模块图），
+        # 用户看到的就是"改了没生效"（2026-10-22 踩到，误判成代码没打进去）。
+        # `no-store` 是唯一能保证"部署即生效"的头。src/ 一共 544K，重下的代价可以接受。
         location / {
             try_files $uri $uri/index.html /index.html;
-            add_header Cache-Control "private,no-cache";
+            add_header Cache-Control "no-store";
+        }
+
+        # 第三方大件（three.js 672K）不会变：给它长缓存，省一次下载。
+        # 注意 nginx 的 add_header 在子 location 里会**覆盖**继承，所以这里单独写。
+        location /vendor/ {
+            add_header Cache-Control "public, max-age=31536000, immutable";
         }
 
         # agent：同一个 pod 里的 127.0.0.1:8788。前缀不剥 —— agent 自己认 /agent/
