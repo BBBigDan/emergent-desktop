@@ -1934,7 +1934,11 @@ const server = http.createServer(async (req, res) => {
             speak(s, r?.reason === 'short'
               ? '这段还短，不用收'
               : '没收成，先把这一段留着');
-            emit(s, { t: 'note', message: `压缩失败：${r?.error || r?.reason || '未知'}` });
+            /* "太短"不是故障，别在观察窗里报一条红字。
+               观察窗里的每条 note 都该是"你要知道的事"，不是内部枚举值。 */
+            if (r?.reason !== 'short') {
+              emit(s, { t: 'note', message: `压缩失败：${r?.error || r?.reason || '未知'}` });
+            }
           }
           emit(s, { t: 'idle' });
         })();

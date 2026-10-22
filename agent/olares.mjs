@@ -74,7 +74,7 @@ export const OPS = Object.keys(READ);
 /** 给模型看的 op 说明。写在这里而不是提示词里：工具 schema 离调用更近。 */
 export const OP_DOC = [
   'apps=装了哪些应用(版本/状态/来源/CPU/内存)，并附整机内存 node；每个应用的 cpu/memPct 是 0~1、指它自己占节点的比例（整机看 node）',
-  'app=某个应用的状态(name)',
+  'app=某个应用的状态(name)；不含重启次数，那个看 pods',
   'appinfo=某个应用是什么、能干什么(name)',
   'catalog=市场有什么可装',
   'categories=市场分类与数量',

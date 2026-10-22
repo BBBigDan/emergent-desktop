@@ -51,8 +51,10 @@ console.log('\n其它形态');
   ok(cleanSpeech('```json\n{"a":1}\n```') === '', '只有代码块 → 空');
   /* 没闭合的代码块：后面那半截正是 JSON 参数，必须一起切 */
   ok(cleanSpeech('先说结论：正常。\n```json\n{"reading":"x"') === '先说结论：正常。', '未闭合代码块也切');
-  /* 行首 JSON 残片（没有围栏） */
+  /* 行首 JSON 残片（没有围栏）。**不枚举键名** —— 线上漏过 label 这个键 */
   ok(cleanSpeech('CPU 21%。\n{"reading":"CPU 21%"') === 'CPU 21%。', '裸 JSON 行也切');
+  ok(cleanSpeech('运行正常。\n{"label":"要看日志吗","yes":"看","no":"不看"}') === '运行正常。',
+    '选项形态的 JSON 也切（label 曾经漏网）');
   /* 四空格缩进的代码块不是围栏，但内容是参数 —— 由 JSON_LINE 兜住 */
   ok(cleanSpeech('正常。\n    {"ask":"要看吗"}') === '正常。', '缩进的 JSON 也切');
 }
