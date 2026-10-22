@@ -22,6 +22,7 @@
  * 它不是"两套 UI 交叉淡入淡出"，而是把相干度压到 0、换几何、再拉回 1。
  */
 
+import { splitTitle } from './forktitle.js';
 import { ParticleText, SlotAllocator, glyphBudget } from './pui.js';
 import { FONT, FONT_LAT } from './draw.js';
 import { TIMING } from './timing.js';
@@ -313,7 +314,25 @@ export class FieldScene {
            这是"决策是排他的"能成立的技术前提：场里只有一个决策槽，
            新问题来了就地把旧的换掉，不新建、不叠两个。 */
         layer.spec.label = op.label;
-        layer.title?.set(fit(op.label, 14));
+        const tl = splitTitle(op.label, 15);
+        layer.title?.set(tl[0] || '');
+        /* 第二行：原来没有就补一块（问句变长了会多一行），原来有就清掉 */
+        if (tl[1]) {
+          if (!layer.title2) {
+            try {
+              layer.title2 = new ParticleText({
+                field: this.field, alloc: this.alloc, x: layer.anchor.x, y: layer.anchor.y - 76,
+                size: 17, max: 16, color: '#93b8d8', align: 'center', font: FONT,
+                label: `f2-${op.id}`, budget: glyphBudget(17, true),
+              });
+              /* 多了一行，第一行要跟着上移 —— 否则两行贴在一起 */
+              layer.title.y = layer.anchor.y - 100;
+            } catch { /* 挤不下就只留一行 */ }
+          }
+          layer.title2?.set(tl[1]);
+        } else if (layer.title2) {
+          layer.title2.set('');
+        }
         if (Array.isArray(op.options)) {
           layer.spec.options = op.options;
           op.options.slice(0, 2).forEach((o, k) => {
@@ -824,13 +843,28 @@ export class FieldScene {
     this.layers.set(spec.id, layer);
 
     const f = this.field;
+    /* 问句最多两行（见 splitTitle）。两行时整块上移一点，让"问句 + 选项"
+       这个整体还是围绕环心居中 —— 一行时保持原来的 cy-78。 */
+    const lines = splitTitle(spec.label, 15);
+    const titleY = lines.length > 1 ? cy - 100 : cy - 78;
     const title = new ParticleText({
-      field: f, alloc: this.alloc, x: cx, y: cy - 78, size: 17, max: 12,
+      field: f, alloc: this.alloc, x: cx, y: titleY, size: 17, max: 16,
       color: '#93b8d8', align: 'center', font: FONT, label: `f-${spec.id}`,
       budget: glyphBudget(17, true),
     });
-    title.set(fit(spec.label, 12));
+    title.set(lines[0]);
     layer.title = title;
+    if (lines[1]) {
+      /* 第二行单独预留槽位。挤不下就只留第一行 —— 少一行比整屏不铺好。 */
+      try {
+        layer.title2 = new ParticleText({
+          field: f, alloc: this.alloc, x: cx, y: titleY + 24, size: 17, max: 16,
+          color: '#93b8d8', align: 'center', font: FONT, label: `f2-${spec.id}`,
+          budget: glyphBudget(17, true),
+        });
+        layer.title2.set(lines[1]);
+      } catch { /* 没有第二行也照样能看 */ }
+    }
 
     /* 方位即时间。角度是屏幕坐标：0° = 正右，顺时针为正。
          右 330°（跨 0°）= 未来、下 60° = 现在、左 150° = 过去，各占 60°

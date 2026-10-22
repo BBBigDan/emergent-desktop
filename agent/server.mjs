@@ -24,6 +24,7 @@ import path from 'node:path';
 import url from 'node:url';
 
 import { makeTools, defaultOverview, coldTools } from './tools.mjs';
+import { normalizeSpec, patchToSpec } from './scene.schema.mjs';
 import { createMockModel } from './model.mock.mjs';
 import { createOpenAIModel } from './model.openai.mjs';
 import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
@@ -662,12 +663,16 @@ function settleApproval(s, ok) {
 
 /* ───────────────────────── 工具调用循环 ───────────────────────── */
 
+/** 意图里的人话名字。**永远不许出现 undefined** ——
+ *  它是写进对话历史的一句话，模型下一轮会照着它理解"用户刚刚做了什么"，
+ *  而「点了 undefined」教给它的只有"用户点了个不存在的东西"。 */
+const nm = (i) => String(i?.label || i?.target || '那个东西');
 const INTENT_ZH = {
-  adjust: (i) => `把「${i.label}」从 ${Math.round(i.from * 100)}% 拖到 ${Math.round(i.to * 100)}%`,
-  pick: (i) => `在「${i.label}」选了「${i.optionLabel || i.option}」`,
-  tap: (i) => `点了「${i.label}」`,
-  pan: (i) => `把「${i.label}」横向翻了一段`,
-  seek: (i) => `把「${i.label}」跳到 ${Math.round(i.to * 100)}%`,
+  adjust: (i) => `把「${nm(i)}」从 ${Math.round(i.from * 100)}% 拖到 ${Math.round(i.to * 100)}%`,
+  pick: (i) => `在「${nm(i)}」选了「${String(i.optionLabel || i.option || '其中一项')}」`,
+  tap: (i) => `点了「${nm(i)}」`,
+  pan: (i) => `把「${nm(i)}」横向翻了一段`,
+  seek: (i) => `把「${nm(i)}」跳到 ${Math.round(i.to * 100)}%`,
 };
 
 const summarize = (r) => {
@@ -1355,6 +1360,28 @@ async function runTurn(s, goal) {
 
         /* 场景工具不是"数据"，是给眼睛的指令 —— 直接下发，不进工具结果里让模型再读一遍 */
         if (result && result.ok && result.op) {
+          /* patch 打在一个**不存在的层**上会被静默丢掉（`scene.patch` 找不到就 continue）。
+           *
+           * 实测（2026-10-22 线上）：屏幕上是三个仪表，模型调 `scene_ask` 问
+           * 「要在 Navidrome 中查找《千与千寻》吗」，op 是 patch id=ask ——
+           * 当场没有 ask 那一层，于是**屏幕上什么都没出现**，而模型以为问过了，
+           * 下一轮就按"用户已经回答"往下走。用户看到的是"它说了好多个选项，
+           * 但屏幕上没有"。
+           *
+           * 所以这里补一层：patch 里出现新 id 时，把这一屏**升级成 set**
+           * （旧层保留 + 新层加进去）。视角上是从"三个仪表"变成"三个仪表 + 一个问题"，
+           * 而不是什么都不发生。 */
+          if (result.op === 'patch' && Array.isArray(result.ops) && result.ops.length) {
+            const known = new Set((s.lastSceneSpec?.layers || []).map((l) => l.id));
+            const fresh = result.ops.filter((o) => o.id && !known.has(o.id));
+            if (fresh.length) {
+              const merged = patchToSpec(s.lastSceneSpec, result.ops);
+              const norm = normalizeSpec(merged);
+              if (norm.spec) {
+                result = { ...result, op: 'set', spec: norm.spec, ops: undefined, upgraded: true };
+              }
+            }
+          }
           /* 曲线要延续。
            *
            * 实测：系统先铺的兜底屏带了一条 CPU 曲线，模型随后用 scene_show
@@ -1385,7 +1412,10 @@ async function runTurn(s, goal) {
              * 改成按次数：一轮一次。要换屏是下一个回合的事。 */
             /* 但"次数"这条对**系统铺的首屏**不适用 —— 模型覆盖首屏是设计好的。
                （首屏不占 s.sets，所以这里 s.sets 已经是模型自己的次数。） */
-            if (sig === s.lastSpecSig) {
+            if (result.upgraded) {
+              /* 这条是从 patch 升级来的（新层），本来就不是"重铺一遍" */
+              s.lastSpecSig = sig;
+            } else if (sig === s.lastSpecSig) {
               result.duplicate = true;
               result.hint = '这一屏和现在屏幕上的一样，不要再铺一次';
             } else if (s.sets > 1) {
@@ -1964,6 +1994,10 @@ const server = http.createServer(async (req, res) => {
         runTurn(s, { kind: 'ask', text });
       }
     } else if (body.t === 'intent' && body.intent) {
+      /* 空白处的一次点击（`target: null` 的 tap）不是意图。
+         老前端会把它发上来，服务端这边也挡一道：它没有内容可指，
+         交给模型只会让它对着「点了 undefined」编一段回答，还白烧一轮。 */
+      if (body.intent.kind === 'tap' && !body.intent.target) return;
       runTurn(s, { kind: 'intent', intent: body.intent });
     } else if (body.t === 'approve') {
       settleApproval(s, !!body.ok);

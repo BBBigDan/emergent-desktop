@@ -1396,6 +1396,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     },
 
     onIntent: (i) => {
+      /* 空白处的点击不产生意图。
+         gesture.js 在"没打到任何层"时会发一个 `target: null` 的 tap（让场响一下），
+         但它没有内容可指 —— 交给模型只会得到一句「点了 undefined」，
+         还要白烧一整轮（实测：用户点一下空白，模型开始答一个不存在的问题）。
+         场已经在 onStart 里响过了，这里到此为止。 */
+      if (i.kind === 'tap' && !i.target) return;
       /* 分叉上的"允许/拒绝"是**审批**，不是普通选择 —— 但走的是同一条手势通道。
          审批不是特权通道，它只是"服务端此刻在等一个 pick"。 */
       if (pendingApproval && i.kind === 'pick' && i.target === 'ask') {

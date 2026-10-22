@@ -830,7 +830,7 @@ export function makeTools(o = {}) {
           description: '要看哪个指标最近一小时的走势。填了它由系统取真实曲线，你不用给 data',
         },
         note: { type: 'string', description: '一句结论，≤20 字（可选）' },
-        ask: { type: 'string', description: '要问用户的那句话，≤14 字（可选）。填了它就必须同时填 yes 和 no' },
+        ask: { type: 'string', description: '要问用户的那句话，≤30 字（屏幕上最多两行，可选）。填了它就必须同时填 yes 和 no' },
         yes: { type: 'string', description: '左边那个选项，≤8 字' },
         no: { type: 'string', description: '右边那个选项，≤8 字' },
         mood: { type: 'string', enum: ['calm', 'working', 'alert'] },
@@ -893,7 +893,7 @@ export function makeTools(o = {}) {
     schema: {
       type: 'object',
       properties: {
-        label: { type: 'string', description: '问题，≤14 字' },
+        label: { type: 'string', description: '问题，≤30 字（屏幕上最多两行）' },
         yes: { type: 'string', description: '左边选项，≤8 字' },
         no: { type: 'string', description: '右边选项，≤8 字' },
       },

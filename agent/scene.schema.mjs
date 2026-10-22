@@ -46,7 +46,9 @@ export const TEXT_CAP = {
   gauge: { label: 12 },
   stream: { label: 12 },
   trace: { label: 12 },
-  fork: { label: 14, option: 8 },
+  /* 问句给到 30：屏幕上是**两行**（splitTitle，每行 15）。
+     14 会把「要在 Navidrome 中查找《千与千寻》这部电影吗？」切成半句 —— 线上实拍。 */
+  fork: { label: 30, option: 8 },
   condense: { text: 20 },
   turbulence: { label: 8 },
 };
@@ -289,7 +291,7 @@ const LAYER_SCHEMA = {
     /* 一个字段服务多种 kind，是因为 models 对 oneOf 的支持很差：
        用 oneOf 时便宜模型经常整段 spec 都不生成了。宁可 schema 宽一点，
        由 normalizeSpec 按 kind 二次收紧。 */
-    label: { type: 'string', description: 'gauge ≤12 字（应用就写真名），stream/trace ≤12 字，fork ≤14 字' },
+    label: { type: 'string', description: 'gauge ≤12 字（应用就写真名），stream/trace ≤12 字，fork ≤30 字（会排成两行）' },
     value: { type: 'number', description: 'gauge 用，0~1 的比例' },
     progress: { type: 'number', description: 'stream 用，0~1 的比例' },
     level: { type: 'number', description: 'turbulence 用，0~1，越大越乱' },
@@ -329,3 +331,41 @@ const OP_SCHEMA = {
 };
 
 export const OPS_SCHEMA = { type: 'array', items: OP_SCHEMA };
+
+/**
+ * 把一串 patch op 合并成一份完整 spec。
+ *
+ * 只在**目标层还不存在**时用（见 runTurn 里那段）。op 的形状是扁平的
+ * （`{id, label, options}` / `{id, value}`），要靠"带了哪个字段"反推 kind ——
+ * 因为 `normalizeOps` 也要吃同一份形状，两边都得能从字段认出类型。
+ */
+export function patchToSpec(prev, ops) {
+  const layers = (prev?.layers || []).map((l) => ({ ...l }));
+  for (const o of ops || []) {
+    if (!o?.id) continue;
+    const at = layers.findIndex((l) => l.id === o.id);
+    /* 已存在 → 这一条交给原来的 patch 路径（合并进旧层） */
+    if (at >= 0) {
+      const l = layers[at];
+      if (Array.isArray(o.options)) Object.assign(l, { kind: 'fork', label: o.label ?? l.label, options: o.options });
+      else if (o.value != null) Object.assign(l, { kind: 'gauge', value: o.value, label: o.label ?? l.label });
+      else if (o.progress != null) Object.assign(l, { kind: 'stream', progress: o.progress, label: o.label ?? l.label });
+      else if (o.label != null) l.label = o.label;
+      continue;
+    }
+    if (Array.isArray(o.options)) {
+      layers.push({ id: o.id, kind: 'fork', label: o.label, options: o.options });
+    } else if (o.value != null) {
+      layers.push({ id: o.id, kind: 'gauge', label: o.label || o.id, value: o.value });
+    } else if (o.progress != null) {
+      layers.push({ id: o.id, kind: 'stream', label: o.label || o.id, progress: o.progress });
+    } else if (Array.isArray(o.data)) {
+      layers.push({ id: o.id, kind: 'trace', label: o.label || o.id, data: o.data, axis: o.axis });
+    } else if (o.label != null) {
+      /* 只有一句问题、没有选项：做成"一问两选项"里的问句层没意义，
+         退化成一句凝聚的话（至少屏幕上看得见）。 */
+      layers.push({ id: o.id, kind: 'condense', text: o.label });
+    }
+  }
+  return { ...(prev || {}), layers };
+}
