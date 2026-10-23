@@ -96,8 +96,10 @@ const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : '
 const MAX_STEPS = Number(process.env.MAX_STEPS || 10);
 const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 16);
 /* 一整轮的墙钟上限。步数管不住"每一步都很慢"（一次工具 40 秒），
-   而用户对"没结果"和"等太久"的感受是同一件事。到点就收口，不再往下等。 */
-const TURN_MS = Number(process.env.TURN_MS || 120000);
+   而用户对"没结果"和"等太久"的感受是同一件事。到点就收口，不再往下等。
+   180 秒而不是 120：`olares_act` 的 `--watch` 本身就是 90 秒，
+   装一个应用加上前后的查询很容易顶到 120 —— 那会把一次正常的长活在半路掐掉。 */
+const TURN_MS = Number(process.env.TURN_MS || 180000);
 /* 上下文满窗自收的水位（见 history.mjs）。78% 动手，收到 45% ——
    留出滞回，否则每轮都会裁一点点，而"每轮都变"对前缀缓存是最坏的事。 */
 const CTX_TRIM_AT = Number(process.env.CTX_TRIM_AT || 0.78);
@@ -2642,7 +2644,12 @@ try {
   console.warn('[skills] 索引失败：' + e.message);
 }
 
-server.listen(PORT, () => {
+/* 绑哪个地址。默认是 Node 的老行为（不带 host = `::`/0.0.0.0 双栈），
+   pod 里要的就是这个 —— 只绑 127.0.0.1 的话 k8s 的探针和 Service 都进不来。
+   但**本机自测用得上 127.0.0.1**：GitHub runner 上 `listen(PORT)` 的行为
+   和本机不一致（自测里 server 明明打印了启动横幅、`fetch('http://127.0.0.1:…')`
+   却一直连不上），给一个显式开关比猜平台差异省事。 */
+const onListen = () => {
   console.log(`emergent-agent  http://127.0.0.1:${PORT}/agent/`);
   console.log(`  model=${MODEL_ID}  data=${SYS}  base=${process.env.MODEL_BASE || 'https://api.siliconflow.cn/v1'}`);
   /* 系统层的两个状态要分开报：**有没有这个二进制**、**有没有身份**。
@@ -2661,4 +2668,6 @@ server.listen(PORT, () => {
   if (MODEL_ID !== 'mock' && !process.env.MODEL_KEY) {
     console.warn('  ⚠ 没有 MODEL_KEY，连上后会报错。在 agent/.env 里写 MODEL_KEY=sk-...');
   }
-});
+};
+if (process.env.HOST) server.listen(PORT, process.env.HOST, onListen);
+else server.listen(PORT, onListen);

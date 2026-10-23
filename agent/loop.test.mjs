@@ -25,6 +25,7 @@
  * 只测纯函数测不到"四条路有没有汇到同一个出口"。
  */
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -64,6 +65,10 @@ async function runCase(mode) {
     env: {
       ...process.env,
       PORT: String(sport), SYS: 'mock', DEBUG: '1',
+      /* 显式绑 IPv4。默认的 `listen(PORT)` 在 GitHub runner 上出现过
+         "banner 打印了、fetch 却连不上"（本机同样的代码没问题）——
+         不去猜平台差异，直接让它绑 127.0.0.1。 */
+      HOST: '127.0.0.1',
       MODEL: `local/stub-${mode}`,
       MODEL_LOCAL_BASE: `http://127.0.0.1:${fport}/v1`,
       MAX_STEPS: '4',          // 压低一点，测试快；判的是"撞上限有没有收口"，不是上限本身
@@ -80,15 +85,30 @@ async function runCase(mode) {
   /* 45 秒。CI 的 2 核冷启动比本机慢一倍多（实测本机 12s、runner 上更久），
      18 秒那版在 GitHub 上四个用例全部"server 起不来"—— 而其实只是慢。
      `exitCode` 一旦非空就别再等了：那才是真失败，等下去只是把错误拖长。 */
+  let lastErr = '';
   for (let i = 0; i < 150; i++) {
     if (srv.exitCode !== null) break;
-    try { const r = await fetch(`${base}/api/health`); if (r.ok) { up = true; break; } } catch { /* 还没起来 */ }
+    try { const r = await fetch(`${base}/api/health`); if (r.ok) { up = true; break; } } catch (e) {
+      /* `fetch failed` 什么也没说 —— 把 cause 的 code 留住，否则排障只能靠猜 */
+      lastErr = `${e.message}${e.cause ? ` / ${e.cause.code || e.cause.message}` : ''}`;
+    }
     await wait(300);
   }
   if (!up) {
+    /* 再用 http 模块探一次：它只走 IPv4，能把"没监听"和"fetch 这一层的问题"分开 */
+    const probe = await new Promise((res) => {
+      const req = http.get({ host: '127.0.0.1', port: sport, path: '/api/health', timeout: 3000 }, (r) => {
+        res(`HTTP ${r.statusCode}`); r.resume();
+      });
+      req.on('error', (e) => res(`err ${e.code || e.message}`));
+      req.on('timeout', () => { req.destroy(); res('timeout'); });
+    });
     kill();
     /* 失败时必须能看见根因：进程是**死了**还是**只是慢**，以及它最后说了什么。 */
-    return { up: false, exit: srv.exitCode, log: srvLog.slice(-1200) };
+    return {
+      up: false, exit: srv.exitCode, probe, fetchErr: lastErr,
+      log: srvLog.slice(-900),
+    };
   }
 
   const evs = [];
@@ -156,8 +176,9 @@ console.log('每一轮都必须有结局');
 for (const c of CASES) {
   const r = await runCase(c.mode);
   ok(r.up, `${c.mode}：server 起来了`,
-    `exit=${r.exit === undefined ? '(还在跑)' : r.exit}
-${String(r.log || '').slice(-700)}`);
+    `exit=${r.exit === undefined ? '(还在跑)' : r.exit}  probe=${r.probe}  fetch="${r.fetchErr}"
+`
+    + String(r.log || '').slice(-500));
   if (!r.up) continue;
 
   ok(r.idle, `${c.mode}：这一轮正常收尾（收到 idle），没有卡住`);
