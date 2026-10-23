@@ -369,3 +369,50 @@ export function patchToSpec(prev, ops) {
   }
   return { ...(prev || {}), layers };
 }
+
+/* ───────────── 模型把后续字段写进了 reading 字符串里 ───────────── */
+
+/** reading 里面出现"下一个字段名"的样子：`…说完了",\n  "gauges": [` */
+const NESTED = /"\s*,\s*(?=\s*"(gauges|note|ask|yes|no|trend|trace)"\s*:)/;
+
+/**
+ * 把"整段 JSON 被塞进 reading"这一种畸形参数拆开。
+ *
+ * 线上实拍（2026-10-23，V4.1-Flash，问"装了哪些应用"）：
+ *
+ *   {"reading":"…要不要我看一眼它最近有没有报错？",\n  \"gauges\": […],\n  \"note\": …}
+ *
+ * 注意那些**带反斜杠的引号** —— 模型把后面所有字段当成 reading 这个字符串的一部分
+ * 写了出来，并且老老实实转义了。于是 JSON 完全合法，我们解析成功、拿到的却是
+ * `{reading: "…后面还跟着一段转义过的 JSON"}`。`expandShow` 于是看到"没给 gauges、
+ * 没给 ask"，回一句"这一屏什么都没有"，模型收到错误再重写一遍（第二次就对了）。
+ *
+ * 代价不只是多一次往返：那条 440 字的 reading 会进历史，**之后每一轮都要读它**。
+ *
+ * 所以先把转义还原成普通文本，再按"下一个字段名"切。只有 `reading` 一个键时才动手 ——
+ * 多键说明模型本来就写对了，里面的引号是正文的一部分（"他说别动然后走了"），不该碰。
+ */
+export function unwrapReading(args) {
+  const a = args || {};
+  const r = a.reading;
+  if (typeof r !== 'string' || Object.keys(a).length > 1) return a;
+  /* 先还原转义：`\"` → `"`、`\n` → 换行、`\t` → 制表。
+     **不还原的话下面的正则一个都匹配不上** —— 而"匹配不上就原样返回"会静默退回
+     畸形参数，看起来像没修。这一条是拿线上原样数据试出来的，不是推的。 */
+  const plain = r.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  const m = plain.match(NESTED);
+  if (!m) return a;
+  const head = plain.slice(0, m.index).replace(/[",\s]+$/u, '').trim();
+  /* lookahead 不消费，所以 `m.index + m[0].length` 正好落在 `"gauges"` 的第一个引号上 */
+  const body = plain.slice(m.index + m[0].length);
+  /* 尾巴可能是 `…"先不用"\n}`，也可能在 `}` 之前就断了 —— 补一次再试 */
+  for (const candidate of [body, `${body}}`, `${body.replace(/,\s*$/, '')}}`]) {
+    try {
+      const tail = JSON.parse(`{${candidate}`);
+      if (tail && typeof tail === 'object') return { ...tail, reading: head };
+    } catch { /* 换下一个 */ }
+  }
+  /* 挖不出来就至少把那段 JSON 从正文里去掉：屏幕上留一句干净的结论，
+     比留一句带半截 JSON 的话好读得多（而且它会被 say 通道念出来）。 */
+  return { ...a, reading: head };
+}

@@ -16,7 +16,7 @@ import fs from 'node:fs/promises';
 
 import {
   SPEC_SCHEMA, OPS_SCHEMA, PULSES,
-  normalizeSpec, normalizeOps, normalizePulse,
+  normalizeSpec, normalizeOps, normalizePulse, unwrapReading,
 } from './scene.schema.mjs';
 import { createK8s } from './sources/k8s.mjs';
 import { createFs } from './sources/fs.mjs';
@@ -837,7 +837,10 @@ export function makeTools(o = {}) {
       },
       additionalProperties: false,
     },
-    run: async (a) => {
+    run: async (a0) => {
+      /* 先解开"整段 JSON 被塞进 reading"那种畸形参数（见 unwrapReading）。
+         放在最前面：它之后的所有分支都假设 `a` 的键是真的键。 */
+      let a = unwrapReading(a0);
       /* 形状不对就明说，别静默丢掉。实测：模型会把 ask 写成一句话而不是
          {label, yes, no}；如果这里只是忽略，用户看到的是"屏幕上少了一个问题"，
          而模型以为自己做对了 —— 两边都不知道出了什么事。 */
