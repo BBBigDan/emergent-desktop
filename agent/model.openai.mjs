@@ -36,7 +36,7 @@ const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
  * 它们都慢 3~10 倍，且一轮里思考上千字。所以默认落在这个上面；
  * 想省钱或跑离线验证时，`MODEL=Qwen/Qwen3-8B` 一行就切回去（适配器不用改）。
  */
-const DEFAULT_MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';
+export const DEFAULT_MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';
 
 /** 只保留 OpenAI 认识的字段。`intent` 这类私有字段漏出去就是 400。 */
 function cleanMessages(messages) {

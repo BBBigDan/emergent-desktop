@@ -324,8 +324,10 @@ SYS=k8s                                   # k8s 读集群 / host 读本机 / moc
 3. **规则进代码**：手势 `adjust` 回合里 `danger` 工具直接拒绝；
    整屏判重、每轮最多两屏、问完即停。
 
-默认模型因此仍是 `Qwen2.5-7B-Instruct`（快，配合兜底已经够用）。
-换成更慢但更会画的 `Qwen/Qwen3.5-4B` 只需改 `MODEL`，代码不用动。
+这套兜底是给"弱模型"准备的，现在默认换了会思考的 V4.1-Flash，它依然有用 ——
+`scene_show` 调用失败、超时、429 的时候就是它在铺屏，和模型强弱无关。
+
+换模型只改 `MODEL`，代码不用动（`DEFAULT_MODEL` **只在 `model.openai.mjs` 里写一份**）。
 
 ### 没有余额怎么继续开发
 
@@ -528,7 +530,7 @@ SSE 是 HTTP/1.1 上最省事的流式方案，反代只要 `proxy_buffering off
 ## 怎么量它有没有变蠢（`tools/dev/eval-llm.mjs`）
 
 ```bash
-SYS=k8s MODEL=Qwen/Qwen2.5-7B-Instruct PORT=8788 node agent/server.mjs &
+SYS=k8s MODEL=Qwen/Qwen3-8B PORT=8788 node agent/server.mjs &   # 免费、慢，但够跑对照
 node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 ```
 

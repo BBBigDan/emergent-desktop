@@ -26,7 +26,7 @@ import url from 'node:url';
 import { makeTools, defaultOverview, coldTools } from './tools.mjs';
 import { normalizeSpec, patchToSpec } from './scene.schema.mjs';
 import { createMockModel } from './model.mock.mjs';
-import { createOpenAIModel } from './model.openai.mjs';
+import { createOpenAIModel, DEFAULT_MODEL } from './model.openai.mjs';
 import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
@@ -69,11 +69,10 @@ const SYS = process.env.SYS || 'k8s';            // k8s | host | mock —— 只
    SYS=host + mock 模型，能在真数据上验工具。混成一个开关就没法分开排障。
    k8s 是默认值：这台东西存在的意义就是管那台 Olares。没有集群凭据时
    tools.mjs 会打一行警告并退回本机读数，不会静默。 */
-/* 默认用**免费**模型。这不是省钱，是"零余额账户"这条现实：
-   硅基流动的规则是「现金余额 < 0 → 账户级停服」，而停服是账户级的 ——
-   收费模型欠的不到一分钱，会把 ¥0 的免费模型一起带走（2026-10-21 实测踩过）。
-   所以默认值必须落在价格表 ¥0 的那一列上，想花钱自己改 MODEL。 */
-const DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
+/* 默认模型**只在 model.openai.mjs 里写一次**。
+   这里以前也抄了一份 —— 换模型时改了一处、漏了这处，线上跑的还是旧的，
+   而日志里 `model=` 打的是这一份，看起来像"改了没生效"。
+   同一个常数分两处写，迟早漂（这条踩过不止一次）。 */
 const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : 'mock');
 /* 一轮最多几步。
  *
