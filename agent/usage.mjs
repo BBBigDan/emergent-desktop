@@ -21,6 +21,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+/* 单价来自"能换的模型"那张表（`models.mjs`）。**不在这里再抄一份**：
+   屏幕上那个列表和下边这本账说的必须是同一个价，各存一份就迟早对不上 ——
+   而对不上的表现是"列表写着免费、账上扣着钱"，这种错没人能自己发现。 */
+import { priceOf } from './models.mjs';
+
 /* ───────────────────────── 上限与价格 ───────────────────────── */
 
 /* 上下文窗口。**这张表是给人看的**，值要能被推翻：
@@ -36,30 +41,11 @@ const CTX_TABLE = [
 ];
 const DEFAULT_CTX = 32768;
 
-/* 单价（¥ / 百万 token）。**只放确实为 0 的**。
-   收费模型的价格会变，写死在代码里迟早过期，所以走环境变量：
-   `MODEL_PRICE_IN` / `MODEL_PRICE_OUT`（元/百万 token，两个一起给才生效）。 */
-const FREE_TABLE = [
-  /Qwen\/Qwen2\.5-7B-Instruct/i,
-];
-
 function ctxLimitOf(model) {
   const env = Number(process.env.MODEL_CTX || 0);
   if (env > 0) return { limit: env, src: 'env' };
   for (const [re, n] of CTX_TABLE) if (re.test(model)) return { limit: n, src: 'table' };
   return { limit: DEFAULT_CTX, src: 'default' };
-}
-
-function priceOf(model) {
-  /* 假模型不花钱是**事实**，不是"不知道" —— 它连网都没连。 */
-  if (/^mock/i.test(model)) return { in: 0, out: 0, src: 'mock', free: true };
-  const pin = Number(process.env.MODEL_PRICE_IN || NaN);
-  const pout = Number(process.env.MODEL_PRICE_OUT || NaN);
-  if (Number.isFinite(pin) && Number.isFinite(pout)) {
-    return { in: pin, out: pout, src: 'env', free: pin === 0 && pout === 0 };
-  }
-  for (const re of FREE_TABLE) if (re.test(model)) return { in: 0, out: 0, src: 'table', free: true };
-  return null;   // 不知道就说不知道
 }
 
 /* ───────────────────────── 估算 ───────────────────────── */
@@ -103,9 +89,12 @@ export function ymd(d = new Date()) {
 }
 
 export async function createMeter(o = {}) {
-  const model = o.model || process.env.MODEL || 'unknown';
-  const { limit, src: limitSrc } = ctxLimitOf(model);
-  const price = priceOf(model);
+  /* 三个 let：模型是**可以在会话中途换掉的**（界面上点一下就换）。
+     换了模型，"窗口多大""单价多少"这两件事跟着换 —— 它们是模型的属性，
+     而这段对话本身没变。把它写成 const 就得重建 meter，一天的账目就断了。 */
+  let model = o.model || process.env.MODEL || 'unknown';
+  let { limit, src: limitSrc } = ctxLimitOf(model);
+  let price = priceOf(model);
   const dayCap = Number(process.env.TOKEN_DAY_CAP || 0);   // 0 = 不限
   const dir = o.dir || '';
 
@@ -171,6 +160,22 @@ export async function createMeter(o = {}) {
     snap,
     /** 从落盘快照恢复**会话级**累计。日账本不在这里恢复 —— 它自己会读当天的文件，
         两边都写会双计。 */
+    /**
+     * 换模型：只换"这个模型的属性"，不动这段对话已经记下的账。
+     *
+     * 为什么不是"新建一个 meter"：日账本、会话累计、最近几轮的明细都挂在
+     * 实例上；换一次模型就重开一本，用户会看到"今天花了多少"忽然归零。
+     * 上下文水位照旧保留 —— 它是**这段对话**的长度，换模型并不让它变短。
+     */
+    retarget(id) {
+      const s = String(id || model);
+      if (s === model) return snap();
+      model = s;
+      ({ limit, src: limitSrc } = ctxLimitOf(s));
+      price = priceOf(s);
+      return snap();
+    },
+
     restore(snap) {
       if (!snap) return;
       const c = snap.ctx || {};

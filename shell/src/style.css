@@ -370,7 +370,7 @@ body.launching .rail-zone { display: none; }
 .ag-bar .ag-dot.on { background: rgba(255, 196, 120, .95); box-shadow: 0 0 9px rgba(255, 196, 120, .55); }
 .ag-bar .ag-dot.off { background: rgba(255, 124, 147, .95); box-shadow: 0 0 9px rgba(255, 124, 147, .5); }
 
-.ag-bar .ag-model { font-weight: 400; color: rgba(184, 214, 240, .78); }
+.ag-bar .ag-model { font-weight: 400; color: rgba(184, 214, 240, .78); cursor: pointer; }
 .ag-bar .ag-ctx { display: flex; align-items: center; gap: 7px; pointer-events: auto; cursor: default; }
 .ag-bar .ag-ctx-track {
   display: inline-block; width: 54px; height: 3px; border-radius: 2px;
@@ -395,6 +395,126 @@ body.launching .rail-zone { display: none; }
 .ag-bar .ag-ctx-num { font-weight: 400; color: rgba(163, 198, 228, .72); }
 .ag-bar .ag-mem { pointer-events: auto; cursor: default; }
 .ag-bar .ag-tool { color: rgba(255, 178, 87, .62); overflow: hidden; text-overflow: ellipsis; }
+
+/* ── 换模型的那张表（modelpick.js） ──
+ *
+ * 和「思考过程」同一套材质：它是**从屏幕上长出来的一块空间**，不是网页里的下拉框。
+ * 所以还是 0.8 的黑玻璃 + 背景模糊 —— 后面那些点会透上来，读起来像
+ * "这块空间本来就在这儿"，而不是"一张贴在屏幕上的卡片"。
+ * 唯一和它不同的是层级：它在状态条下面，z-index 要高过那一栏。
+ */
+.ag-mp {
+  position: fixed; z-index: 8;
+  display: flex; flex-direction: column;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(6, 11, 18, 0.86) 0%, rgba(5, 9, 15, 0.8) 100%);
+  backdrop-filter: blur(10px) saturate(118%);
+  -webkit-backdrop-filter: blur(10px) saturate(118%);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .46);
+  opacity: 0; transform: translateY(-5px) scale(0.994);
+  transition: opacity .18s ease, transform .18s ease;
+  user-select: none; cursor: default;
+  font: 12px/1.5 ui-monospace, Menlo, "Cascadia Mono", monospace;
+}
+.ag-mp.in { opacity: 1; transform: none; }
+.ag-mp[hidden] { display: none; }
+
+.ag-mp-hd {
+  display: flex; align-items: center; gap: 8px;
+  height: 30px; padding: 0 8px 0 12px; flex: 0 0 auto;
+  border-bottom: 1px solid rgba(120, 170, 230, .07);
+}
+.ag-mp-title { font-size: 10.5px; font-weight: 400; letter-spacing: .16em; color: rgba(158, 196, 230, .62); }
+.ag-mp-meta {
+  margin-left: auto; font: 10px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  color: rgba(127, 227, 207, .6);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 190px;
+}
+.ag-mp-x {
+  flex: 0 0 auto; width: 20px; height: 20px;
+  background: none; border: 0; border-radius: 6px;
+  color: rgba(147, 184, 216, .42); font-size: 14px; line-height: 1; cursor: pointer;
+  transition: color .2s, background .2s;
+}
+.ag-mp-x:hover { color: rgba(226, 238, 252, .9); background: rgba(120, 170, 230, .1); }
+
+.ag-mp-list {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: none;
+  padding: 6px 8px 8px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 3%, #000 95%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 3%, #000 95%, transparent 100%);
+}
+.ag-mp-list::-webkit-scrollbar { width: 0; }
+
+/* 分组标题：一个小写字距的标签 + 一句"这一组是怎么算钱的" */
+.ag-mp .mg { display: flex; align-items: baseline; gap: 8px; padding: 9px 6px 4px; }
+.ag-mp .mg b { font-size: 10.5px; font-weight: 400; letter-spacing: .16em; color: rgba(158, 196, 230, .55); }
+.ag-mp .mg em { font-style: normal; font-size: 10px; color: rgba(147, 184, 216, .34); }
+.ag-mp .mp-empty { padding: 2px 6px 6px; font-size: 10.5px; line-height: 1.6; color: rgba(147, 184, 216, .34); }
+
+/* 一行 = 一个模型。左半边全是"它是什么"，右半边只有一个数："多少钱" */
+.ag-mp .mrow {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border: 0; border-radius: 8px;
+  background: none; text-align: left; cursor: pointer;
+  color: rgba(226, 238, 252, .9);
+  transition: background .14s;
+}
+.ag-mp .mrow:hover { background: rgba(120, 170, 230, .1); }
+.ag-mp .mrow:disabled { cursor: not-allowed; }
+.ag-mp .mrow:disabled:hover { background: none; }
+.ag-mp .mrow .ml { display: flex; align-items: center; gap: 7px; min-width: 0; flex: 1 1 auto; }
+
+/* 当前那个用一颗亮点标记：**形状**先说话，颜色只是加强 ——
+   只有颜色的话，色弱用户看不出"现在是哪个" */
+.ag-mp .mrow .mk {
+  flex: 0 0 6px; width: 6px; height: 6px; border-radius: 4px;
+  background: rgba(147, 184, 216, .18);
+}
+.ag-mp .mrow.cur .mk { background: rgba(127, 227, 207, .95); box-shadow: 0 0 8px rgba(127, 227, 207, .55); }
+.ag-mp .mrow .mn { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.ag-mp .mrow.cur .mn { color: rgba(232, 246, 255, .98); }
+.ag-mp .mrow .mo {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-style: normal; font-size: 10px; color: rgba(147, 184, 216, .3);
+}
+.ag-mp .mrow .mtags { flex: 0 0 auto; display: flex; gap: 4px; }
+/* 想 / 工 两个小方块，三个状态用**形状**区分，不靠颜色：
+     有   = 实心（填了底）
+     没有 = 空心（只剩一圈极淡的边）—— 划掉那条线在 10px 的中文上只剩一坨，
+            实测比不表态还难认，所以用"空心"而不是"划掉"
+     没测 = 虚线框 + 问号
+   颜色只是第二信号（色弱用户照样分得清）。 */
+.ag-mp .mrow .mt {
+  flex: 0 0 auto; min-width: 17px; padding: 0 3px; border-radius: 4px;
+  font-size: 10px; line-height: 15px; text-align: center; font-style: normal;
+  background: rgba(127, 227, 207, .12); color: rgba(127, 227, 207, .82);
+}
+.ag-mp .mrow .mt[data-v="0"] {
+  background: transparent; color: rgba(147, 184, 216, .44);
+  box-shadow: inset 0 0 0 1px rgba(147, 184, 216, .22);
+}
+.ag-mp .mrow .mt[data-v="?"] {
+  background: transparent; color: rgba(255, 196, 120, .62);
+  box-shadow: inset 0 0 0 1px rgba(255, 196, 120, .3);
+}
+.ag-mp .mrow .mpr {
+  flex: 0 0 auto; font-size: 10.5px; letter-spacing: .02em;
+  color: rgba(127, 227, 207, .78);
+}
+.ag-mp .mrow .mpr[data-un="1"] { color: rgba(255, 196, 120, .62); }
+/* 不可选的那些整行压暗；价格仍然看得见 —— 它确实存在、确实便宜，只是跑不了 agent */
+.ag-mp .mrow.off .mn, .ag-mp .mrow.off .mpr { color: rgba(147, 184, 216, .32); }
+.ag-mp .mrow.off .mtags { opacity: .55; }
+.ag-mp .mrow.pending .mn { color: rgba(255, 196, 120, .9); }
+
+/* 底部那一行：鼠标停在哪一行，就说哪一行的毛病。
+   九行都带一行说明的话，这块面板会高过半个屏幕。 */
+.ag-mp-foot {
+  flex: 0 0 auto; min-height: 26px; padding: 6px 12px 8px;
+  font-size: 10.5px; line-height: 1.45; color: rgba(147, 184, 216, .42);
+  border-top: 1px solid rgba(120, 170, 230, .06);
+}
 
 .ag-hint {
   position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);

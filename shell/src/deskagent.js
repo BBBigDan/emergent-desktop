@@ -25,6 +25,7 @@ import { createFace } from './face.js';
 import { createHalo } from './halo.js';
 import { createAgentBar } from './agentbar.js';
 import { createTrace } from './trace.js';
+import { createModelPicker } from './modelpick.js';
 import { createTraceFrame } from './traceframe.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
@@ -118,6 +119,31 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     '回车发送 · /new 开新会话 · /compact 收上下文 · Esc 收起');
 
   layer.append(barEl, typeEl, inspEl, gateEl, a11yEl, hintEl);
+
+  /* ───────────────── 换模型的表 ─────────────────
+   *
+   * 它由点名（`barModel` 那一下）打开，位置贴着状态条 —— 左边那个名字就是
+   * "现在用的是谁"，换它的入口长在它自己身上，是最短的一条路。
+   *
+   * 它和「思考过程」互斥：两块同样宽的玻璃叠在一起，谁也读不清。
+   * 所以开这块之前先收那块（见 openPicker）。
+   */
+  const picker = createModelPicker({
+    onPick: (id) => send({ t: 'model', id }),
+    /* 用户自己收起来：点名字时输入框会失焦（那一行不可聚焦），
+       这里把光标还回去 —— 他刚才很可能正打到一半。 */
+    onClose: () => { if (pickerWasTyping) typeEl.focus(); },
+  });
+  layer.appendChild(picker.el);
+  let pickerData = null;      // 服务端给的那张表（含 current / busy）
+  let pickerLoading = 0;
+  let pickerWasTyping = false;
+
+  barModel.title = '点击换模型';
+  barModel.addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePicker();
+  });
   /* 状态区常驻（§3 的第一句）。观察窗和提示行仍旧只在 ?dev=1 出现 */
   if (!DEV) { inspEl.hidden = true; hintEl.hidden = true; }
   document.body.appendChild(layer);
@@ -250,6 +276,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     traceTimer = 0;
   }
 
+  /* 点面板以外的地方就收起它：没有遮罩层，就不该有"点哪儿都关不掉"的感觉 */
+  addEventListener('pointerdown', (e) => {
+    if (!picker.isOpen()) return;
+    if (e.target instanceof Element && e.target.closest('.ag-mp, .ag-model')) return;
+    picker.close();
+  });
+
   /** 点小脸：开着就收，收着就开（再看一遍刚才的经过） */
   function toggleTrace() {
     if (!hasTraceRows()) return false;
@@ -267,6 +300,58 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return true;
   }
 
+
+  /* ───────────────── 换模型：开、关、取表 ─────────────────
+
+     三条约束：
+
+     · **表是现取的，不是本地写死的。** 本地那一组要在运行时探测（Ollama 装了
+       哪些模型只有那台机器知道），平台那一组要用接口核对"还在不在"。写死一份
+       在浏览器里，用户装上新模型后得重启页面才看得见。
+     · **它和那一栏互斥。** 两块同样宽的玻璃叠在一起，谁也读不清；而且
+       「思考过程」是"正在发生的事"，换模型是"接下来用什么" —— 不该同时抢屏幕。
+     · **打不开就别装作打开了。** 取表失败时说清楚（观察窗一行），而不是弹一块
+       空的玻璃。
+   */
+  async function loadModels(force = false) {
+    const seq = ++pickerLoading;
+    try {
+      const r = await fetch(`${API}/models?sid=${encodeURIComponent(sid)}${force ? '&force=1' : ''}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      /* 慢的那次不要覆盖快的那次：点了两次名，先发的后到会把最新的表盖掉 */
+      if (seq !== pickerLoading) return;
+      pickerData = j;
+      picker.setData(j);
+    } catch (e) {
+      insp('model', `模型表取不到：${e.message || e}`);
+    }
+  }
+
+  function openPicker({ force = false } = {}) {
+    if (!open) return;
+    /* 先收那一栏：它和新面板抢同一块地方，而且它的框会从玻璃边缘漏出来 */
+    if (trace?.isOpen()) { tracePinned = true; closeTrace(); }
+    /* 点名字会让输入框失焦（那一行是不可聚焦的 DOM），关了面板要还回去 ——
+       否则用户"点一下看看有哪些模型"，回来发现自己打的半句话不在光标上了。 */
+    pickerWasTyping = document.activeElement === typeEl;
+    const r = barModel.getBoundingClientRect();
+    picker.openAt(r);
+    /* 开着的时候先显示上一次拿到的表（立刻有东西看），同时去要一份新的 */
+    if (pickerData) picker.setData(pickerData);
+    loadModels(force);
+  }
+
+  function closePicker() {
+    const was = picker.close();
+    if (was && pickerWasTyping) typeEl.focus();
+    return was;
+  }
+
+  function togglePicker() {
+    if (picker.isOpen()) { picker.close(); return; }
+    openPicker();
+  }
 
   /* ───────────────── 渲染树（DOM 内容） ─────────────────
    *
@@ -1072,6 +1157,27 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         if (!askText) echo('');
         break;
 
+      /* 换模型的结果。**成功和失败走同一条事件** ——
+         分成两个名字的话，迟早有一边忘了处理，屏幕上就停在"换…"。
+         `ok:false` 时服务端已经发了 note 说原因，这里只负责把界面复位。 */
+      case 'model': {
+        if (m.ok === false) { picker.settle(pickerData?.current || m.id); break; }
+        pickerData = pickerData || {};
+        pickerData.current = m.id;
+        picker.settle(m.id);
+        if (m.id) {
+          barModel.textContent = m.id;
+          abar?.setModel(m.id);
+          /* 模型名换了，上下文上限可能也换了（32k → 66k），水位要重画 */
+          renderTok(m.usage);
+        }
+        insp('model', `换成 ${m.name || m.id}`);
+        /* 停一下再收：让那颗点跳过去，用户看得见"换成它了" ——
+           立刻收面板的话，这一下就等于什么都没发生。 */
+        setTimeout(() => { if (picker.isOpen()) closePicker(); }, 900);
+        break;
+      }
+
       case 'resume':
         /* 不是"重新长一遍"：用户没有发起任何事，画面应该已经在那儿 */
         if (m.log?.length) { log = m.log.slice(-40); histBtn.hidden = false; if (histOpen) renderHist(); }
@@ -1618,6 +1724,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   }
 
   function pickAt(x, y) {
+    /* 两块玻璃都先问一遍：盖住的地方**不许**产生任何意图 ——
+       否则在面板上拖一下，会把背后的仪表拖走（踩过）。 */
+    if (picker.hit(x, y)) return null;
     if (trace?.hit(x, y)) return null;
     return scene.hit(x, y) || faceHit(x, y);
   }
@@ -1695,7 +1804,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (!open) return;
     if (gt.g?.moved) return;
     /* 面板上不换光标：它自己那层的 cursor 更准确（滚动的区域就是滚动的样子） */
-    if (trace?.hit(e.clientX, e.clientY)) { document.body.style.cursor = 'default'; return; }
+    if (picker.hit(e.clientX, e.clientY) || trace?.hit(e.clientX, e.clientY)) {
+      document.body.style.cursor = 'default';
+      return;
+    }
     const h = scene.hit(e.clientX, e.clientY) || faceHit(e.clientX, e.clientY);
     document.body.style.cursor = !h ? 'default'
       : h.id === '@face' ? 'pointer'
@@ -1811,6 +1923,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
     field.setAgentMode(false);
     closeSurface();
+    picker.close();
     clearTimeout(drawTimer);
     drawTimer = 0;
     drawLine = '';
@@ -1931,6 +2044,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       closeHist();
       return true;
     },
+    /** 换模型的表在最上层（它从状态条长出来，盖住那一栏）。活着就先收它 */
+    closePicker: () => picker.close(),
     /** 「思考过程」是第二层浮窗（在记录之下、场之上）。活着就先收它 */
     closeTrace: () => {
       if (!trace?.isOpen()) return false;
@@ -1968,6 +2083,18 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     },
     /* 自测：直接开合那一栏（DEV 下才有意义，和用户点 × / 点脸等价） */
     toggleTrace: () => { toggleTrace(); return trace?.isOpen() ?? false; },
+    /* 自测：点一下状态条上的名字。走的是**真的那个 click 监听** ——
+       CDP 合成的 press/release 不产生 click（那套坑见 tools/dev），
+       所以用 el.click() 而不是模拟指针。 */
+    tapModel: () => { barModel.click(); return picker.isOpen(); },
+    pickerState: () => ({
+      open: picker.isOpen(),
+      rows: picker.debugRows(),
+      current: pickerData?.current || null,
+      groups: (pickerData?.groups || []).map((g) => ({ key: g.key, n: g.models.length })),
+    }),
+    /* 自测：直接点名开合（DOM click 走不了合成事件，见 tools/dev 那套 CDP 的坑） */
+    toggleModelPicker: () => { togglePicker(); return picker.isOpen(); },
     drag: (id, dx, dy) => {
       const h = scene?.layers.get(id)?.hot;
       if (!h) return false;

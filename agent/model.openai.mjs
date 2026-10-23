@@ -19,24 +19,13 @@
  */
 
 import { normUsage, estTokens } from './usage.mjs';
+/* 默认模型的定义在 `models.mjs` —— 那里是"能换的模型"这张表的唯一来源，
+   而这个文件只管"怎么说一句话"。两处各写一份的下场踩过：换模型时改了一处、
+   漏了这处，线上跑的还是旧的，日志里却打得像"改了没生效"。 */
+import { DEFAULT_MODEL } from './models.mjs';
+export { DEFAULT_MODEL };
 
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
-/* 默认模型：一个**会思考**的模型。
- *
- * 为什么换掉 Qwen2.5-7B-Instruct（它便宜、免费、够老实）：
- * 它没有 reasoning 能力，返回里永远没有 `reasoning_content` ——
- * 于是屏幕上那栏"思考过程"只有工具动作，没有"想"。用户的原话是
- * "感觉很奇怪"。这不是那栏做错了，是模型这一层根本没有思考可显示。
- *
- * 免费名单里**确实有**能思考的（实测 2026-10-23）：
- *   · Qwen/Qwen3-8B            思考 332 字，调工具正常，一轮 8.5s
- *   · THUDM/GLM-Z1-9B-0414     思考 239 字，调工具正常，一轮 2.7s / 回灌 12s
- *   · deepseek-ai/DeepSeek-R1-0528-Qwen3-8B  **不支持 function call**（400），出局
- *   · Qwen/Qwen3.5-4B          把工具调用写成 `<tool_call>` 文本，出局
- * 它们都慢 3~10 倍，且一轮里思考上千字。所以默认落在这个上面；
- * 想省钱或跑离线验证时，`MODEL=Qwen/Qwen3-8B` 一行就切回去（适配器不用改）。
- */
-export const DEFAULT_MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';
 
 /** 只保留 OpenAI 认识的字段。`intent` 这类私有字段漏出去就是 400。 */
 function cleanMessages(messages) {

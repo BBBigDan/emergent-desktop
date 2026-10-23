@@ -26,7 +26,11 @@ import url from 'node:url';
 import { makeTools, defaultOverview, coldTools } from './tools.mjs';
 import { normalizeSpec, patchToSpec } from './scene.schema.mjs';
 import { createMockModel } from './model.mock.mjs';
-import { createOpenAIModel, DEFAULT_MODEL } from './model.openai.mjs';
+import { createOpenAIModel } from './model.openai.mjs';
+/* "能换的模型"那张表（含默认模型、单价、本地发现）。默认模型这个常数
+   只在 `models.mjs` 里写一次 —— 这里以前也抄了一份，换模型时漏改，
+   日志打得像"改了没生效"。 */
+import { DEFAULT_MODEL, catalog, findModel, routeOf } from './models.mjs';
 import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
@@ -147,6 +151,7 @@ async function saveNow(s) {
       /* 说话记录：屏幕上那一行只活一回合，用户想回头看一眼"刚才它怎么说的"
          没有别的地方可查 —— 场里 20 格、工具调用也不该给用户看。 */
       log: (s.log || []).slice(-40),
+      modelId: s.modelId || null,
       status: s.lastStatus || null,
       apps: s.lastApps || null,
       /* token 账本也一起存：刷新之后"这个会话花了多少"不能从零开始。
@@ -157,10 +162,25 @@ async function saveNow(s) {
   } catch { /* 落盘失败不该影响对话 */ }
 }
 
-function makeModel() {
-  if (MODEL_ID === 'mock') return createMockModel();
+/**
+ * 造一个模型实例。
+ *
+ * `id` 是**表里的那个 id**（见 `models.mjs`），不是发给接口的模型名 ——
+ * 前缀 `local/` 表示"走本机那个推理服务"。这层翻译只在 `routeOf()` 里做一次：
+ * 别的地方（尤其是前端）都不该自己拆这个字符串，两边拆法一旦不同，
+ * 表现是"本地模型被发去了硅基流动"，然后是一个看不懂的 404。
+ */
+function makeModel(id = MODEL_ID) {
+  const route = routeOf(id);
+  if (route.kind === 'mock') {
+    const m = createMockModel();
+    m.id = 'mock';
+    return m;
+  }
   try {
-    return createOpenAIModel({ model: MODEL_ID });
+    const m = createOpenAIModel({ model: route.model, baseURL: route.baseURL, apiKey: route.apiKey });
+    m.id = id;
+    return m;
   } catch (e) {
     /* 配错了不要静默退回 mock：那会让人以为"模型变笨了"，其实是一直没连上 */
     console.error('[model]', e.message);
@@ -174,11 +194,15 @@ function makeModel() {
    "你就是抽取器"。多一个模型就是多一份 key、多一个延迟、多一种不一致。
    它跑在后台，不挡回话 —— 抽一条事实的成本不该由用户等。 */
 let memModel = null;
+/* 这是**当前**哪个模型在干活。会话可以中途换模型，抽取器也要跟着换 ——
+   否则用户省着钱换成了免费的，后台还在偷偷用那个收费的模型抽事实。
+   只记一个 id：抽取器没有 sid（它拿到的是文本），而这是个单用户桌面。 */
+let liveModelId = MODEL_ID;
 const memory = createMemory({
   extractor: async (text) => {
     /* mock 模型不会老实返回 JSON，本地跑协议时干脆不抽 —— 记忆本身照常可用 */
-    if (MODEL_ID === 'mock') return '{"facts":[]}';
-    memModel = memModel || makeModel();
+    if (liveModelId === 'mock') return '{"facts":[]}';
+    if (!memModel || memModel.id !== liveModelId) memModel = makeModel(liveModelId);
     const out = await memModel.complete({
       messages: [
         { role: 'system', content: EXTRACT_SYS },
@@ -273,6 +297,9 @@ async function getSession(sid) {
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
       tools: makeTools({ source: SYS, memory, forge, olares, skills }),
       model: null,
+      /* 这段对话用的是哪个模型。**要落盘**：换过一次之后刷新，
+         不能又回到默认那个 —— 用户会以为"换了没生效"（他刚踩过这个）。 */
+      modelId: saved?.modelId || MODEL_ID,
       pending: null,        // 审批挂起：{id, resolve}
       abortCtl: null,       // 这一轮的中断开关（用户按停）
       busy: false,
@@ -286,11 +313,14 @@ async function getSession(sid) {
       lastApps: saved?.apps || null,
       resumed: !!saved?.scene,
     };
-    s.model = makeModel();
+    liveModelId = s.modelId;
+    s.model = makeModel(s.modelId);
     /* 账本按模型建：上下文上限和单价都是**模型**的属性，不是会话的属性。
        落在 sessions/*.json 里的是快照，这里重建实例再灌回去 —— 刷新之后
-       "这个会话花了多少"不能从零开始算。 */
-    s.meter = await createMeter({ model: s.model.model || s.model.name, dir: USAGE_DIR });
+       "这个会话花了多少"不能从零开始算。
+       用 `modelId`（表里的 id）而不是 `s.model.model`（发给接口的名字）：
+       单价表是按表里的 id 建的，拿 `qwen3:8b` 去查本地那一行会查不到。 */
+    s.meter = await createMeter({ model: s.modelId, dir: USAGE_DIR });
     s.meter.restore(saved?.usage);
     sessions.set(sid, s);
   }
@@ -759,6 +789,58 @@ function abortTurn(s) {
     emit(s, { t: 'approval_done', ok: false });
   }
   return true;
+}
+
+/**
+ * 换模型 —— 界面上点一下那个名字就是调这里。
+ *
+ * 三件事都不做会出问题：
+ *
+ *   ① **不许在跑着的时候换。** 一轮里可能有五次模型往返，`s.model` 是在循环
+ *      里逐次取的；换到一半，前半轮想的是 A、后半轮想的是 B —— 而屏幕上
+ *      只有一行"思考过程"，没人能看出这件事发生过。所以这一轮跑着就直说"等它说完"。
+ *   ② **账本只换属性、不换本子。** 见 `usage.retarget()`：日账本和会话累计
+ *      都挂在那一个实例上，换模型重开一本，用户会看到"今天花了多少"忽然归零。
+ *   ③ **抽取器跟着换。** 用户为了省钱换成免费的，后台不该还在用收费那个
+ *      抽记忆（见 `liveModelId`）。
+ *
+ * 校验只认表里的 id。不校验的话，前端拼错一个字符会得到一个 404，
+ * 而那个 404 在界面上长得像"模型没响应"。
+ */
+async function switchModel(s, id) {
+  if (s.busy) return { ok: false, error: '这一轮还在跑，等它说完再换' };
+  const entry = await findModel(id).catch(() => null);
+  if (!entry) return { ok: false, error: '表里没有这个模型' };
+  /* 不可选的模型（不会调工具的那些）：**在表里能看见，但换不过去**。
+     让它换过去的话，第一句话就会得到"它没铺屏、也没调工具"，而原因
+     根本不在提示词上 —— 那是这一层该拦住的事。 */
+  if (!entry.usable) return { ok: false, error: entry.why || '这个模型跑不了 agent（它不会调工具）' };
+  if (entry.id === s.modelId) return { ok: true, same: true };
+
+  const prev = s.modelId;
+  try {
+    s.model = makeModel(entry.id);
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+  s.modelId = entry.id;
+  liveModelId = entry.id;
+  memModel = null;                    // 下一轮抽取时按新模型重建
+  const usage = s.meter ? s.meter.retarget(entry.id) : null;
+
+  emit(s, {
+    t: 'model', ok: true, id: entry.id, name: entry.name,
+    think: entry.think, tools: entry.tools, price: entry.price,
+    from: prev, usage,
+  });
+  /* 那句话要说清"以后会有什么不一样"，因为换模型最直观的后果就在那栏里：
+     不会想的模型，左上那一栏从此只有动作。 */
+  const tail = entry.think === true ? '它会想' : entry.think === false ? '它不会想：那栏里只有动作' : '';
+  const money = entry.price?.free ? '¥0' : entry.price ? '按量计费' : '单价未配置';
+  emit(s, { t: 'note', message: `换成 ${entry.name}（${[tail, money].filter(Boolean).join(' · ')}）` });
+  scheduleSave(s);
+  console.log(`[model] ${prev} → ${entry.id}`);
+  return { ok: true };
 }
 
 /**
@@ -2032,7 +2114,10 @@ const server = http.createServer(async (req, res) => {
     s.reses = s.reses || new Set();
     s.reses.add(res);
     emit(s, {
-      t: 'hello', sid, model: s.model.name, sys: SYS,
+      /* `model` 给的是**表里的 id**（`local/qwen3:8b`、`mock`、
+         `deepseek-ai/…`），不是适配器自己的名字（`sf:…`）—— 状态条和那个
+         列表要对得上，对不上就分不清"现在用的是哪一个"。 */
+      t: 'hello', sid, model: s.modelId, sys: SYS,
       tools: Object.keys(s.tools.all),
       /* 一连上就把账本交出去：刷新、换标签页、隔夜回来，用户第一眼
          就该看到"这个会话已经用掉多少"，而不是等下一轮才发现。 */
@@ -2110,6 +2195,17 @@ const server = http.createServer(async (req, res) => {
       /* 打断也要回执：客户端点了停却什么都没发生，是最难受的一种失败 */
       const ok = abortTurn(s);
       emit(s, { t: 'note', message: ok ? '收到「停」' : '当前没有在跑的回合' });
+    } else if (body.t === 'model' && body.id) {
+      (async () => {
+        const r = await switchModel(s, String(body.id)).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+        if (!r.ok) {
+          emit(s, { t: 'note', message: `换不了：${r.error}` });
+          /* 失败也要回一条 model 事件：前端在等这个事件落定"当前是哪个"，
+             只发 note 的话它会一直以为"正在换"。**同一条事件管成功和失败** ——
+             两种回执两个名字，迟早有一边忘了处理。 */
+          emit(s, { t: 'model', id: s.modelId, ok: false, error: r.error });
+        }
+      })();
     }
     return;
   }
@@ -2220,6 +2316,28 @@ const server = http.createServer(async (req, res) => {
     if (!hasModel) body.hint = 'MODEL_KEY 没配。装的时候要建 Secret emergent-desktop-env';
     res.writeHead(hasModel ? 200 : 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(body));
+    return;
+  }
+
+  /* 能换的模型。**每次现探**（本地那一组是运行时发现的，缓存一分钟）：
+     用户刚 `ollama pull` 了一个模型，刷新面板就该看见它 ——
+     写死一张表的话，他得重启服务才能换上新模型，而没人会想到要这么做。 */
+  if (p === '/api/models' && req.method === 'GET') {
+    const sid = u.searchParams.get('sid') || '';
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      let current = MODEL_ID;
+      let busy = false;
+      if (SID_RE.test(sid)) {
+        const s = await getSession(sid);
+        current = s.modelId || MODEL_ID;
+        busy = !!s.busy;
+      }
+      const c = await catalog({ force: u.searchParams.get('force') === '1' });
+      res.end(JSON.stringify({ ...c, current, busy }));
+    } catch (e) {
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
     return;
   }
 

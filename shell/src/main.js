@@ -285,6 +285,9 @@ const _esc = () => {
     /* 按"眼前最上面那一层"排：渲染树是屏幕正中最大的东西，先收它；
        然后是记录面板、再是这一轮、最后才收整个场。 */
     if (agent.closeSurface?.()) return;
+    /* 换模型那张表在最上层：它从状态条长出来，盖住了名字本身。
+       顺序错了的表现是"按 Esc，玻璃还在那儿"。 */
+    if (agent.closePicker?.()) return;
     /* 「思考过程」是浮在场上的第二块（§7.5）：它盖着正文头两行，先收它 */
     if (agent.closeTrace?.()) return;
     if (agent.closeHistory?.()) return;
