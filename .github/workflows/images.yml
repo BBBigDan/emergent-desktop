@@ -38,10 +38,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 先跑自测。这六份是纯 Node 的（零依赖、不连网、不碰集群），几秒钟，
-  # 但它们盖的正是"最容易一次改坏一片"的东西：截断策略、记忆三条纪律、
-  # 人格正交、重试退避、token 账本、造工具的四个 7B 坑。
-  # 打镜像前不过这一关，等于把没验过的代码变成 latest。
+  # 先跑自测。它们是纯 Node 的（零依赖、不连网、不碰集群），十几秒，
+  # 盖的正是"最容易一次改坏一片"的东西：截断策略、记忆三条纪律、
+  # 人格正交、重试退避、token 账本、造工具的四个 7B 坑、模型表的三态与单价。
+  # **用 glob 收全部 `*.test.mjs`，不写死名单** —— 写死的话，新加的自测
+  # 默认不跑，而"CI 绿了"会被当成"这份也验过了"。
   test:
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +50,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: 自测（六份）
+      - name: 自测（agent/*.test.mjs）
         run: |
           set -e
           for f in $(find agent -name '*.test.mjs' | sort); do
