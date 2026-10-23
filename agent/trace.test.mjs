@@ -86,6 +86,16 @@ console.log('\n思考：中英混排只留中文句');
   ok(L.some((x) => x.includes('应用清单')), '英句后面的中文还是完整的一句（没被当成同一句截掉）');
 }
 
+console.log('\n思考：一句话里夹中文也骗不过去');
+{
+  /* 2026-10-23 线上原样：这句中文占了五成，光看整句占比是拦不住的 */
+  const half = 'User asks "挑一个占内存最多的说说" — the user wants me to pick the biggest one';
+  ok(reasonLines(half).length === 0, '半中半英 → 一条都不显示');
+  /* 反过来，专有名词开头的正经中文句子不能被误杀 */
+  ok(reasonLines('n8n 占内存最多：355MB，2.2%节点').length === 1, '"n8n 占内存最多…" 要留下');
+  ok(reasonLines('CPU 21% 和内存 41%，都不高').length === 1, '"CPU 21% 和内存…" 要留下（前 10 字有汉字）');
+}
+
 console.log('\n思考：有的模型把标签原样吐出来');
 {
   const L = reasonLines('\n<think>\n好的，用户问机器现在忙不忙。根据之前的指示，我需要先调用 sys_status 工具。');

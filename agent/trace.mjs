@@ -211,6 +211,13 @@ export function reasonLines(thinking, max = 4) {
     if (s.length < 6 || s.length > 120) continue;
     /* 纯英文句：中文占比不足三成就是英文思考，不显示 */
     if (zhWeight(s) < 0.3) continue;
+    /* 整句占比不够狠 —— 中英混排里夹一句中文就能骗过去。
+       线上原样：`User asks "挑一个占内存最多的说说" —…` 中文占了五成，
+       过了上一关，屏幕上就是一行半中半英。所以再看**开头 10 个字**：
+       思考的中文句子开头几乎不可能是纯英文（"n8n 占内存最多：…" 这种
+       专有名词开头，前 10 个字里也有四五个汉字）。 */
+    const head = Array.from(s).slice(0, 10).join('');
+    if ((head.match(/[一-龥]/g) || []).length < 2) continue;
     const k = s.slice(0, 12);
     if (seen.has(k)) continue;
     seen.add(k);
