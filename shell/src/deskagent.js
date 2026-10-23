@@ -24,6 +24,8 @@ import { createAnswer } from './answer.js';
 import { createFace } from './face.js';
 import { createHalo } from './halo.js';
 import { createAgentBar } from './agentbar.js';
+import { createTrace } from './trace.js';
+import { createTraceFrame } from './traceframe.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
 import { GestureTracker, describe } from './gesture.js';
@@ -66,6 +68,12 @@ function escapeHTML(s) {
  * @param {(open:boolean)=>void} [o.onOpenChange] 展开/收起时通知桌面（收拢元素、降权窗口）
  */
 export function createDeskAgent({ field, onOpenChange } = {}) {
+  /* 「思考过程」那一栏的 DOM。它必须在**最前面**建：DOM 骨架那一段就要把它
+     挂进 layer，而 `let` 在函数体里是有 TDZ 的 —— 声明写在下面会让整个模块
+     在加载时报 "Cannot access 'trace' before initialization"（踩过，
+     而且报错只出现在页面中央一行，看起来像"加载失败"）。 */
+  let trace = null;
+
   /* ───────────────── DOM：只有四样不是粒子 ───────────────── */
 
   const layer = el('div', 'ag-layer');
@@ -150,6 +158,114 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   stopBtn.hidden = true;
 
   layer.append(histEl, histBtn, stopBtn);
+
+  /* ───────────────── 「思考过程」那一栏 ─────────────────
+   *
+   * 它讲的是**这一轮的经过**：翻记忆、取证、跑工具、铺屏、等你确认。
+   * 模型最后开口时它收起来（那一屏要留给答案），收起来之后点一下小脸还能再看。
+   *
+   * 为什么这块是 HTML 而不是粒子：它是几十行 12px 的字，点阵里那必然是糊的
+   * （§2.1）。但它不能"站在"屏幕上 —— 所以外面套一圈**流动的粒子框**
+   * （traceframe.js），框是粒子的、字是清楚的，这才和这一层是同一个世界。
+   *
+   * 它由 deskagent 管理开合，自己只管"往里加一行"。
+   */
+  let tracePinned = false;      // 用户亲手关掉了 → 这一轮别再自动弹出来
+  let tracePeek = false;        // 现在开着的这一栏是用户点开的（不是跟着思考出来的）
+  let traceTipShown = false;
+  let traceTimer = 0;
+
+  trace = createTrace({
+    onToggle: (on) => {
+      tframe?.setOpen(on);
+      if (on) tframe?.setHint(false);
+      /* 只重排答案：那一栏盖住的正是正文头两行，挪开它字才能读。
+         **不走 applyMode** —— 那个会顺手改 scene.area，而场景可能正在铺。 */
+      ans?.layout(ansGeom());
+      tracePeek = on;
+    },
+    onClose: () => {
+      tracePinned = true;
+      tracePeek = false;
+      tframe?.setOpen(false);
+      tframe?.setHint(hasTraceRows());
+      ans?.layout(ansGeom());
+    },
+  });
+  layer.appendChild(trace.el);
+
+  /* 一次性的提示：那一栏收起之后，用户怎么知道那张脸可以点？
+     就靠这一行小字，说一次，4 秒后自己化掉。 */
+  const tipEl = el('div', 'ag-tip', '点这张脸，能看它刚才是怎么做的');
+  layer.appendChild(tipEl);
+  let tipTimer = 0;
+
+  function hasTraceRows() { return (trace?.rows || 0) > 0; }
+
+  function showTip() {
+    if (traceTipShown || !open) return;
+    traceTipShown = true;
+    const f = faceGeom();
+    /* 贴着脸的右边，别压上去：脸本身是 48px 的点阵，压在它边上会让两团
+       粒子糊在一起（第一版 +40，正好啃掉脸的右眼）。 */
+    tipEl.style.left = `${f.x + 52}px`;
+    tipEl.style.top = `${f.y - 8}px`;
+    requestAnimationFrame(() => tipEl.classList.add('in'));
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(() => tipEl.classList.remove('in'), 4200);
+  }
+
+  function hideTip() {
+    clearTimeout(tipTimer);
+    tipEl.classList.remove('in');
+  }
+
+  function openTrace() {
+    if (!trace || trace.isOpen() || !open) return;
+    clearTimeout(traceTimer);
+    traceTimer = 0;
+    trace.open();
+    hideTip();
+  }
+
+  function closeTrace({ finished = false } = {}) {
+    if (!trace?.isOpen()) return;
+    trace.close();
+    if (finished && hasTraceRows()) {
+      tframe?.setHint(true);
+      showTip();
+    }
+  }
+
+  /** 它开口了：这一栏该收了。但**不立刻收** —— 一轮里它可能说一句再接着干活
+      （实测：`我先看看日志` → 再调 logs_tail）。600ms 内有新动作就算"还在跑"。 */
+  function scheduleCloseTrace() {
+    clearTimeout(traceTimer);
+    traceTimer = setTimeout(() => { traceTimer = 0; closeTrace({ finished: true }); }, 600);
+  }
+
+  function cancelCloseTrace() {
+    if (!traceTimer) return;
+    clearTimeout(traceTimer);
+    traceTimer = 0;
+  }
+
+  /** 点小脸：开着就收，收着就开（再看一遍刚才的经过） */
+  function toggleTrace() {
+    if (!hasTraceRows()) return false;
+    if (trace.isOpen()) {
+      tracePinned = true;
+      tracePeek = false;
+      closeTrace();
+      tframe?.setHint(hasTraceRows());
+    } else {
+      /* 用户点开了 = 他想看。清掉 pin，下一轮就恢复"跟着思考自己弹出来"。 */
+      tracePinned = false;
+      openTrace();
+    }
+    return true;
+  }
+
 
   /* ───────────────── 渲染树（DOM 内容） ─────────────────
    *
@@ -290,6 +406,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let face = null;   // loading 区：小表情 / 在想
   let halo = null;   // 输入行那一圈流光
   let abar = null;   // 左上角的状态条（也是粒子，见 agentbar.js）
+  let tframe = null; // 「思考过程」那一栏的粒子框（traceframe.js）
   let scene = null;
 
   /* 槽位总账（池子 56000，见 field.js 的 UI_POOL，账在 docs/interaction-spec.md §9）：
@@ -318,6 +435,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   /* loading 区的槽位。300 够 260 颗的螺旋 + 一圈光尘；
      它和答案块抢的是同一段槽位，所以数字要记在总账里（见 ANS_SLOTS）。 */
   const FACE_SLOTS = 300;
+  /* 「思考过程」的框：900 颗边 + 70 颗连接线 + 60 颗尘埃 + 30 颗收起态细弧。
+     点距必须落在 1.5~1.8px 才连成线（2.7px 就是一条虚线边框），
+     所以它比"一圈边框"看起来该有的粒子数多一倍。 */
+  const TRACE_SLOTS = 1140;
   /* 用户那一行（"问"）：18px、暗色、单行。
      它是和答案块分开的第二块字，不是答案块的降级版。 */
   const ASK_SIZE = 18;
@@ -354,9 +475,40 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     };
   }
 
-  /* loading 区：场景区左上角，200 x 88 里的一小块。表情 48 摆在里面偏左。 */
+  /* loading 区：**内容区左上角**，200 x 88 里的一小块。表情 48 摆在里面偏左。
+   *
+   * 它以前锚在 `area` 上（= 场景区）。分栏之后场景搬到右半，这张脸就跟着
+   * 跳到右半的左上角 —— 于是「思考过程」那一栏也跟着跳，正好盖在新铺出来的
+   * 仪表上（实测截图：三块仪表被一块玻璃挡住两块）。
+   * 它是**这个 agent 的脸**，不是场景的一部分，所以锚在内容区，全程不动。 */
   function faceGeom() {
-    return { x: area.x + 52, y: area.y + 44, size: 48, slots: FACE_SLOTS };
+    const a = contentArea();
+    return { x: a.x + 52, y: a.y + 44, size: 48, slots: FACE_SLOTS };
+  }
+
+  /* 「思考过程」那一栏：贴着小脸的右边，一块 470 x 250 的空间。
+   *
+   * 为什么不放在屏幕正中或右边：它讲的是"刚才那一下"，而"刚才那一下"的
+   * 视觉标记就是左上角那张小脸 —— 两者挨着，读起来才是同一个东西的两面。
+   * 也不占右边：右边是场的（场景铺开时那块要给图）。
+   *
+   * 内框比粒子框**内缩 8px**：粒子框在 DOM 上面（canvas z-index 3 < 这一层 6），
+   * 面板一旦铺到边上就会把框盖掉，屏幕上只剩一个"没有边框的卡片"。 */
+  function traceGeom() {
+    const a = contentArea();
+    /* 窄窗口要收：固定 470 在 1000px 以下会顶出内容区（右边是场景的地盘）。
+       高度同理 —— 小窗口里 250 会压到答案下沉之后的位置。 */
+    return {
+      x: Math.round(a.x + 116),
+      y: Math.round(a.y + 4),
+      w: Math.max(280, Math.min(470, a.w - 148)),
+      h: Math.max(140, Math.min(250, a.h - 120)),
+    };
+  }
+
+  function tracePanelGeom() {
+    const g = traceGeom();
+    return { x: g.x + 8, y: g.y + 8, w: g.w - 16, h: g.h - 16 };
   }
 
   /* 输入行的光环：椭圆，中心比文字基线高 6px（字的视觉中心在基线之上）。
@@ -387,7 +539,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
          读三百字就是三百次重新找头。 */
       align: 'left',
       cx: Math.round(split ? a.x + 20 : a.x + (a.w - bw) / 2),
-      centerY: Math.round(a.y + a.h / 2),
+      /* 那一栏打开时，答案整体**下移 92px**。
+         不这么做的话，面板正好压在正文头的两行上 —— 而"这一栏开着"往往
+         正是因为它刚才说了什么你想回头看（peek），偏偏那时答案已经写满。
+         下移是唯一不改变行宽、不打断阅读的办法（layout 只按新中点重绘，
+         不会把答案重新逐字打一遍）。 */
+      centerY: Math.round(a.y + a.h / 2 + (trace?.isOpen() ? 92 : 0)),
     };
   }
 
@@ -418,6 +575,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     histBtn.style.right = '40px';
     stopBtn.style.top = histBtn.style.top;
     stopBtn.style.right = histBtn.style.right;
+
+    /* 「思考过程」那一栏：粒子框和小脸同一个锚点，面板比框内缩 8px。
+       两处都要排：只排 DOM 的话，框会留在"上一次 area 的位置"（换分栏时
+       area 从满宽变成右半，框就飘到屏幕中间去了）。 */
+    tframe?.layout({ ...traceGeom(), anchor: faceGeom() });
+    trace?.layout(tracePanelGeom());
   }
 
   function build() {
@@ -445,6 +608,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     abar.layout({ x: contentArea().x, y: 38 });
     face = createFace({ field, alloc: head, slots: FACE_SLOTS });
     face.layout(faceGeom());
+    /* 「思考过程」的框紧跟在脸之后拿：它和小脸是一个整体（框是从脸上长出来的），
+       中间被答案块插一刀的话，槽位就不连续了。 */
+    if (tframe) tframe.dispose();
+    tframe = createTraceFrame({ field, alloc: head, slots: TRACE_SLOTS });
+    tframe.layout({ ...traceGeom(), anchor: faceGeom() });
     /* 光环紧跟在脸之后拿：它也是"常驻且在固定位置"的东西，
        被答案块挤掉就等于输入框没了边 —— 那正是它要解决的问题。 */
     if (halo) halo.dispose();
@@ -927,15 +1095,29 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 新问题 = 上一屏作废（进"在想"时屏幕上只该有问 + 环）。
            放在 turn 而不是只放 submit：手势回合也要走这里，而 adjust 不清。 */
         if (m.kind !== 'intent') dropScene();
+        /* 这一轮的经过从这里开始记。
+           `tracePinned` **不重置**：用户亲手关掉它，就是"别再自动弹"的意思 ——
+           每轮都重置等于让他每轮关一次。想再看就点那张脸（那一下会把 pin 清掉）。 */
+        tracePeek = false;
+        trace?.begin();
+        if (!tracePinned) openTrace();
         insp(m.kind === 'intent' ? '→ 手势' : '→ 你问',
           m.kind === 'intent' ? describe(m.intent) : askText);
         break;
 
-      case 'think': setThink(m.on); break;
+      case 'think':
+        setThink(m.on);
+        trace?.think(m.on, m.step);
+        if (m.on) { cancelCloseTrace(); if (!tracePinned) openTrace(); }
+        break;
 
       case 'say':
         /* 它一开口，"在想"那圈就该收了：圆心要腾出来给字 */
         ringOff();
+        /* 那一栏也收（但等 600ms）：先让它把"开始回答"记上，
+           万一它说完这句又接着调工具，就不该收 —— 见 scheduleCloseTrace。 */
+        trace?.said(Array.from(String(m.text || '')).length);
+        scheduleCloseTrace();
         speak(m.text);
         /* 第一次有答案 → 内容区从满宽切成左右分栏。以前这一步只在"场景落地"时做，
            模型只说话不出图时整屏会一直停在满宽，答案块没地方站。 */
@@ -945,6 +1127,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         break;
 
       case 'tool':
+        cancelCloseTrace();
         if (m.state === 'run') {
           /* 参数只取一小截：完整 JSON 一排下去能横穿半个屏幕，
              而观察窗要的是"它在干什么"，不是它发了什么报文。 */
@@ -967,6 +1150,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 先切区、再铺。顺序反了就是"铺满宽 → 收缩"闪两下，而且第二次铺申请不到
            槽位（allocator 被第一次占满），场上永远停在满宽那一版。 */
         enterSplit();
+        /* 经过里也要有"画"这一笔：用户看到右边突然多了一屏图，
+           得知道是它刚放的（而不是上一题没刷干净）。 */
+        trace?.scene(m.op, m.spec?.layers || m.ops);
         if (m.op === 'set') {
           /* 场上已经有东西时，"铺一屏"其实是换景。要不要有溶解重组，是**场的决定**，
              不是模型的参数 —— 它对用户说"再给我一屏"时不该还得分 set / transition。 */
@@ -1015,6 +1201,32 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         clearThink();
         setBusy(false);
         barTool.textContent = '';
+        /* 这一轮结束了：那一栏停下来（计时定格），然后收起来。
+           收起**之后**才提示"可以点开看" —— 顺序反了就变成"边收边喊"。 */
+        cancelCloseTrace();
+        trace?.finish();
+        if (trace?.isOpen()) closeTrace({ finished: true });
+        else if (hasTraceRows()) tframe?.setHint(true);
+        break;
+
+      /* 服务端记下的"经过"。
+       *
+       * 为什么不让前端自己从 tool / scene / note 里拼：拼不出来的是
+       * "翻到 2 条旧事""这一段上下文压过了"这类只有服务端知道的事，
+       * 而工具名翻成人话这件事只该有一份词典（agent/trace.mjs）。
+       *
+       * step 带工具调用 id，所以结局（end）能补回**同一行**，而不是再开一行。 */
+      case 'trace':
+        if (m.k === 'step') {
+          trace?.step(m);
+          if (!tracePinned && busy) openTrace();
+        } else if (m.k === 'end') {
+          trace?.end(m);
+        } else {
+          trace?.note(m);
+          if (!tracePinned && busy) openTrace();
+        }
+        insp('trace', `${m.k} ${m.text || ''} ${m.detail || ''}`.trim());
         break;
 
       /* 换会话（`/new` 或「开个新会话」）。
@@ -1037,6 +1249,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         sayText = '';
         echo('');
         ans?.set('', { instant: true });
+        /* 新会话 = 上一段的经过不再相关。它和"↑ 记录"不同：记录是跨轮的，
+           这一栏只回答"刚才那一下"，换话题就该空着。 */
+        trace?.begin();
+        closeTrace();
+        tframe?.setHint(false);
         ringOff();
         clearThink();
         log = [];
@@ -1062,7 +1279,16 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       /* 记忆条数：每轮结束后服务端会重数一遍（可能刚抽出一条新的） */
       case 'mem': renderMem(m); break;
 
-      case 'note': insp('note', m.message); break;
+      case 'note':
+        insp('note', m.message);
+        /* 服务端的自述也进那一栏。有两条刻意不进去：
+           "旁白已咽掉"是模型废话的墓碑，用户不需要看；"模型空回复"要进
+           （它解释了这一段为什么慢了）。 */
+        if (m.message && !/^旁白已咽掉/.test(m.message)) {
+          trace?.note({ text: String(m.message).slice(0, 60), tone: 'note' });
+          if (!tracePinned && busy) openTrace();
+        }
+        break;
       case 'busy': insp('busy', '上一轮还没结束，这一步先排队'); break;
 
       /* 人格层注入了旧事。这一行是验收用的：屏幕上它说「重启过 n8n（#41）」，
@@ -1106,6 +1332,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 出错了它自己也该变脸（§7.2 的「警觉」）：屏幕上一句话说清原因，
            角落那张脸同时红一下 —— 两条通道说的是同一件事，但不重复。 */
         face?.alert();
+        /* 那一栏也要写下这一下为什么完了。否则用户点开只看到"跑了一半的经过"，
+           最关键的结局反而不在里面。 */
+        trace?.note({ text: friendly(m.message), detail: String(m.message || '').slice(0, 40), tone: 'note' });
+        trace?.finish();
         break;
 
       default:
@@ -1365,8 +1595,29 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   let panBase = null;
   let dragId = null;
 
+  /* 命中有三种来源，顺序就是遮挡顺序：
+     ① 那一栏（它在 DOM 最上层，盖住的地方**不许**产生任何意图 ——
+        否则在面板上拖一下会把背后的仪表拖走）；
+     ② 场里的层；
+     ③ 小脸（点它 = 看/收"思考过程"）。 */
+  function faceHit(x, y) {
+    if (!open || !face) return null;
+    const f = faceGeom();
+    if (Math.hypot(x - f.x, y - f.y) > 34) return null;
+    return {
+      id: '@face',
+      hot: { gestures: ['tap'], cx: f.x, cy: f.y, r: 34 },
+      layer: { spec: { label: '思考过程' } },
+    };
+  }
+
+  function pickAt(x, y) {
+    if (trace?.hit(x, y)) return null;
+    return scene.hit(x, y) || faceHit(x, y);
+  }
+
   const gt = new GestureTracker({
-    pick: (x, y) => scene.hit(x, y),
+    pick: pickAt,
 
     onStart: (s) => {
       field.setWells([{ x: s.x, y: s.y, r: 180, k: 1200, swirl: 0.3 }]);
@@ -1402,6 +1653,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
          还要白烧一整轮（实测：用户点一下空白，模型开始答一个不存在的问题）。
          场已经在 onStart 里响过了，这里到此为止。 */
       if (i.kind === 'tap' && !i.target) return;
+      /* 点小脸 = 看它刚才做了什么。这条**不发服务端**：它不是一次提问，
+         是"把已经发生过的事再摊开一次"，发过去只会白烧一轮（模型会以为
+         用户在说"我点了思考过程"）。 */
+      if (i.kind === 'tap' && i.target === '@face') {
+        toggleTrace();
+        return;
+      }
       /* 分叉上的"允许/拒绝"是**审批**，不是普通选择 —— 但走的是同一条手势通道。
          审批不是特权通道，它只是"服务端此刻在等一个 pick"。 */
       if (pendingApproval && i.kind === 'pick' && i.target === 'ask') {
@@ -1430,8 +1688,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   addEventListener('pointermove', (e) => {
     if (!open) return;
     if (gt.g?.moved) return;
-    const h = scene.hit(e.clientX, e.clientY);
+    /* 面板上不换光标：它自己那层的 cursor 更准确（滚动的区域就是滚动的样子） */
+    if (trace?.hit(e.clientX, e.clientY)) { document.body.style.cursor = 'default'; return; }
+    const h = scene.hit(e.clientX, e.clientY) || faceHit(e.clientX, e.clientY);
     document.body.style.cursor = !h ? 'default'
+      : h.id === '@face' ? 'pointer'
       : h.hot.gestures.includes('adjust') ? 'ns-resize'
       : h.hot.gestures.includes('pan') ? 'ew-resize'
       : 'pointer';
@@ -1476,6 +1737,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     face?.start();
     halo?.start();
     abar?.start();
+    tframe?.start();
+    /* 唤出时那一栏可能还开着（上一次没关）：框要跟上，
+       否则 DOM 玻璃在、粒子框不在 —— 屏幕上就是一张没有边的纸。 */
+    tframe?.setOpen(trace?.isOpen() || false);
+    tframe?.setHint(!trace?.isOpen() && hasTraceRows());
     startTick();
     halo?.setLevel(1);
     document.body.classList.add('agent-open');
@@ -1528,6 +1794,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     face?.stop();
     abar?.stop();
     stopTick();
+    /* 那一栏跟着收起：它是这一层的东西，桌面态不该留一块玻璃浮在那儿。
+       但**行不清**（下次唤出还能点脸看），只把框和面板收掉。 */
+    closeTrace();
+    hideTip();
+    tframe?.setHint(false);
+    tframe?.stop();
     /* 光环跟着散：它不是"消失"，是亮度收回去 —— 和球面同一条 700ms 的时间感 */
     halo?.setLevel(0);
     /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
@@ -1620,6 +1892,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       const keepSay = sayText;
       build();
       typeEl.style.top = `${lineY - 17}px`;
+      /* build() 换掉了所有常驻件（脸/光环/状态条/粒子框），新的是"没在跑"的。
+         不重启的话窗口一变大小，整圈东西就冻在第一帧上。 */
+      face?.start();
+      halo?.start();
+      abar?.start();
+      tframe?.start();
+      tframe?.setOpen(trace?.isOpen() || false);
+      tframe?.setHint(!trace?.isOpen() && hasTraceRows());
       if (spec) scene.set(spec);
       if (keepAsk) { askText = keepAsk; ask?.set(keepAsk, { instant: true, color: ASK_COLOR }); }
       if (keepSay) { sayText = keepSay; speak(keepSay, { instant: true }); }
@@ -1645,6 +1925,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       closeHist();
       return true;
     },
+    /** 「思考过程」是第二层浮窗（在记录之下、场之上）。活着就先收它 */
+    closeTrace: () => {
+      if (!trace?.isOpen()) return false;
+      tracePinned = true;
+      closeTrace();
+      tframe?.setHint(hasTraceRows());
+      return true;
+    },
     /** 渲染树内容优先于记录：它是屏幕正中最大的一块 */
     closeSurface: () => closeSurface(),
     stopDraw: () => stopDraw(),
@@ -1665,6 +1953,15 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       setTimeout(() => gt.up(cx, cy), 110);
       return true;
     },
+    /* 自测：点那张小脸（走真实手势通道，和用户按下去同一条路） */
+    tapFace: () => {
+      const f = faceGeom();
+      gt.down(f.x, f.y);
+      setTimeout(() => gt.up(f.x, f.y), 110);
+      return true;
+    },
+    /* 自测：直接开合那一栏（DEV 下才有意义，和用户点 × / 点脸等价） */
+    toggleTrace: () => { toggleTrace(); return trace?.isOpen() ?? false; },
     drag: (id, dx, dy) => {
       const h = scene?.layers.get(id)?.hot;
       if (!h) return false;
@@ -1698,6 +1995,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       answerGeom: ans ? ansGeom() : null,
       answerLines: ans ? ans.debugLines?.() : null,
       sceneArea: scene ? { x: scene.area.x, w: scene.area.w, busy: scene.busy, n: scene.spec?.layers?.length ?? -1 } : null,
+      trace: trace ? {
+        open: trace.isOpen(), steps: trace.steps, rows: trace.rows,
+        pinned: tracePinned, peek: tracePeek,
+        geom: traceGeom(), frame: tframe?.level ?? 0, dbg: tframe?.dbg?.(),
+      } : null,
     }),
   };
 }

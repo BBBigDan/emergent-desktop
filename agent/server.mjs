@@ -36,6 +36,7 @@ import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
+import { toolLine } from './trace.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -394,6 +395,22 @@ function emit(s, ev) {
   }
 }
 
+/**
+ * 「思考过程」一行。
+ *
+ * 这不是调试日志（那是 `?dev=1` 的观察窗和 stdout）：这是**给用户看的经过**。
+ * 所以它必须是人话、有宾语、有耗时，而且**只在这一轮里有效** ——
+ * 换一题就清空，它不是历史记录（那是 ↑ 记录 那一层的事）。
+ *
+ * 三种 kind：
+ *   step  —— 一件正在做的事（`id` 用于之后把结果补上去）
+ *   end   —— step 的结局（ok / err / denied / timeout）
+ *   note  —— 不属于任何 step 的一句话（上下文压了、模型空回复、系统代问）
+ */
+function trace(s, k, o = {}) {
+  emit(s, { t: 'trace', k, ...o });
+}
+
 /** 记一次模型调用的 token。
  *
  *  为什么在**调用点**记、而不是在模型适配器里记：只有这里知道两件
@@ -568,6 +585,9 @@ function requestApproval(s, { id, name, args }) {
     const d = describeDanger(s, name, args, extraNet);
     s.pending = { id, resolve };
     emit(s, { t: 'approval', id, tool: name, args, label: d.label, danger: d.detail });
+    /* 审批在等待时，那一栏要停在这一句上 —— 否则用户盯着"停掉 navidrome"那行
+       看它转，却不知道它其实在等自己点按钮。 */
+    trace(s, 'note', { text: '等你确认', detail: d.label, tone: 'gate', id });
     const timer = setTimeout(() => {
       if (s.pending?.id !== id) return;
       s.pending = null;
@@ -1095,6 +1115,20 @@ async function runTurn(s, goal) {
     emit(s, { t: 'turn', round: s.turn, kind: 'intent', intent: it });
   }
 
+  /* 记忆命中要说出来。不说的后果是：模型忽然提起三周前的事，
+     用户以为它在编 —— 而屏幕上本来能显示"翻到 2 条旧事"。
+     **放在 turn 之后**：前端在 turn 上清空那一栏，先发就被清掉了。 */
+  if (memHits.length) {
+    trace(s, 'note', {
+      text: `翻到 ${memHits.length} 条旧事`,
+      detail: String(memHits[0]?.text || '').slice(0, 18),
+      tone: 'mem',
+    });
+  }
+  if (driftNote.items.length) {
+    trace(s, 'note', { text: '想起一件别的事', detail: String(driftNote.items[0]?.text || '').slice(0, 16), tone: 'mem' });
+  }
+
   try {
     let lastSig = '';
     let repeats = 0;
@@ -1280,6 +1314,10 @@ async function runTurn(s, goal) {
         const id = c.id;
         const t0 = Date.now();
         emit(s, { t: 'tool', id, name, args, state: 'run' });
+        /* 「它现在在干什么」—— 和上面那条是同一件事的两个听众：
+           tool 事件给观察窗和状态条（要原始参数），trace 给用户（要人话）。 */
+        const tl = toolLine(name, args);
+        trace(s, 'step', { id, text: tl.verb, detail: tl.detail || undefined, tool: name });
 
         let result;
         try {
@@ -1495,6 +1533,14 @@ async function runTurn(s, goal) {
           : JSON.stringify(forContext);
         s.messages.push({ role: 'tool', name, tool_call_id: id, content: ctxContent });
         emit(s, { t: 'tool', id, name, state: result?.denied ? 'denied' : result?.error ? 'err' : 'ok', ms: Date.now() - t0, note: summarize(result) });
+        /* 结局补到同一行上，而不是再开一行 —— 一行工具 = 一件事+它的下场。
+           失败的那行 `note` 通常是"为什么失败"（模型没给参数、参数不是 JSON），
+           那正是用户最需要看见的一句。 */
+        trace(s, 'end', {
+          id, ms: Date.now() - t0,
+          status: result?.denied ? 'denied' : result?.error ? 'err' : 'ok',
+          note: summarize(result) || undefined,
+        });
 
         /* 记下最近一次的真实数据。它不是给模型的上下文，是给兜底用的：
            模型没铺屏时，系统要能自己画出来，画得准的前提是它拿着原始读数。 */

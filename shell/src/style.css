@@ -563,3 +563,136 @@ body.agent-open .stat-zone { pointer-events: none; }
 .ag-page.on { opacity: 1; }
 .ag-page b { font-weight: 400; color: rgba(178, 210, 238, 0.78); }
 .ag-page span { color: rgba(160, 192, 222, 0.42); }
+
+/* ── 思考过程（那一栏的内容）─────────────────────────────
+ * 框是粒子画的（traceframe.js），这里只放**框里面**的那块东西。
+ * 所以：没有 border，没有阴影，边缘靠玻璃自己的渐变收掉 ——
+ * 粒子框已经在外面把边界画清楚了，这里再描一条就变成"双层边框"。
+ *
+ * 玻璃是 0.78 + blur：后面那些点（框里的尘埃、还有场）会被糊开透上来，
+ * 读起来像"这块空间里本来就有点东西"，而不是一张贴在屏幕上的卡片。 */
+.ag-trace {
+  position: fixed; z-index: 7;
+  pointer-events: auto;
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, rgba(6, 11, 18, 0.82) 0%, rgba(5, 9, 15, 0.76) 100%);
+  backdrop-filter: blur(10px) saturate(118%);
+  -webkit-backdrop-filter: blur(10px) saturate(118%);
+  opacity: 0;
+  transform: translateY(-5px) scale(0.994);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  /* 面板自己吃指针，但它内部不该出现文本选择（这一层没有"选中"这件事） */
+  user-select: none;
+  cursor: default;
+}
+.ag-trace.in { opacity: 1; transform: none; }
+.ag-trace[hidden] { display: none; }
+
+.ag-trace-hd {
+  display: flex; align-items: center; gap: 8px;
+  height: 30px; padding: 0 8px 0 12px;
+  border-bottom: 1px solid rgba(120, 170, 230, 0.07);
+}
+/* 脉动点：只在"它真的在跑"的时候跳。停下来就变暗变实 ——
+   一颗还在跳的点，会让人以为还有下文。 */
+.ag-trace-pulse {
+  flex: 0 0 auto; width: 5px; height: 5px; border-radius: 3px;
+  background: rgba(127, 196, 255, 0.55);
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.ag-trace-pulse.on {
+  background: rgba(127, 227, 207, 0.95);
+  box-shadow: 0 0 8px rgba(127, 227, 207, 0.55);
+  animation: ag-think 1.3s ease-in-out infinite;
+}
+@keyframes ag-think {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.78); }
+}
+.ag-trace-title {
+  font-size: 10.5px; font-weight: 400; letter-spacing: 0.16em;
+  color: rgba(158, 196, 230, 0.62);
+}
+.ag-trace-meta {
+  margin-left: auto; font: 10px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  letter-spacing: 0.04em; color: rgba(147, 184, 216, 0.42);
+}
+.ag-trace.done .ag-trace-meta { color: rgba(147, 184, 216, 0.3); }
+.ag-trace-x {
+  flex: 0 0 auto; width: 20px; height: 20px; margin-left: 2px;
+  background: none; border: 0; border-radius: 6px;
+  color: rgba(147, 184, 216, 0.42); font-size: 14px; line-height: 1;
+  cursor: pointer; transition: color 0.2s, background 0.2s;
+}
+.ag-trace-x:hover { color: rgba(226, 238, 252, 0.9); background: rgba(120, 170, 230, 0.1); }
+
+.ag-trace-list {
+  height: calc(100% - 31px);
+  overflow-y: auto; scrollbar-width: none;
+  padding: 4px 10px 12px 12px;
+  /* 上下边缘化开：它是"流"，不是"列表控件" —— 出现硬边就有分区感 */
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 94%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 94%, transparent 100%);
+}
+.ag-trace-list::-webkit-scrollbar { width: 0; }
+
+.ag-trace .tr {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 3.5px 0;
+  font-size: 12px; line-height: 1.62;
+  opacity: 1; transform: none;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+/* 新行从左边 4px 处滑进来，只动一次 */
+.ag-trace .tr.new { opacity: 0; transform: translateX(-4px); }
+.ag-trace .tr-m {
+  flex: 0 0 12px; font-style: normal; font-size: 9.5px; line-height: 1.9;
+  letter-spacing: 0; color: rgba(127, 196, 255, 0.5);
+}
+.ag-trace .tr-t {
+  flex: 0 1 auto; min-width: 0;
+  color: rgba(226, 238, 252, 0.92);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ag-trace .tr-d {
+  flex: 1 1 auto; min-width: 0; font-style: normal;
+  font-size: 11.5px; color: rgba(150, 188, 222, 0.52);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ag-trace .tr-s {
+  flex: 0 0 auto; font: 9.5px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  letter-spacing: 0.02em; color: rgba(147, 184, 216, 0.3);
+}
+/* 结局：成了是绿、没成是红、被拒是琥珀。颜色只是第二信号，
+   右边那个 ✓/✕ 才是第一信号 —— 色盲看得见符号。 */
+.ag-trace .tr[data-s="ok"] .tr-s { color: rgba(127, 211, 176, 0.62); }
+.ag-trace .tr[data-s="err"] .tr-s { color: rgba(255, 124, 147, 0.9); }
+.ag-trace .tr[data-s="denied"] .tr-s { color: rgba(255, 196, 120, 0.9); }
+.ag-trace .tr[data-s="err"] .tr-d { color: rgba(255, 160, 175, 0.62); }
+
+/* 每一种经过各有一套笔调：工具是暖的（它在动手）、场景是青的、
+   记忆与等待是紫的、说话是绿的。全一样的话，扫一眼分不出"卡在哪一类"。 */
+.ag-trace .tr[data-k="step"] .tr-m { color: rgba(255, 178, 87, 0.62); }
+.ag-trace .tr[data-k="act"] .tr-m { color: rgba(255, 156, 120, 0.85); }
+.ag-trace .tr[data-k="scene"] .tr-m { color: rgba(127, 227, 207, 0.55); }
+.ag-trace .tr[data-k="mem"] .tr-m { color: rgba(196, 168, 255, 0.65); }
+.ag-trace .tr[data-k="mem"] .tr-t { color: rgba(200, 186, 240, 0.7); }
+.ag-trace .tr[data-k="gate"] .tr-m { color: rgba(255, 124, 147, 0.85); }
+.ag-trace .tr[data-k="gate"] .tr-t { color: rgba(255, 190, 200, 0.92); }
+.ag-trace .tr[data-k="say"] .tr-m { color: rgba(127, 227, 207, 0.7); }
+.ag-trace .tr[data-k="think"] .tr-m { color: rgba(147, 184, 216, 0.4); }
+.ag-trace .tr[data-k="think"] .tr-t { color: rgba(147, 184, 216, 0.55); }
+.ag-trace .tr[data-k="note"] .tr-m { color: rgba(147, 184, 216, 0.28); }
+.ag-trace .tr[data-k="note"] .tr-t { color: rgba(170, 200, 228, 0.6); font-size: 11.5px; }
+
+/* 一次性的提示：那一栏收起之后，告诉用户"那张脸可以点"。
+   只出现一次（每次会话第一次收起），4 秒后自己化掉 —— 常驻就又变成控件了。 */
+.ag-tip {
+  position: fixed; z-index: 7; pointer-events: none;
+  font: 11px/1.5 ui-monospace, Menlo, "Cascadia Mono", monospace;
+  letter-spacing: 0.04em; color: rgba(147, 196, 235, 0.5);
+  opacity: 0; transform: translateX(-3px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.ag-tip.in { opacity: 1; transform: none; }
