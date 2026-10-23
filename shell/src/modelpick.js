@@ -61,12 +61,28 @@ export function createModelPicker(o = {}) {
   root.append(hd, list, foot);
 
   let data = null;          // 服务端给的那张表
+  let sig = '';             // 上一次画出来的那张表（判断"要不要重画"）
   let open = false;
   let pending = '';         // 正在换的那个 id（等 model 事件落定）
   const rowById = new Map();
 
   function currentModel() {
     return data?.groups?.flatMap((g) => g.models).find((m) => m.id === data.current) || null;
+  }
+
+  /* 一次"这张表长什么样"的指纹。打开面板时会先显示上次拿到的表、随即再去要一份新的
+     （要紧的是"刚 pull 的模型立刻能看见"）。但那一次刷新**大多什么都没变** ——
+     如果照样重建 DOM，正在按下、还没抬起的那一下就被丢了：
+     按钮在 mousedown 和 mouseup 之间被换成了新节点，click 不成立。
+     实测线上就是这么丢过一次点击（点下去什么都不发生）。所以内容一样就不重画。 */
+  function fingerprint(d) {
+    if (!d) return '';
+    return JSON.stringify({
+      c: d.current, b: !!d.busy,
+      g: (d.groups || []).map((g) => [g.key, g.label, g.note, g.empty,
+        (g.models || []).map((m) => [m.id, m.name, m.org, m.usable, m.why, m.think, m.tools, m.cost,
+          m.price && [m.price.in, m.price.out, !!m.price.free], m.note, m.speed])]),
+    });
   }
 
   /* 底部那行说明：默认说当前这个，鼠标移到哪一行就说哪一行。
@@ -212,13 +228,16 @@ export function createModelPicker(o = {}) {
       data = d;
       if (pending && d.current === pending) pending = '';
       if (!open) return;
+      const f = fingerprint(d);
+      if (f === sig) return;      // 一模一样就不要再建一遍节点（会丢正在按下的那一下）
+      sig = f;
       render();
     },
     /** 换模型的结果回来了：落定"当前"，把"换…"擦掉 */
     settle(id) {
       pending = '';
       if (data) data.current = id || data.current;
-      if (open) render();
+      if (open) { sig = fingerprint(data); render(); }
     },
     /** 打开着就重画（比如服务端说"这一轮还在跑"） */
     repaint() { if (open) render(); },
