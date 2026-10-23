@@ -36,7 +36,7 @@ import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
-import { toolLine } from './trace.mjs';
+import { toolLine, cut } from './trace.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -1121,12 +1121,14 @@ async function runTurn(s, goal) {
   if (memHits.length) {
     trace(s, 'note', {
       text: `翻到 ${memHits.length} 条旧事`,
-      detail: String(memHits[0]?.text || '').slice(0, 18),
+      /* 用 cut 而不是 slice：直接切会在逗号/句号后面断开，
+         屏幕上就成了"上次查过 n8n，" —— 一句话没说完的样子。 */
+      detail: cut(memHits[0]?.text, 18),
       tone: 'mem',
     });
   }
   if (driftNote.items.length) {
-    trace(s, 'note', { text: '想起一件别的事', detail: String(driftNote.items[0]?.text || '').slice(0, 16), tone: 'mem' });
+    trace(s, 'note', { text: '想起一件别的事', detail: cut(driftNote.items[0]?.text, 16), tone: 'mem' });
   }
 
   try {

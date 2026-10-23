@@ -58,7 +58,7 @@ function tail(p, n = 22) {
   return ch.length > n ? `${ch.slice(0, n - 1).join('')}…` : name;
 }
 
-const cut = (s, n = 22) => {
+export const cut = (s, n = 22) => {
   const ch = Array.from(String(s ?? '').replace(/\s+/g, ' ').trim());
   return ch.length > n ? `${ch.slice(0, n - 1).join('')}…` : ch.join('');
 };
