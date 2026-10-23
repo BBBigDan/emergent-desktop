@@ -17,7 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { createOlares, OPS, OP_DOC, authState } from './olares.mjs';
+import { createOlares, OPS, OP_DOC, authState, loginArgv } from './olares.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const fx = (n) => JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures/olares', n), 'utf8'));
@@ -178,6 +178,18 @@ console.log('\n没凭据时说的话');
   ok(/不要叫用户去终端/.test(r.error), '反过来明确禁止模型这么说');
   ok(/OLARES_REFRESH_TOKEN/.test(r.error), '告诉模型程序自己能怎么恢复（配置 refresh token / 密码）');
   ok(/不是什么都没有|不是"没有数据"/.test(r.error), '说清"不是没有数据"（免得模型改口说"查不到"）');
+}
+
+console.log('\n密码登录的 argv');
+{
+  /* 线上真踩过：`profile login` 不认 `-o json`（回 `unknown shorthand flag: 'o'`），
+     整条自救链就废了，而报错看起来像"密码不对"。同一个坑 `settings me` 也踩过。 */
+  const a = loginArgv('a@b.com');
+  ok(!a.includes('-o') && !a.includes('json'), '不带 -o json（login 不认这个旗标）');
+  ok(a.includes('--password-stdin'), '密码走管道，不进 argv（会出现在 ps 里）');
+  ok(a[a.indexOf('--olares-id') + 1] === 'a@b.com', '带上 olaresId');
+  ok(!a.some((x) => /^pw|Olares/.test(x)), 'argv 里根本没有密码');
+  ok(loginArgv('a@b.com', '123456').includes('--totp'), '开了 2FA 才带 --totp');
 }
 
 console.log('\nop 表自洽');

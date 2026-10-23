@@ -55,6 +55,19 @@ export function authState(status) {
   return 'ok';
 }
 
+/**
+ * 密码登录的 argv。
+ *
+ * **不能带 `-o json`** —— `profile login` 不认这个旗标，会回
+ * `unknown shorthand flag: 'o' in -o`，整条自救链就断在这儿（线上真踩过，
+ * 而那个报错看起来像"密码不对"）。同一个坑 `settings me` 也踩过：
+ * **不是每条子命令都支持 `-o`**，别把 `run()` 里那套统一加旗标当成理所当然。
+ */
+export function loginArgv(id, totp = '') {
+  return ['profile', 'login', '--olares-id', String(id), '--password-stdin',
+    ...(totp ? ['--totp', String(totp)] : [])];
+}
+
 /* 读操作白名单：op → argv。**不带 `-o json`**，统一在 run() 里加。 */
 const READ = {
   /* 应用清单：装了什么、什么版本、从哪个源来的、什么状态。
@@ -329,8 +342,7 @@ export function createOlares(o = {}) {
   /** 密码登录：`--password-stdin` 要求密码走管道，不能进 argv。 */
   function runLogin(id, password, totp = '') {
     const t0 = Date.now();
-    const argv = ['profile', 'login', '--olares-id', id, '--password-stdin',
-      ...(totp ? ['--totp', totp] : []), '-o', 'json'];
+    const argv = loginArgv(id, totp);
     return new Promise((resolve) => {
       const p = spawn(bin, argv, {
         stdio: ['pipe', 'pipe', 'pipe'],
