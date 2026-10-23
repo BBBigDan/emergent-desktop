@@ -25,6 +25,20 @@ const DEFAULT_AT = 0.78;   // 到这个水位才动手
 const DEFAULT_TO = 0.45;   // 收到这个水位（滞回：涨回 78% 之前不会再裁）
 
 /**
+ * 从 `at` 往回找最近的一条 user，返回它的下标（找不到返回 -1）。
+ *
+ * 为什么要"往回"：切点落在 user 上是这套裁剪唯一的硬约束，
+ * 而一轮对话的**末尾**可能是一长串工具调用（没有 user）。
+ * 往后找不到的时候，正确做法是把这一整轮留下、丢掉更早的几轮，
+ * 而不是在工具链中间砍一刀。
+ */
+function snapBackToUser(messages, at) {
+  let i = Math.min(Number(at) || 0, messages.length - 1);
+  while (i > 1 && messages[i].role !== 'user') i--;
+  return i >= 1 && messages[i]?.role === 'user' ? i : -1;
+}
+
+/**
  * @param {Array} messages  会话消息（第 0 条应该是 system）
  * @param {object} o        { used, limit, parts: {sys, tools}, at, to }
  * @returns {null | { messages, dropped, before, cramped?: boolean }}
@@ -50,9 +64,11 @@ export function trimHistory(messages, o = {}) {
   let cramped = false;
   if (budget <= 200) {
     /* 系统提示 + 工具表本身就把目标水位吃光了 —— 裁历史救不了。
-       这时候不做"假装裁过了"：留最近两条，并把 cramped 交回去，让上层说实话。 */
+       这时候不做"假装裁过了"：留最近两条，并把 cramped 交回去，让上层说实话。
+       但"最近两条"也要退回 user：直接切在 `tool` 上就是一次 400，
+       而 400 比"裁不动"糟得多（裁不动只是这一轮挤，400 是这一轮死）。 */
     cramped = true;
-    cut = Math.max(1, messages.length - 2);
+    cut = snapBackToUser(messages, Math.max(1, messages.length - 2));
   } else if (histTok <= budget) {
     /* 历史本来就没超预算。这里**必须 return null**，不能算 cramped ——
        "历史很小"和"裁不动"是两件相反的事，混在一起会让每轮都报一条假警报。 */
@@ -62,7 +78,14 @@ export function trimHistory(messages, o = {}) {
     const from = Math.max(1, Math.floor(messages.length * (1 - keepRatio)));
     cut = from;
     while (cut < messages.length && messages[cut].role !== 'user') cut++;
-    if (cut >= messages.length) cut = Math.max(1, messages.length - 2);
+    if (cut >= messages.length) {
+      /* 往后找不到 user：说明**这一轮还没结束**（一轮里几十次工具调用，现在很常见）。
+         以前这里是 `cut = length - 2` —— 那一刀很可能正落在
+         `assistant(tool_calls)` 和它的 `tool` 之间，下一次请求直接 400，
+         而报错看起来像"接口坏了"。改成**往回**退到本轮开头那条 user：
+         丢掉的是更早的几轮，本轮整段留着（工具结果靠 foldToolResults 折叠）。 */
+      cut = snapBackToUser(messages, messages.length - 1);
+    }
   }
 
   /* 丢掉的是 1..cut-1 —— 第 0 条 system 永远留着，所以不是 `length - cut`。
@@ -76,6 +99,54 @@ export function trimHistory(messages, o = {}) {
     before: used,
     cramped,
   };
+}
+
+/* ─────────────────── 一轮之内的折叠（长任务用） ───────────────────
+ *
+ * 不设步数上限之后，把窗口吃满的往往不是"聊了很多轮"，而是**这一轮干了很多事**：
+ * 三十次工具调用、每次回一段 JSON，一轮就能吃掉半个窗口。
+ *
+ * 这里做的是最省的一种：**只折内容，不动结构**。
+ * `tool` 消息留着、`tool_call_id` 留着（所以永远不会 400），
+ * 只把较早那些的正文换成一句"已折叠"加开头一小段。
+ * 对比之下，从头裁消息要撞"切点必须在 user"这条 —— 而本轮只有开头一个 user，
+ * 往后无 user 可切（那正是 trimHistory 里那个往回退的分支）。
+ *
+ * 为什么不摘要素：摘要要再调一次模型，用的还是**已经快满的**上下文，
+ * 而且挡住的正是用户等着的那一步。折叠是零成本的。
+ */
+
+/**
+ * @param {Array} messages 完整消息（第 0 条 system）
+ * @param {{keep?:number, head?:number}} o 留最近几条不动、折叠后保留多少字
+ * @returns {null | {messages:Array, folded:number, chars:number}}
+ */
+export function foldToolResults(messages, { keep = 6, head = 240 } = {}) {
+  if (!Array.isArray(messages)) return null;
+  const idx = [];
+  for (let i = 1; i < messages.length; i++) if (messages[i]?.role === 'tool') idx.push(i);
+  const victims = idx.slice(0, Math.max(0, idx.length - Math.max(1, keep)));
+  if (!victims.length) return null;
+  const out = messages.slice();
+  let folded = 0;
+  let chars = 0;
+  for (const i of victims) {
+    const c = String(out[i].content ?? '');
+    /* 已经折过的不再折 —— 不然第二次调用会把 head 也切掉，剩一句空话 */
+    if (c.startsWith('{"_folded"')) continue;
+    if (c.length <= head) continue;
+    out[i] = {
+      ...out[i],
+      content: JSON.stringify({
+        _folded: '较早的工具结果已折叠（省上下文）。要细节就再查一次。',
+        head: c.slice(0, head),
+      }),
+    };
+    folded++;
+    chars += Math.max(0, c.length - head);
+  }
+  if (!folded) return null;
+  return { messages: out, folded, chars };
 }
 
 /* ─────────────────── 压缩（摘要，不是丢） ───────────────────

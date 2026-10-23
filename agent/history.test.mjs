@@ -11,7 +11,7 @@
  *   4. 固定开销本身就把窗口占满时，不能假装裁过了（返回 cramped）。
  */
 
-import { trimHistory, compactPlan, applyCompact, transcriptFor, SUMMARY_TAG } from './history.mjs';
+import { trimHistory, foldToolResults, compactPlan, applyCompact, transcriptFor, SUMMARY_TAG } from './history.mjs';
 
 let failed = 0;
 const ok = (cond, label, extra = '') => {
@@ -97,6 +97,74 @@ console.log('\n第一条不是 system');
 {
   const m = convo(10).slice(1);
   ok(trimHistory(m, { used: 15000, limit: 16000, parts }) === null, '没有 system 就不裁（否则会话失去身份）');
+}
+
+/* ───────────────── 一轮还没结束就到了水位 ─────────────────
+ * 步数不设限之后这是**常态**：一轮里三十次工具调用，末尾全是 tool 消息，
+ * 往后根本找不到下一个 user。以前那个 `cut = length - 2` 会正切在
+ * assistant(tool_calls) 和 tool 中间 —— 下一次请求 400，报错还像"接口坏了"。 */
+console.log('\n一轮还没结束就到了水位');
+{
+  const m = [SYS];
+  for (let t = 0; t < 3; t++) {
+    m.push({ role: 'user', content: `旧问题 ${t}` });
+    m.push({ role: 'assistant', content: `旧回答 ${t}` });
+  }
+  m.push({ role: 'user', content: '这一轮还没结束' });
+  for (let i = 0; i < 30; i++) {
+    m.push({
+      role: 'assistant', content: '',
+      tool_calls: [{ id: `k${i}`, type: 'function', function: { name: 'fs_list', arguments: '{}' } }],
+    });
+    m.push({ role: 'tool', name: 'fs_list', tool_call_id: `k${i}`, content: '{"ok":1}' });
+  }
+  const used = est(m) + 1000;
+  const r = trimHistory(m, { used, limit: 12000, parts });
+  ok(!!r, '还是要裁（这一轮太长了）');
+  const kept = r ? r.messages.slice(2) : [];
+  ok(kept[0]?.role === 'user' && kept[0].content === '这一轮还没结束',
+    '切点退回**本轮开头那条 user**，本轮整段留着', kept[0]?.role);
+  const ids = new Set(kept.filter((x) => x.role === 'assistant')
+    .flatMap((x) => (x.tool_calls || []).map((c) => c.id)));
+  const orphan = kept.filter((x) => x.role === 'tool' && !ids.has(x.tool_call_id));
+  ok(orphan.length === 0, '没有孤立的 tool 消息（否则下一次请求直接 400）',
+    orphan.map((x) => x.tool_call_id).join(','));
+}
+
+/* ───────────────── 一轮之内的折叠 ─────────────────
+ * 不设步数上限之后，吃满窗口的是"这一轮干了很多事"。
+ * 折叠只动内容、不动结构 —— 这正是它能在一轮**中间**用的原因：
+ * tool_call_id 全留着，所以永远不会 400。 */
+console.log('\n一轮之内的折叠');
+{
+  const m = [SYS, { role: 'user', content: '查一下' }];
+  for (let i = 0; i < 20; i++) {
+    m.push({
+      role: 'assistant', content: '',
+      tool_calls: [{ id: `f${i}`, type: 'function', function: { name: 'fs_list', arguments: '{}' } }],
+    });
+    m.push({ role: 'tool', name: 'fs_list', tool_call_id: `f${i}`, content: `{"x":"${'y'.repeat(800)}"}` });
+  }
+  const f = foldToolResults(m, { keep: 6, head: 240 });
+  ok(!!f, '到水位就折');
+  ok(f.folded === 14, `只折最老的 14 条、留最近 6 条原样（折了 ${f.folded}）`);
+  ok(f.messages.length === m.length, '**条数不变**（结构不动，所以不会 400）');
+  const tools = f.messages.filter((x) => x.role === 'tool');
+  ok(tools.length === 20, 'tool 消息一条不少（只换内容）');
+  ok(tools.slice(-6).every((x) => !String(x.content).startsWith('{"_folded"')), '最近 6 条原样保留');
+  ok(tools.slice(0, 14).every((x) => String(x.content).startsWith('{"_folded"')), '老的都标了"已折叠"');
+  ok(tools.slice(0, 14).every((x) => String(x.content).length < 500), '每条只剩开头一小段');
+  /* 只量 tool 正文：assistant 那层 tool_calls 不折（它才是"调了什么"的凭据）。
+     真实场景里占地方的也是正文（一屏表格 20KB）。 */
+  const sum = (arr) => arr.reduce((a, x) => a + String(x.content || '').length, 0);
+  ok(sum(tools) < sum(m.filter((x) => x.role === 'tool')) * 0.6,
+    `工具正文明显变小：${sum(m.filter((x) => x.role === 'tool'))} → ${sum(tools)}`);
+  ok(foldToolResults(f.messages, { keep: 6, head: 240 }) === null,
+    '折过的不再折（再折一次连 head 都没了，只剩一句空话）');
+  /* 不足 keep 条时不该动 —— 最近的结果可能正是它下一步要用的 */
+  const few = [SYS, { role: 'user', content: 'a' },
+    { role: 'tool', tool_call_id: 'x', content: 'y'.repeat(999) }];
+  ok(foldToolResults(few, { keep: 6 }) === null, '不超过 keep 条就不折');
 }
 
 /* ───────────────── 压缩（摘要） ─────────────────

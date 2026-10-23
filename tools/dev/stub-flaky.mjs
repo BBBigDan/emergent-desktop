@@ -6,6 +6,8 @@
  *
  *   loop  —— 每一步都调工具，参数还都不一样（所以不是"原地打转"），
  *            走到步数上限也从不说话
+ *   long  —— **正常的长任务**：连着调 14 次工具（参数各不相同），然后给出回答。
+ *            用来证明"默认不设步数上限"真的不掐：上限设成 0 时必须走完全程。
  *   stuck —— 每一步都调同一个工具、同一组参数
  *   mute  —— 空回复：没有 content，也没有 tool_calls
  *   dead  —— 连"你说结论"（上层收口时不再给工具）都不理
@@ -77,6 +79,21 @@ http.createServer((req, res) => {
     }
 
     if (MODE === 'mute') return choice({ content: '' });
+    /* long：**正常的长任务**。连着 14 次工具调用，然后收工说一句话。
+       桩数的是"这一轮里的第几次工具调用"，所以它不依赖服务端的任何上限 ——
+       把 MAX_STEPS 设成 0（不限）时会走满 14 步，设成 4 时第 4 步就被拦。
+       这正是那条判据：**不设限时，长任务不该被掐。** */
+    if (MODE === 'long') {
+      const used = msgs.filter((m) => m.role === 'tool').length;
+      if (used >= 14) return choice({ content: '查了 14 个地方，凑齐了：装的是这些。' }, 'stop');
+      return choice({
+        content: '',
+        tool_calls: [{
+          id: `c_long_${n}`, type: 'function',
+          function: { name: 'fs_list', arguments: JSON.stringify({ path: `~/long-${used + 1}` }) },
+        }],
+      }, 'tool_calls');
+    }
     if (MODE === 'stuck') {
       return choice({
         content: '',

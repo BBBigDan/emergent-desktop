@@ -126,14 +126,17 @@ console.log('提示词');
 console.log('行为');
 {
   _reset();
+  ok(getSettings().behavior.maxSteps === 0, '默认**不限**步数（0 = 不限，长任务不该被掐）');
   let r = applyPatch({ behavior: { temp: 5, maxSteps: 999 } });
   ok(r.settings.behavior.temp <= 1.2, `温度被夹在 1.2（${r.settings.behavior.temp}）`);
-  ok(r.settings.behavior.maxSteps <= 30, `步数夹在 30（${r.settings.behavior.maxSteps}）`);
+  ok(r.settings.behavior.maxSteps <= 200, `步数夹在 200（${r.settings.behavior.maxSteps}）`);
   r = applyPatch({ behavior: { temp: -1, maxSteps: 1 } });
   ok(r.settings.behavior.temp === 0, '温度不小于 0');
-  ok(r.settings.behavior.maxSteps >= 3, '步数不小于 3（少于 3 连"查一下再说"都走不完）');
+  ok(r.settings.behavior.maxSteps >= 3, '1~2 抬到 3（少于 3 步连"查一下再说"都走不完）');
+  r = applyPatch({ behavior: { maxSteps: 0 } });
+  ok(r.settings.behavior.maxSteps === 0, '显式填 0 就是不服（放开）');
   r = applyPatch({ behavior: { temp: 'x', maxSteps: null } });
-  ok(r.settings.behavior.temp === 0 && r.settings.behavior.maxSteps === 3, '乱填的值退回上一次的');
+  ok(r.settings.behavior.temp === 0 && r.settings.behavior.maxSteps === 0, '乱填的值退回上一次的');
 }
 
 /* ─────────────────── ⑥ 脱敏：GET 里不许有明文 key ─────────────────── */
@@ -172,7 +175,20 @@ console.log('落盘');
   await fs.writeFile(TMP, '{ 这不是 json');
   _reset();
   const bad = await loadSettings(TMP);
-  ok(bad.providers.length === 0 && bad.behavior.maxSteps > 0, '文件坏了就退回默认值，不抛');
+  ok(bad.providers.length === 0 && bad.behavior.maxSteps === 0, '文件坏了就退回默认值（不限），不抛');
+
+  /* 旧文件迁移：v1 的 `maxSteps: 10` 是当年的**默认安全网**，不是用户的选择。
+     照搬过来的话，上线第一件事就是"长任务还是 10 步就停"，而用户从没设过它。 */
+  await fs.writeFile(TMP, JSON.stringify({ behavior: { temp: 0.4, maxSteps: 10 } }));
+  _reset();
+  const old = await loadSettings(TMP);
+  ok(old.behavior.maxSteps === 0, `旧文件里的 10 按"不限"读（读到 ${old.behavior.maxSteps}）`);
+  ok(old.behavior.temp === 0.4, '旧文件里真在用的温度要留着');
+  /* 新文件（带 v:2）里的数字是用户自己设的，必须当真 */
+  await fs.writeFile(TMP, JSON.stringify({ behavior: { v: 2, temp: 0.4, maxSteps: 12 } }));
+  _reset();
+  const v2 = await loadSettings(TMP);
+  ok(v2.behavior.maxSteps === 12, `新文件里的 12 是用户的决定，照读（${v2.behavior.maxSteps}）`);
 
   await fs.rm(TMP, { force: true });
   _reset();

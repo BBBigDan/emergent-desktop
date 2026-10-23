@@ -43,7 +43,7 @@ import {
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
-import { trimHistory } from './history.mjs';
+import { trimHistory, foldToolResults } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
@@ -51,7 +51,7 @@ import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
 /* 收口的三句措辞。单独一个文件是为了能**不起服务**就测住它们 ——
    见 turnstop.mjs 开头的说明。 */
-import { finalizePrompt, closeLine, stopWord } from './turnstop.mjs';
+import { finalizePrompt, closeLine, stopWord, progressLine, resumeHint } from './turnstop.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -95,28 +95,35 @@ const SYS = process.env.SYS || 'k8s';            // k8s | host | mock —— 只
    而日志里 `model=` 打的是这一份，看起来像"改了没生效"。
    同一个常数分两处写，迟早漂（这条踩过不止一次）。 */
 const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : 'mock');
-/* 一轮最多几步。
+/* 一轮最多几步。**默认 0 = 不限。**
  *
- * 8 是给"造工具"留的（写元数据 → 贴代码 → 试跑 → 改 → 装，五步起步）。
- * 但**普通问答用不到 8**：实测一轮"机器怎么样"翻了 8 次，其中 2 次是被服务端
- * 拒掉的调用（k8s_restart / scene_ask），有效工具只有 3 个。
- * 每多一步就是**多一次整份上下文**（12k 起），8 步 = 10 万 token 输入。
+ * 以前这里是 5、后来 10（造工具放宽到 16），出发点都是省钱 ——
+ * 每多一步就是多一次整份上下文（12k 起）。但那个算盘打错了一件事：
+ * **长任务本来就需要很多次工具调用**。查一个组件版本、翻三层目录、
+ * 装完再验一遍，20 步是常态；掐在 10 步上，用户看到的是"它做了一半就不做了"，
+ * 而这种失败**看起来像模型能力问题**，其实是循环的形状问题。
  *
- * 所以拆成两个上限：默认 10，一旦这一轮动了造工具的那几个，才放宽到 16。
- * 判据写在代码里（看到 tool_* / skill_save 被调用），不靠模型自己声明。
+ * 所以现在默认不设限，安全网换成另外三条，判的都是"有没有进展"而不是"几次"：
+ *   · `stuck`  —— 同一组参数反复调（三步内两次重复）→ 没有进展，收口；
+ *   · `long`   —— 单回合墙钟到点（`TURN_HARD_MS`）→ 停下，**可续跑**；
+ *   · `ctx`    —— 上下文快满且折不动了 → 停下，**可续跑**。
  *
- * **这两个数是"安全网"，不是"正常终点"。**
- * 以前默认 5，后果是"查了几次就被掐断、而且一句话都不说"（见 runTurn 里
- * 那个 while 的注释）。业界默认也是这个量级（OpenAI Agents SDK 的 max_turns
- * 是 10），区别在于它们撞上上限会**报错**；我们要的是"撞上了也把结论说出来"，
- * 那一层由 `finalize()` 负责。 */
-const MAX_STEPS = Number(process.env.MAX_STEPS || 10);
-const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 16);
-/* 一整轮的墙钟上限。步数管不住"每一步都很慢"（一次工具 40 秒），
-   而用户对"没结果"和"等太久"的感受是同一件事。到点就收口，不再往下等。
-   180 秒而不是 120：`olares_act` 的 `--watch` 本身就是 90 秒，
-   装一个应用加上前后的查询很容易顶到 120 —— 那会把一次正常的长活在半路掐掉。 */
-const TURN_MS = Number(process.env.TURN_MS || 180000);
+ * `MAX_STEPS` / `MAX_STEPS_FORGE` 仍然认（设置页的滑块也还写这个字段），
+ * 只有显式设成 >0 时才是上限 —— 自测和"我就想省点钱"的人用它。
+ */
+const MAX_STEPS = Number(process.env.MAX_STEPS || 0);
+const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 0);
+/* 一整轮能跑多久。**这是一个"可续跑的断点"，不是终点。**
+ *
+ * 时间这条仍然要留：一次 HTTP 回合挂半小时，用户已经不知道它在干什么了，
+ * 而且进程重启/SW 刷新都会把这一轮丢掉。所以到点就收口 ——
+ * 但收口时会给一份中途汇报，并明说「继续」能接着来（历史全在）。
+ *
+ * 15 分钟：`olares_act --watch` 本身 90 秒，装一个应用加前后查询能到 4~5 分钟，
+ * 再留出"装完再验一遍"的余量。以前这里是 180 秒 —— 那才是真正在半路掐活的东西。 */
+const TURN_HARD_MS = Number(process.env.TURN_HARD_MS || process.env.TURN_MS || 15 * 60 * 1000);
+/* 心跳间隔：长任务不能安静地跑。见 turnstop.mjs 的 `progressLine`。 */
+const BEAT_MS = Number(process.env.BEAT_MS || 45000);
 /* 上下文满窗自收的水位（见 history.mjs）。78% 动手，收到 45% ——
    留出滞回，否则每轮都会裁一点点，而"每轮都变"对前缀缓存是最坏的事。 */
 const CTX_TRIM_AT = Number(process.env.CTX_TRIM_AT || 0.78);
@@ -1244,7 +1251,7 @@ function coldAllow(goal) {
  * 几次没成。宁可说"我查了三遍都没拿到东西"，也不装作答上了。
  */
 function closeFallback(s, why) {
-  const line = closeLine(s.acts || [], why);
+  const line = closeLine(s.acts || [], why, s.actN || 0);
   s.spoke = true;
   speak(s, line);
   return line;
@@ -1385,6 +1392,7 @@ async function runTurn(s, goal) {
   s.salvaged = false;       // 这一轮有没有已经兜底铺过（见 salvage）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
+  s.actN = 0;               // 这一轮真正调了多少次（acts 有 12 条上限，长任务会截断）
   s.reasonN = 0;            // 这一轮已经上屏了几条"想"（整轮封顶 8 条，见下面）
   s.reasonSeen = new Set(); // 已经上过屏的那几句（跨步去重）
   s.traced = null;          // 这一轮它有没有把注入的旧事说出来（说了就记下编号）
@@ -1484,10 +1492,15 @@ async function runTurn(s, goal) {
     let lastSig = '';
     let repeats = 0;
     let nudges = 0;
-    /* 步数上限现在可以在设置里改（默认还是 10）。造工具那几轮仍然更宽 ——
+    /* 步数上限现在默认是 0（不限），设置里可以设。造工具那几轮仍然另算 ——
        那是**任务形状**决定的，不该被一个滑块改掉。 */
-    const stepCap = () => (s.forgeStep ? MAX_STEPS_FORGE
-      : Math.max(3, Number(settingsBehavior().maxSteps) || MAX_STEPS));
+    const stepCap = () => {
+      const forge = MAX_STEPS_FORGE > 0 ? MAX_STEPS_FORGE : 0;
+      const mine = Number(settingsBehavior().maxSteps) || MAX_STEPS || 0;
+      const n = s.forgeStep ? (forge || mine) : mine;
+      /* 0 / 没设 = 不限。**不是**随便给个 10 —— 那正是这次要拆掉的东西。 */
+      return n > 0 ? Math.max(3, n) : Infinity;
+    };
     /* ── 这一轮怎么结束 ──
      *
      * **不是"走完 N 步"。** 参考的是几个真跑在生产里的循环：
@@ -1508,17 +1521,41 @@ async function runTurn(s, goal) {
      *
      * 现在只有两条路能结束：
      *   ① 模型不再要工具 —— 它给出了回答（正常终局，`stop` 保持空串）；
-     *   ② 预算用完 / 墙钟到点 / 原地打转 —— `stop` 记下原因，
+     *   ② 没有进展 / 太久 / 上下文满 —— `stop` 记下原因，
      *      出去之后**必须收口**（`finalize()`：关掉工具，再问一次要结论）。
+     *
+     * **"次数"不在 ② 里。** 默认不设步数上限（`MAX_STEPS=0`），因为长任务本来
+     * 就要几十次工具调用；判"该不该停"要看**有没有进展**，不是数了几次。
+     * 那条纪律的代价是这一轮可能跑很久 —— 所以配了三样：
+     *   · 心跳（`progressLine`）：每 45 秒说一句"第几步 / 多久"，别让长任务看起来像卡死；
+     *   · 上下文折叠（`foldToolResults`）：一轮里几十个工具结果会把窗口吃满，
+     *     折最老的那几条，结构不动（tool_call_id 留着，永远不会 400）；
+     *   · 硬上限可续跑：撞上 `long`/`ctx`/`cap` 时收口会给中途汇报，
+     *     并明说「继续」能接着来 —— 历史全在，不是从头再来。
      */
     let step = 0;
     let stop = '';
     const tTurn = Date.now();
+    let beat = tTurn + BEAT_MS;
     for (;;) {
       /* 上一轮工具刚跑完就被按了停：这里也要接住，别再多问模型一次 */
       if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
       if (step >= stepCap()) { stop = 'cap'; break; }
-      if (Date.now() - tTurn > TURN_MS) { stop = 'slow'; break; }
+      if (Date.now() - tTurn > TURN_HARD_MS) { stop = 'long'; break; }
+      /* 心跳。**长任务最怕的不是慢，是安静** —— 屏幕上粒子在抖、一句话没有，
+         和"卡死了"没有区别。这一句几乎不花钱，但它把两件事分开了。 */
+      if (Date.now() > beat) {
+        beat = Date.now() + BEAT_MS;
+        /* 花了多少也一起报（单价未配置时 `cost` 是 null，那就别写）。
+           不设步数上限之后，一轮真能花掉几毛钱 —— 这笔钱要在过程中看得见，
+           等轮末才显示，人已经觉得被坑了。 */
+        let cost = null;
+        try { cost = s.meter?.snap?.()?.turn?.cost ?? null; } catch { /* 账本不该挡住对话 */ }
+        emit(s, {
+          t: 'note',
+          message: progressLine({ step, ms: Date.now() - tTurn, acts: s.actN || 0, cost }),
+        });
+      }
       const at = step;
       step = at + 1;
       emit(s, { t: 'think', on: true, step: at });
@@ -1553,6 +1590,36 @@ async function runTurn(s, goal) {
         emit(s, { t: 'think', on: false, step: at });
       }
       recordUsage(s, out, reqMsgs, schemas);
+
+      /* ── 一轮之内的上下文闸 ──
+       *
+       * 步数不设限之后，吃满窗口的不再是"聊了很多轮"，而是**这一轮干了很多事**：
+       * 三十次工具调用、每次回一段 JSON，一轮就能吃掉半个窗口。
+       * 而满窗的失败发生在工具跑到一半，用户看到的是"做了一半不动了"。
+       *
+       * 所以每到水位就折一次最老的工具结果（结构不动，见 history.mjs 的
+       * `foldToolResults`）。折不动还超线，才停 —— 停下也带着中途汇报和「继续」，
+       * 不是把这一轮判死。 */
+      {
+        const snap = s.meter?.snap?.();
+        if (snap?.limit) {
+          const ratio = (snap.ctx.tokens || 0) / snap.limit;
+          if (ratio >= CTX_TRIM_AT) {
+            const f = foldToolResults(s.messages, { keep: 6 });
+            if (f) {
+              s.messages = f.messages;
+              emit(s, {
+                t: 'note',
+                message: `上下文 ${Math.round(ratio * 100)}%：把 ${f.folded} 条较早的工具结果折叠了`
+                  + '（省下约 ' + Math.round(f.chars / 3) + ' token，要细节可以再查一次）',
+              });
+            } else if (ratio >= 0.95) {
+              stop = 'ctx';
+              break;
+            }
+          }
+        }
+      }
 
       /* 空回复重试一次。
          7B 实测会偶尔吐一个空 message（没有 content，也没有 tool_calls）——
@@ -1826,6 +1893,7 @@ async function runTurn(s, goal) {
           /* 这一轮干过什么。它**不进**模型上下文（那会让模型变成在念流水账），
              只在回合结束时交给记忆抽取：审计日志是"真实发生过的事"，
              而真实发生过的事才是 L0 记忆该有的种子。 */
+          s.actN = (s.actN || 0) + 1;
           if (s.acts.length < 12) {
             /* ok/denied 一起带上：人格层只收"造成了后果的动作"。
                被拒的、报错的调用没有改变任何东西，记下来只会在下一轮变成
@@ -2066,7 +2134,13 @@ async function runTurn(s, goal) {
        这一步是整件事的重点。没有它，用户看到的就是"它去查了，然后没有然后" ——
        而屏幕上的最后一句可能是毫不相干的兜底（实测：问"系统里装了什么"，
        它最后说"我记得这件事"）。 */
-    if (stop) await finalize(s, stop, ctxNote, step);
+    if (stop) {
+      await finalize(s, stop, ctxNote, step);
+      /* 停下的**不是**结束：长任务被硬上限拦下时，历史里全都是查到的结果，
+         用户一句「继续」就能接着走。不说这句话，他会以为这轮已经收尾了。 */
+      const hint = resumeHint(stop);
+      if (hint) emit(s, { t: 'note', message: hint });
+    }
 
     /* 手势回合里把话补上：问题已经问出去了，但那一行字不能空着 */
     if (s.drew && !s.spoke && s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust') {

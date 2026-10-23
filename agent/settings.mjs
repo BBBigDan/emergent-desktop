@@ -14,7 +14,9 @@
  *   ② `prompt` —— 系统提示词。默认是**追加**：内置那套（场的说明书、工具怎么调、
  *      上限多少）一个字不动，只在末尾加用户的要求。另有一个"整段替换"的口子，
  *      因为有人确实想从零写；但它默认关着，且界面上写清代价。
- *   ③ `behavior` —— 温度和每轮步数上限。前者改"怎么说话"，后者是安全网。
+ *   ③ `behavior` —— 温度和每轮步数。前者改"怎么说话"；后者**默认 0 = 不限**，
+ *      只有用户自己想省钱时才设个数（以前它是"安全网"，默认 10 —— 那会把
+ *      正常的长任务掐在半路，看起来像模型不行）。
  *
  * 落盘位置由 `SETTINGS_FILE` 决定（集群里挂到 state 目录，见 deploy 的 yaml）——
  * 它必须**跟着数据走、不跟着镜像走**，否则换个 tag 用户配的接口就没了。
@@ -44,7 +46,12 @@ const ID_RE = /^p_[a-z0-9]{4,10}$/;
 const DEFAULTS = () => ({
   providers: [],
   prompt: { append: '', replace: '' },
-  behavior: { temp: 0.3, maxSteps: Number(process.env.MAX_STEPS || 10) },
+  /* `maxSteps` = 一轮最多几步，**0 = 不限，这是默认**。
+     以前它的默认值是 10 —— 那时它还叫"安全网"。可长任务本来就要几十次工具调用，
+     10 步会把正常的长活掐在半路（而且看起来像模型能力不行）。现在安全网换成
+     "有没有进展 / 跑多久 / 上下文满没满"（见 server.mjs 的循环和 turnstop.mjs）。
+     `v` 是语义版本：v2 起 0 表示不限，读旧文件时见 loadSettings 里的迁移。 */
+  behavior: { v: 2, temp: 0.3, maxSteps: Number(process.env.MAX_STEPS || 0) },
 });
 
 let cur = DEFAULTS();
@@ -156,12 +163,16 @@ function normPrompt(p, prev) {
 function normBehavior(b, prev) {
   const temp = Number(b?.temp);
   const steps = Number(b?.maxSteps);
+  const n = Math.round(steps);
   return {
     /* 温度卡在 0~1.2。>1.2 的模型会开始胡说，而这不是"更有创意"，
        是"scene_show 的字段名写错"（实测过 8B 在 1.5 上）。 */
     temp: Number.isFinite(temp) ? Math.max(0, Math.min(1.2, +temp.toFixed(2))) : prev.temp,
-    /* 步数 3~30。下限 3 是因为"查一下再说"至少要 2 步；上限 30 是安全网本身。 */
-    maxSteps: Number.isFinite(steps) ? Math.max(3, Math.min(30, Math.round(steps))) : prev.maxSteps,
+    /* 步数 **0 = 不限（默认）**，显式限制时 3~200。
+       1~2 会抬到 3：少于 3 步连"查一下再说"都走不完，
+       那不是"省钱"，是"每一轮都半路死"。0 是另一件事 —— 它是"放开"。 */
+    maxSteps: Number.isFinite(steps) ? (n <= 0 ? 0 : Math.max(3, Math.min(200, n))) : prev.maxSteps,
+    v: 2,
   };
 }
 
@@ -174,6 +185,11 @@ export async function loadSettings(file = settingsFile()) {
     const raw = await fs.readFile(file, 'utf8');
     const j = JSON.parse(raw);
     const { providers } = normProviders(j?.providers, []);
+    /* 旧文件（v1）里的 `maxSteps` 默认是 10，那时它的意思是"安全网"，
+       不是用户的选择。上线后第一件事就是把它当成"用户设了 10 步"，
+       结果长任务还是被掐 —— 这正是这次要拆掉的东西。
+       所以没有 `v` 字段的文件一律按"不限"读；真有人想限制，面板上一拖就有。 */
+    if (j?.behavior && typeof j.behavior === 'object' && j.behavior.v == null) j.behavior.maxSteps = 0;
     cur = {
       providers,
       prompt: normPrompt(j?.prompt, base.prompt),

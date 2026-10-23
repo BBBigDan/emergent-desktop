@@ -30,7 +30,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { finalizePrompt, closeLine, stopWord } from './turnstop.mjs';
+import { finalizePrompt, closeLine, stopWord, progressLine, resumeHint } from './turnstop.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const ROOT = path.resolve(HERE, '..');
@@ -94,7 +94,7 @@ function openSSE(url, onData) {
 }
 
 /** 起一个假模型 + 一个真 server，问一句话，收回这一轮的全部事件。 */
-async function runCase(mode) {
+async function runCase(mode, extra = {}) {
   const basePort = 18700 + (process.pid % 200) + Math.floor(Math.random() * 60);
   const fport = basePort;
   const sport = basePort + 300;
@@ -127,7 +127,13 @@ async function runCase(mode) {
       MODEL_KEY: 'stub-key-for-test',
       MODEL: `local/stub-${mode}`,
       MODEL_LOCAL_BASE: `http://127.0.0.1:${fport}/v1`,
-      MAX_STEPS: '4',          // 压低一点，测试快；判的是"撞上限有没有收口"，不是上限本身
+      /* 别读本机真实那份设置：里面可能有用户自己存的模型 / 提示词 / 步数，
+         会把用例变成"在我机器上过"。 */
+      SETTINGS_FILE: path.join(os.tmpdir(), `loop-settings-${mode}-${process.pid}.json`),
+      /* 默认压到 4 步，测试快 —— 判的是"撞上限有没有收口"，不是上限本身。
+         但**上限默认已经是 0（不限）**，所以每个用例自己带 env 覆盖。 */
+      MAX_STEPS: '4',
+      ...extra,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -225,10 +231,40 @@ console.log('收口说什么');
   ok(p1.includes('不要再调工具'), '明确禁止再调工具（7B 会硬发文本形式的调用）');
   ok(p1.includes('不要说抱歉'), '明确不要道歉（"很抱歉我无法完成"零信息）');
   ok(p1.includes('查了什么'), '要求说清"查了什么、卡在哪"');
-  for (const w of ['cap', 'slow', 'stuck', 'silent']) {
+  for (const w of ['cap', 'long', 'ctx', 'budget', 'stuck', 'silent']) {
     ok(finalizePrompt(w).length > 10, `${w}：有对应的原因句`);
     ok(stopWord(w) !== w, `${w}：界面上那行是人话（${stopWord(w)}）`);
   }
+  /* 步数不再设限之后，"次数用尽"这句话本身就是错的：默认没有"用尽"这回事，
+     只有"你设了上限"和"没进展 / 太久"。措辞留在错的那边 = 用户以为又被掐了。 */
+  ok(!/用尽/.test(stopWord('cap')) && /上限/.test(stopWord('cap')),
+    `cap 说成"到了你设的上限"，不说"用尽"（${stopWord('cap')}）`);
+  /* 被硬上限拦下的那一轮**常常还没做完**，所以要中途汇报 + 下一步，
+     不是总结陈词 —— 用户下一步一定会说「继续」。 */
+  ok(finalizePrompt('long', 9).includes('下一步'), 'long：要的是"下一步打算查什么"');
+  ok(!finalizePrompt('stuck', 9).includes('下一步'), 'stuck 不要"下一步"（它本来就卡住了）');
+
+  /* 心跳：长任务不能安静地跑 */
+  const beat = progressLine({ step: 12, ms: 130000, acts: 11 });
+  ok(/第 12 步/.test(beat) && /2 分 10 秒/.test(beat), `心跳说出第几步、多久（${beat}）`);
+  ok(progressLine({ step: 1, ms: 3000 }).includes('3 秒'), '不到一分钟用秒（"130s"难读）');
+  ok(/调了 11 次工具/.test(beat), '带上真调了几次');
+  /* 花了多少也要在过程中看得见；单价未知时不写 ¥0（那是在编） */
+  ok(progressLine({ step: 3, ms: 60000, acts: 2, cost: 0.0234 }).includes('¥0.023'),
+    '有单价时报花费（三位小数，几厘也看得见）');
+  ok(!progressLine({ step: 3, ms: 60000, acts: 2, cost: null }).includes('¥'),
+    '单价未知时不写钱（不拿 ¥0 冒充）');
+
+  /* 停下 ≠ 结束：能续的才说「继续」，打转说「继续」等于让它再转一圈 */
+  ok(resumeHint('long').includes('继续'), '硬上限拦下时告诉用户说「继续」');
+  ok(resumeHint('cap').includes('继续') && resumeHint('ctx').includes('继续'), 'cap / ctx 同样可续');
+  ok(resumeHint('stuck') === '', '打转不给「继续」的暗示');
+  ok(resumeHint('silent') === '', '空回复也不暗示「继续」');
+
+  /* 长任务里 `acts` 会被截到 12 条 —— 次数得用真实计数，不然会报"查了 12 次" */
+  ok(closeLine([{ name: 'fs_list', ok: true }], 'long', 37).includes('37 次'),
+    '次数用真实计数，不是被截断的 12 条');
+  ok(closeLine([{ name: 'fs_list', ok: true }], 'long', 37).includes('继续'), 'long 的实话里带着"继续"');
 
   /* 模型彻底不说话时：宁可说实话，也不装作答上了 */
   const empty = closeLine([]);
@@ -255,6 +291,8 @@ async function loopbackOk() {
 }
 
 const CASES = [
+  { mode: 'long', why: '长任务：连查 14 次，然后正常收工（**不设上限时不许被掐**）',
+    env: { MAX_STEPS: '0', BEAT_MS: '1' }, steps: 14 },
   { mode: 'loop', why: '一直调工具，从不说话（用户遇到的那种）' },
   { mode: 'stuck', why: '原地打转，同一组参数调三遍' },
   { mode: 'mute', why: '空回复' },
@@ -264,11 +302,11 @@ const CASES = [
 console.log('每一轮都必须有结局（端到端）');
 const endToEnd = (await loopbackOk()) ? CASES : [];
 if (!endToEnd.length) {
-  console.log('  ⚠ 这个环境的本机回环不通，跳过端到端那四个用例 —— 上面那组纯逻辑已经跑过；');
+  console.log('  ⚠ 这个环境的本机回环不通，跳过端到端那五个用例 —— 上面那组纯逻辑已经跑过；');
   console.log('    端到端请在本机跑 `node agent/loop.test.mjs`。');
 }
 for (const c of endToEnd) {
-  const r = await runCase(c.mode);
+  const r = await runCase(c.mode, c.env);
   ok(r.up, `${c.mode}：server 起来了`,
     `exit=${r.exit === undefined ? '(还在跑)' : r.exit}  probe=${r.probe}  fetch="${r.fetchErr}"
 `
@@ -283,13 +321,28 @@ for (const c of endToEnd) {
   if (c.mode !== 'mute') {
     ok(r.said.at(-1) !== '我记得这件事', `${c.mode}：没有拿一段旧记忆答非所问`);
   }
-  ok(r.asked, `${c.mode}：向模型要过一次结论（收口请求不带工具）`);
+
+  if (c.steps) {
+    /* 这是这次改动的主判据：**默认不设限，长任务必须走完。**
+       以前 MAX_STEPS 默认 10、更早是 5，14 次调用会在半路被掐 ——
+       而"它做了一半就不做了"在用户眼里就是"模型不行"。 */
+    ok(r.tools.length >= c.steps, `${c.mode}：${c.steps} 次调用一次没少（实际 ${r.tools.length}）`);
+    ok(!r.asked, `${c.mode}：它是**自己说完的**，不是被收口逼出来的`);
+    ok(r.notes.some((n) => /还在跑/.test(n)), `长任务有心跳（${r.notes.find((n) => /还在跑/.test(n)) || '没有'}）`);
+  } else {
+    ok(r.asked, `${c.mode}：向模型要过一次结论（收口请求不带工具）`);
+  }
 
   /* 系统兜底那一条只在"模型也没说"时才该说话；说了就说明最后一道闸在。
      `loop`/`stuck`/`mute` 的桩都会给结论，所以这一条只对 dead 有要求。 */
   if (c.mode === 'dead') {
     ok(/查了 \d+ 次|没能给出回答/.test(r.said.at(-1) || ''),
       `${c.mode}：系统按"真的查过什么"说了实话 → ${JSON.stringify(r.said.at(-1) || '')}`);
+  }
+  /* 撞上限停下来的那些轮次，必须告诉用户"还能接着来" —— 停下不是结束 */
+  if (c.mode === 'loop') {
+    ok(r.notes.some((n) => n.includes('继续')),
+      `撞上限那一轮说清"说「继续」就能接着查"（${r.notes.filter((n) => n.includes('继续')).join(' / ') || '没有'}）`);
   }
 }
 
