@@ -44,6 +44,55 @@ const ok = (c, l, e = '') => {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* ── 网络只用 `http`，不用 `fetch` ──
+ *
+ * CI 上出现过一次很难解释的事：同一个地址，`fetch` 报 ECONNREFUSED、
+ * `http.get` 却拿到了 503。既然 `http` 这一路能给出**具体状态码**，
+ * 就全都走它 —— 自测不该把结论押在两条路径谁对谁错上。
+ */
+const parts = (url) => { const x = new URL(url); return { host: x.hostname, port: x.port, path: x.pathname + x.search }; };
+
+function getStatus(url, timeout = 3000) {
+  return new Promise((res) => {
+    const req = http.get({ ...parts(url), timeout }, (r) => { res(r.statusCode); r.resume(); });
+    req.on('error', (e) => res(e.code || e.message));
+    req.on('timeout', () => { req.destroy(); res('timeout'); });
+  });
+}
+
+function postJSON(url, body) {
+  return new Promise((res) => {
+    const data = JSON.stringify(body);
+    const req = http.request({
+      ...parts(url), method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+    }, (r) => { r.resume(); r.on('end', () => res(r.statusCode)); });
+    req.on('error', () => res(0));
+    req.write(data);
+    req.end();
+  });
+}
+
+/** 开一条 SSE。返回 `{ close }`，事件通过 `onData` 逐条交出去。 */
+function openSSE(url, onData) {
+  const req = http.get(parts(url), (res) => {
+    let buf = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => {
+      buf += chunk;
+      const blocks = buf.split('\n\n');
+      buf = blocks.pop() || '';
+      for (const b of blocks) {
+        const line = b.split('\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        try { onData(JSON.parse(line.slice(6))); } catch { /* 半包，下一轮会有 */ }
+      }
+    });
+  });
+  req.on('error', () => {});
+  return { close: () => { try { req.destroy(); } catch { /* 已经断了 */ } } };
+}
+
 /** 起一个假模型 + 一个真 server，问一句话，收回这一轮的全部事件。 */
 async function runCase(mode) {
   const basePort = 18700 + (process.pid % 200) + Math.floor(Math.random() * 60);
@@ -71,6 +120,11 @@ async function runCase(mode) {
          "banner 打印了、fetch 却连不上"（本机同样的代码没问题）——
          不去猜平台差异，直接让它绑 127.0.0.1。 */
       HOST: '127.0.0.1',
+      /* 一个假 key。走 `local/` 路由用不到它，但 `/api/health` 会**故意**回 503
+         （那是给 k8s readiness 用的闸：没 key 的进程不该被判成就绪）。
+         本机有 agent/.env 所以从来是 200，CI 上没有 —— 于是四个用例都"起不来"。
+         这不是产品 bug，是自测没把环境配齐。 */
+      MODEL_KEY: 'stub-key-for-test',
       MODEL: `local/stub-${mode}`,
       MODEL_LOCAL_BASE: `http://127.0.0.1:${fport}/v1`,
       MAX_STEPS: '4',          // 压低一点，测试快；判的是"撞上限有没有收口"，不是上限本身
@@ -87,13 +141,23 @@ async function runCase(mode) {
   /* 45 秒。CI 的 2 核冷启动比本机慢一倍多（实测本机 12s、runner 上更久），
      18 秒那版在 GitHub 上四个用例全部"server 起不来"—— 而其实只是慢。
      `exitCode` 一旦非空就别再等了：那才是真失败，等下去只是把错误拖长。 */
+  /* 判活走 `http.get` 而不是 `fetch`：CI 上出现过 fetch 报 ECONNREFUSED、
+     http.get 到同一个地址却拿到 503 的情况 —— 两条路径结论相反时，信那条
+     能给出**具体状态码**的。 */
+  const ping = () => new Promise((res) => {
+    const req = http.get({ host: '127.0.0.1', port: sport, path: '/api/health', timeout: 3000 }, (r) => {
+      res(r.statusCode); r.resume();
+    });
+    req.on('error', (e) => res(e.code || e.message));
+    req.on('timeout', () => { req.destroy(); res('timeout'); });
+  });
+
   let lastErr = '';
   for (let i = 0; i < 150; i++) {
     if (srv.exitCode !== null) break;
-    try { const r = await fetch(`${base}/api/health`); if (r.ok) { up = true; break; } } catch (e) {
-      /* `fetch failed` 什么也没说 —— 把 cause 的 code 留住，否则排障只能靠猜 */
-      lastErr = `${e.message}${e.cause ? ` / ${e.cause.code || e.cause.message}` : ''}`;
-    }
+    const code = await ping();
+    if (code === 200) { up = true; break; }
+    lastErr = String(code);
     await wait(300);
   }
   if (!up) {
@@ -115,36 +179,16 @@ async function runCase(mode) {
 
   const evs = [];
   const sid = `loop-${mode}-${Date.now()}`;
-  const ac = new AbortController();
-  const sse = fetch(`${base}/api/events?sid=${sid}`, { signal: ac.signal }).then(async (r) => {
-    const dec = new TextDecoder();
-    let buf = '';
-    try {
-      for await (const chunk of r.body) {
-        buf += dec.decode(chunk, { stream: true });
-        const parts = buf.split('\n\n');
-        buf = parts.pop() || '';
-        for (const p of parts) {
-          const line = p.split('\n').find((l) => l.startsWith('data: '));
-          if (!line) continue;
-          try { evs.push(JSON.parse(line.slice(6))); } catch { /* 半包，下一轮会有 */ }
-        }
-      }
-    } catch { /* abort 就是收尾方式 */ }
-  });
+  const sse = openSSE(`${base}/api/events?sid=${sid}`, (e) => evs.push(e));
   await wait(500);
 
-  await fetch(`${base}/api/send`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sid, t: 'ask', text: '系统里装了什么？' }),
-  });
+  await postJSON(`${base}/api/send`, { sid, t: 'ask', text: '系统里装了什么？' });
 
   for (let i = 0; i < 100; i++) {
     if (evs.some((e) => e.t === 'idle')) break;
     await wait(300);
   }
-  ac.abort();
-  await sse.catch(() => {});
+  sse.close();
   kill();
 
   /* 桩的请求日志：`tools=0` 且提示里有"不要再调工具"的那一次，就是收口。 */
@@ -207,7 +251,7 @@ async function loopbackOk() {
   const srv = http.createServer((q, r) => { r.writeHead(200); r.end('ok'); });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const port = srv.address().port;
-  try { const r = await fetch(`http://127.0.0.1:${port}/`); return r.ok; } catch { return false; } finally { srv.close(); }
+  try { return (await getStatus(`http://127.0.0.1:${port}/`, 1500)) === 200; } finally { srv.close(); }
 }
 
 const CASES = [
