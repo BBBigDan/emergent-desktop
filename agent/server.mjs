@@ -41,6 +41,9 @@ import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
+/* 收口的三句措辞。单独一个文件是为了能**不起服务**就测住它们 ——
+   见 turnstop.mjs 开头的说明。 */
+import { finalizePrompt, closeLine, stopWord } from './turnstop.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -1080,25 +1083,7 @@ function coldAllow(goal) {
  * 几次没成。宁可说"我查了三遍都没拿到东西"，也不装作答上了。
  */
 function closeFallback(s, why) {
-  const acts = (s.acts || []).filter((a) => !a.denied);
-  const verbs = [...new Set(acts.map((a) => {
-    try { return toolLine(a.name, {}).verb; } catch { return '查了一下'; }
-  }))].slice(0, 3);
-  const bad = acts.filter((a) => !a.ok).length;
-
-  let line;
-  if (!acts.length) {
-    /* 一步都没走成：它连工具都没调。原因只可能是模型那边（空回复、被截断）。 */
-    line = '这次我没能给出回答 —— 模型返回的是空的。要我再来一次吗？';
-  } else {
-    const what = verbs.length ? `（${verbs.join('、')}）` : '';
-    const tail = why === 'slow' ? '这次太慢了，先停在这儿。'
-      : why === 'stuck' ? '我一直在查同一个地方，卡住了。'
-        : why === 'cap' ? '要接着查就说一声。'
-          : '';
-    line = `我查了 ${acts.length} 次${what}${bad ? `，其中 ${bad} 次没成` : ''}，`
-      + `但没能把这些串成答案。${tail}`;
-  }
+  const line = closeLine(s.acts || [], why);
   s.spoke = true;
   speak(s, line);
   return line;
@@ -1126,17 +1111,7 @@ function closeFallback(s, why) {
  */
 async function finalize(s, why, ctxNote, steps = 0) {
   if (s.abortCtl?.signal?.aborted) return false;
-  const reason = {
-    cap: `这一轮已经调了 ${steps} 次工具，次数到上限了。`,
-    slow: '这一轮花的时间太长了，先停在这儿。',
-    stuck: '你连着几次在调同一个工具、同一组参数，没有进展。',
-    silent: '你刚才那句话是空的，屏幕上什么都没有。',
-  }[why] || '这一轮停下来了。';
-
-  const ask = `${reason}现在不要再调工具（工具已经关掉了），`
-    + '用**已经拿到的结果**直接回答用户刚才的问题。'
-    + '如果没查到想要的，就说清楚：查了什么、拿到了什么、卡在哪一步。'
-    + '2~5 句，直接说结论。不要说抱歉，也不要解释这件事本身。';
+  const ask = finalizePrompt(why, steps);
 
   /* **这段提示不进历史。**
      它写着"工具已经关掉了" —— 真写进 s.messages，下一轮模型会以为
@@ -1175,10 +1150,10 @@ async function finalize(s, why, ctxNote, steps = 0) {
     /* 说了话就进历史。不然下一轮模型看到的是"我问了它一句、它没答"，
        会以为上一轮彻底失败了（其实它答过，只是那句话只出现在屏幕上）。 */
     s.messages.push({ role: 'assistant', content: text });
-    emit(s, { t: 'note', message: `这一轮到此为止：${({ cap: '工具次数用尽', slow: '时间到', stuck: '原地打转', silent: '模型空回复' })[why] || why}，我把结论说出来了` });
+    emit(s, { t: 'note', message: `这一轮到此为止：${stopWord(why)}，我把结论说出来了` });
   } else {
     closeFallback(s, why);
-    emit(s, { t: 'note', message: `这一轮到此为止：${({ cap: '工具次数用尽', slow: '时间到', stuck: '原地打转', silent: '模型空回复' })[why] || why}，模型没说结论，由系统说一句` });
+    emit(s, { t: 'note', message: `这一轮到此为止：${stopWord(why)}，模型没说结论，由系统说一句` });
   }
   return true;
 }

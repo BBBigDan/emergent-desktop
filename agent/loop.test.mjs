@@ -30,6 +30,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { finalizePrompt, closeLine, stopWord } from './turnstop.mjs';
+
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const ROOT = path.resolve(HERE, '..');
 const NODE = process.execPath;
@@ -165,6 +167,49 @@ async function runCase(mode) {
   };
 }
 
+/* ── 先测不依赖网络的：收口到底说什么 ──
+ *
+ * 这三句是"必须有结局"的最后一道话。它们以前埋在 server.mjs 的闭包里，
+ * 只能起一个真 server 去测 —— 而 GitHub runner 的本机回环不可靠
+ * （同一个地址 fetch 报 ECONNREFUSED、http.get 却拿到 503），
+ * 那道闸在 CI 上等于没有。搬到 turnstop.mjs 之后这里就能直接断言。
+ */
+console.log('收口说什么');
+{
+  const p1 = finalizePrompt('cap', 7);
+  ok(p1.includes('7 次'), '提示里带上"调了 7 次"（模型才知道为什么停）');
+  ok(p1.includes('不要再调工具'), '明确禁止再调工具（7B 会硬发文本形式的调用）');
+  ok(p1.includes('不要说抱歉'), '明确不要道歉（"很抱歉我无法完成"零信息）');
+  ok(p1.includes('查了什么'), '要求说清"查了什么、卡在哪"');
+  for (const w of ['cap', 'slow', 'stuck', 'silent']) {
+    ok(finalizePrompt(w).length > 10, `${w}：有对应的原因句`);
+    ok(stopWord(w) !== w, `${w}：界面上那行是人话（${stopWord(w)}）`);
+  }
+
+  /* 模型彻底不说话时：宁可说实话，也不装作答上了 */
+  const empty = closeLine([]);
+  ok(empty.includes('空的'), '一步没走成 → 说"模型返回的是空的"');
+  ok(!/记得|记忆/.test(empty), '不拿记忆顶替');
+  const some = closeLine([
+    { name: 'fs_list', ok: false }, { name: 'fs_list', ok: false }, { name: 'sys_status', ok: true },
+  ], 'cap');
+  ok(some.includes('3 次'), `说出真查了几次（${some}）`);
+  ok(some.includes('2 次没成'), '说出其中几次没成');
+  ok(!/记得|记忆/.test(some), '同样不拿记忆顶替');
+  const stuck = closeLine([{ name: 'sys_status', ok: true }], 'stuck');
+  ok(stuck.includes('卡住'), '打转时说明是卡住了');
+  /* 动词要翻成人话，不能把工具名糊上去 */
+  ok(!/fs_list|sys_status/.test(some), '不把工具名直接写给用户看');
+}
+
+/** 这个环境的本机回环通不通。不通就别测端到端了 —— 那是环境问题，不是代码问题。 */
+async function loopbackOk() {
+  const srv = http.createServer((q, r) => { r.writeHead(200); r.end('ok'); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  try { const r = await fetch(`http://127.0.0.1:${port}/`); return r.ok; } catch { return false; } finally { srv.close(); }
+}
+
 const CASES = [
   { mode: 'loop', why: '一直调工具，从不说话（用户遇到的那种）' },
   { mode: 'stuck', why: '原地打转，同一组参数调三遍' },
@@ -172,8 +217,13 @@ const CASES = [
   { mode: 'dead', why: '连"你说结论"也不理' },
 ];
 
-console.log('每一轮都必须有结局');
-for (const c of CASES) {
+console.log('每一轮都必须有结局（端到端）');
+const endToEnd = (await loopbackOk()) ? CASES : [];
+if (!endToEnd.length) {
+  console.log('  ⚠ 这个环境的本机回环不通，跳过端到端那四个用例 —— 上面那组纯逻辑已经跑过；');
+  console.log('    端到端请在本机跑 `node agent/loop.test.mjs`。');
+}
+for (const c of endToEnd) {
   const r = await runCase(c.mode);
   ok(r.up, `${c.mode}：server 起来了`,
     `exit=${r.exit === undefined ? '(还在跑)' : r.exit}  probe=${r.probe}  fetch="${r.fetchErr}"
