@@ -8,7 +8,7 @@
  *      而它实际读的是 b.txt。
  */
 
-import { toolLine, reasonLines } from './trace.mjs';
+import { toolLine, reasonLines, alike } from './trace.mjs';
 import { makeTools } from './tools.mjs';
 
 let failed = 0;
@@ -100,6 +100,17 @@ console.log('\n思考：条数与长度');
   ok(L.length === 4, `最多 4 条，实际 ${L.length}`);
   ok(L.every((x) => Array.from(x).length <= 30), `每行不超过 30 字：${L.map((x) => Array.from(x).length)}`);
   ok(reasonLines(long, 0).length === 0, 'max=0 → 空（上限是可用量的函数）');
+}
+
+console.log('\n思考：相近的两句算"说过"');
+{
+  /* 2026-10-23 线上原样：同一轮的两步里它把同一件事想了两遍，只差一个"并" */
+  ok(alike('用户问装了哪些应用，挑一个占内存最多的说说', '用户问装了哪些应用，并挑一个占内存最多的说说'),
+    '差一个字的两句 → 相似（按整句比拦不住，屏幕上会连两行一样的）');
+  ok(!alike('用户问装了哪些应用', 'n8n 占内存最多：355MB，2.2%节点'), '不同的事 → 不相似');
+  ok(!alike('n8n 占内存最多', '所有应用都正常'), '短句也不许乱判');
+  ok(alike('好的', '好的'), '完全相同 → 相似');
+  ok(!alike('', '任意一句'), '空串不跟任何东西相似（否则第一句会被自己吃掉）');
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');

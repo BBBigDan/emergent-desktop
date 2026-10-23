@@ -219,3 +219,29 @@ export function reasonLines(thinking, max = 4) {
   }
   return out;
 }
+
+/** 两句"说的是不是同一件事"：按 2-gram 集合的 Jaccard 比。
+ *
+ *  为什么要它：线上实测（2026-10-23）同一个模型在不同步里会想
+ *  「用户问装了哪些应用，**挑**一个占内存最多的说说」和
+ *  「用户问装了哪些应用，**并挑**一个占内存最多的说说」—— 差一个字，
+ *  按整句去重拦不住，屏幕上就是连着两行几乎一样的话，看起来像卡住了。
+ *
+ *  用 2-gram 而不是按字数前缀：中文差一个字往往就在中间（"挑" / "并挑"），
+ *  前缀法要么漏（取 12 字）要么误杀（取 8 字会把"装了哪些应用"和
+ *  "装了哪些工具"判成同一句）。
+ */
+export function alike(a, b) {
+  const gram = (s) => {
+    const ch = Array.from(String(s || '').replace(/[\s，。、；：！？,.;:!?]/g, ''));
+    const out = new Set();
+    for (let i = 0; i + 1 < ch.length; i++) out.add(ch[i] + ch[i + 1]);
+    return out;
+  };
+  const A = gram(a);
+  const B = gram(b);
+  if (!A.size || !B.size) return false;
+  let hit = 0;
+  for (const g of A) if (B.has(g)) hit++;
+  return hit / (A.size + B.size - hit) >= 0.72;
+}

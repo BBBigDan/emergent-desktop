@@ -36,7 +36,7 @@ import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
-import { toolLine, cut, reasonLines } from './trace.mjs';
+import { toolLine, cut, reasonLines, alike } from './trace.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -1221,7 +1221,10 @@ async function runTurn(s, goal) {
       const budget = Math.min(2, 8 - s.reasonN);
       const lines = budget > 0 ? reasonLines(out.thinking, budget) : [];
       for (const ln of lines) {
-        if (s.reasonSeen.has(ln)) continue;
+        /* 判"说过类似的话"而不是"说过同一句话"：实测同一个模型会在不同步里想
+           「…应用，挑一个占内存最多…」和「…应用，并挑一个占内存最多…」——
+           差一个字，按整句比拦不住，屏幕上连着两行几乎一样的话看着像卡住。 */
+        if ([...s.reasonSeen].some((old) => alike(old, ln))) continue;
         s.reasonSeen.add(ln);
         s.reasonN += 1;
         trace(s, 'reason', { text: ln });
