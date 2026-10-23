@@ -287,6 +287,9 @@ const _esc = () => {
     if (agent.closeSurface?.()) return;
     /* 换模型那张表在最上层：它从状态条长出来，盖住了名字本身。
        顺序错了的表现是"按 Esc，玻璃还在那儿"。 */
+    /* 设置在最上层（从状态条长出来的那块）。它里面可能有没保存的输入，
+       所以 Esc 收它和收别的玻璃是同一种语义：收起，不是丢弃。 */
+    if (agent.closeSettings?.()) return;
     if (agent.closePicker?.()) return;
     /* 「思考过程」是浮在场上的第二块（§7.5）：它盖着正文头两行，先收它 */
     if (agent.closeTrace?.()) return;

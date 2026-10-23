@@ -130,6 +130,39 @@ const PLATFORM = [
   },
 ];
 
+/* ───────────────────── 自定义接口（设置页加的那些） ─────────────────────
+ *
+ * 这一组和上面两组都不一样：**能力不是我们测出来的，是"不知道"。**
+ *
+ * 用户从设置页填进来一个地址（自己的中转站、公司内网、某个兼容网关），
+ * 我们只做一件事：把它列出来、把 id 翻译成"发到哪个 baseURL"。至于那个模型
+ * 会不会想、会不会调工具 —— 没跑过就是没跑过，表里如实写 `?`。
+ * 按名字猜的代价踩过：标着"会想"，结果那栏里一个字都没有。
+ *
+ * 表本身不读 `settings.mjs`（那是另一个方向），由 server 在启动和保存后注入。
+ * 这样 `models.mjs` 仍然是"纯粹算一张表"的模块，自测不用起服务、不用碰磁盘。
+ */
+let CUSTOM = [];
+export function setCustomProviders(list) {
+  CUSTOM = Array.isArray(list) ? list : [];
+}
+
+/** 自定义接口的 id 形状：`x/<providerId>/<model 名>`。model 里可以有 `/`。 */
+const X_PREFIX = 'x/';
+
+function parseCustom(id) {
+  const s = String(id || '');
+  if (!s.startsWith(X_PREFIX)) return null;
+  const rest = s.slice(X_PREFIX.length);
+  const i = rest.indexOf('/');
+  if (i < 0) return null;
+  const pid = rest.slice(0, i);
+  const model = rest.slice(i + 1);
+  if (!pid || !model) return null;
+  const p = CUSTOM.find((x) => x.id === pid);
+  return p ? { p, model } : null;
+}
+
 /* 离线桩。它不是"本地模型"，但它是唯一**一定存在**的本地那个 ——
    没网、没 key、要复现一次协议问题时，它比任何真模型都可靠。 */
 const MOCK = {
@@ -329,6 +362,24 @@ export async function catalog(o = {}) {
            而点下去只会得到一个 400。 */
         models: PLATFORM.map((m) => decorate(m, ids, { blocked: sfKey() ? null : '没配 MODEL_KEY' })),
       },
+      /* 只在用户真配过的时候才出现：空着一组会让"设置"看起来没生效 */
+      ...(CUSTOM.length ? [{
+        key: 'custom',
+        label: '自定义',
+        note: `你自己配的接口 · ${CUSTOM.length} 个`,
+        empty: null,
+        models: CUSTOM.flatMap((p) => p.models.map((m) => decorate({
+          id: `${X_PREFIX}${p.id}/${m}`,
+          name: m,
+          org: p.name,
+          /* 没测过就写 null（界面上是 `?`），不按名字猜 */
+          think: null,
+          tools: null,
+          cost: 'custom',
+          speed: null,
+          note: p.baseURL,
+        }, null))),
+      }] : []),
     ],
     at: Date.now(),
   };
@@ -346,6 +397,12 @@ export async function findModel(id) {
     const m = local.models.find((x) => x.id === s);
     return m ? decorate(m, null) : null;
   }
+  /* 自定义接口：设置页把这条删掉之后，这里就该返回 null ——
+     否则会话里存着的 modelId 会让它继续发往一个已经不存在的地址。 */
+  const x = parseCustom(s);
+  if (x) return decorate({
+    id: s, name: x.model, org: x.p.name, think: null, tools: null, cost: 'custom', note: x.p.baseURL,
+  }, null);
   return null;
 }
 
@@ -357,6 +414,13 @@ export function routeOf(id) {
   const s = String(id || DEFAULT_MODEL);
   if (s === 'mock') return { kind: 'mock', model: s };
   if (s.startsWith('local/')) return { kind: 'openai', model: s.slice('local/'.length), baseURL: localBase(), apiKey: localKey() };
+  const x = parseCustom(s);
+  if (x) {
+    /* 适配器要求 key 非空（它无条件拼 `Authorization`），而不少自建网关
+       根本不校验 —— 所以没填 key 时给一个占位，而不是抛"缺少 MODEL_KEY"。
+       那个错误会让用户以为"设置没生效"，其实设置是对的。 */
+    return { kind: 'openai', model: x.model, baseURL: x.p.baseURL, apiKey: x.p.apiKey || 'not-needed' };
+  }
   return { kind: 'openai', model: s, baseURL: sfBase(), apiKey: sfKey() };
 }
 

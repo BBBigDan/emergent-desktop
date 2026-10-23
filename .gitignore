@@ -37,6 +37,9 @@ agent/sessions/
 # ---- token 日账本（本地跑出来的用量，一天一个文件）----
 agent/usage/
 
+# ---- 设置（本地跑出来的：自定义接口 / 提示词。里面有 key）----
+agent/config/
+
 # ---- 长期记忆（本地跑出来的库与快照）----
 agent/memory/
 agent/.tools/

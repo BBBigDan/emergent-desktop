@@ -26,6 +26,7 @@ import { createHalo } from './halo.js';
 import { createAgentBar } from './agentbar.js';
 import { createTrace } from './trace.js';
 import { createModelPicker } from './modelpick.js';
+import { createSettings } from './settings.js';
 import { createTraceFrame } from './traceframe.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
@@ -69,6 +70,17 @@ function escapeHTML(s) {
  * @param {(open:boolean)=>void} [o.onOpenChange] 展开/收起时通知桌面（收拢元素、降权窗口）
  */
 export function createDeskAgent({ field, onOpenChange } = {}) {
+  /* 接口一律走根绝对路径 `/agent/api/*`。
+   *
+   * 相对路径只在"页面正好挂在 /agent/ 下面"时才对（agent.html 就是）。
+   * 但这一层是**桌面**：浏览器地址是 desktop.<id>.olares.com 的 `/`，
+   * 相对的 `api/send` 会被解析成 `/api/send`，然后被壳层 nginx 原样反代回
+   * 官方的 olares-app:91 —— 返回 404，EventSource 一直重连，
+   * 表现就是"场展开了，但永远停在 connecting"。
+   *
+   * 定义提到函数体最前面：设置面板创建时就要用它（放在下面会撞 TDZ）。 */
+  const API = '/agent/api';
+
   /* 「思考过程」那一栏的 DOM。它必须在**最前面**建：DOM 骨架那一段就要把它
      挂进 layer，而 `let` 在函数体里是有 TDZ 的 —— 声明写在下面会让整个模块
      在加载时报 "Cannot access 'trace' before initialization"（踩过，
@@ -146,6 +158,41 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   barModel.addEventListener('click', (e) => {
     e.stopPropagation();
     togglePicker();
+  });
+
+  /* ───────────────── 设置（接口 / 提示词 / 行为） ─────────────────
+   *
+   * 换模型那张表只覆盖"已经写在表里的那些"。真正只能改 .env 再重启的还有三件：
+   * 加一个新的 API 地址、改系统提示词、调温度和步数。这块面板就是它们。
+   *
+   * 它和「思考过程」、换模型表**互斥**，而且共用同一个粒子框（框只有一个：
+   * 它画的是"哪块空间被圈住了"，不是某一栏的装饰）。
+   *
+   * 它是这三块玻璃里唯一有**真输入框**的一块 —— 所以它比另外两块更怕两件事：
+   * 指针没打开（点了没反应）、以及整块重渲染（打字打到一半焦点丢了）。
+   * 两条都在 settings.js 里写死了做法。
+   */
+  const settings = createSettings({
+    api: API,
+    /* 表回来后（或切 tab 后）高度会变，框跟着重画 */
+    onResize: () => { if (settings.isOpen()) frameToSettings(); },
+    onClose: () => { closeSettings(); },
+    onSaved: () => {
+      /* 加了接口 → 换模型那张表要现取一份，否则"加了但列表里没有" */
+      pickerData = null;
+      if (picker.isOpen()) loadModels(true);
+      insp('set', '设置已保存');
+    },
+  });
+  layer.appendChild(settings.el);
+
+  const setBtn = el('button', 'ag-set-btn', '设置');
+  setBtn.type = 'button';
+  setBtn.title = '接口 / 提示词 / 温度';
+  layer.appendChild(setBtn);
+  setBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSettings();
   });
   /* 状态区常驻（§3 的第一句）。观察窗和提示行仍旧只在 ?dev=1 出现 */
   if (!DEV) { inspEl.hidden = true; hintEl.hidden = true; }
@@ -253,6 +300,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (!trace || trace.isOpen() || !open) return;
     clearTimeout(traceTimer);
     traceTimer = 0;
+    /* 框只有一个：谁要开，另一块玻璃就让位 */
+    if (settings.isOpen()) closeSettings({ focus: false });
     /* 框可能还停在换模型表面上（几何是那一块的），开之前先挪回来 */
     frameToTrace();
     trace.open({ toTop });
@@ -283,9 +332,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   /* 点面板以外的地方就收起它：没有遮罩层，就不该有"点哪儿都关不掉"的感觉 */
   addEventListener('pointerdown', (e) => {
-    if (!picker.isOpen()) return;
-    if (e.target instanceof Element && e.target.closest('.ag-mp, .ag-model')) return;
-    closePicker();
+    /* 两块玻璃都问一遍。**设置里还有点输入框**，所以这里的 closest 要带上
+       `.ag-set` —— 少了它，点一下面板里的空白处整个面板就关了。 */
+    if (!picker.isOpen() && !settings.isOpen()) return;
+    const inside = e.target instanceof Element
+      && e.target.closest('.ag-mp, .ag-model, .ag-set, .ag-set-btn');
+    if (inside) return;
+    if (settings.isOpen()) closeSettings({ focus: false });
+    if (picker.isOpen()) closePicker();
   });
 
   /** 点小脸：开着就收，收着就开（再看一遍刚才的经过） */
@@ -360,8 +414,24 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return true;
   }
 
+  /* 设置面板那块的框。和换模型表同一条：外面留 8px、没有牵引线
+     （它也从状态条上长出来，就在那个入口的正下方）。 */
+  function frameToSettings() {
+    const r = settings.rect();
+    if (!r || !r.w || !r.h) return false;
+    const m = 8;
+    tframe?.layout({
+      x: Math.round(r.x - m), y: Math.round(r.y - m),
+      w: Math.round(r.w + 2 * m), h: Math.round(r.h + 2 * m),
+      anchor: null,
+    });
+    return true;
+  }
+
   function openPicker({ force = false } = {}) {
     if (!open) return;
+    /* 设置面板让位：框只有一个，两块玻璃叠着谁也读不清 */
+    if (settings.isOpen()) closeSettings({ focus: false });
     /* 先收那一栏：它和新面板抢同一块地方，而且它的框会从玻璃边缘漏出来。
        **不设 tracePinned** —— 是"让位"，不是"用户关掉了它"；这一轮要是还在跑，
        后面那条 `think` 会把它放回来（但那时面板已经让位了）。 */
@@ -393,6 +463,42 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   function togglePicker() {
     if (picker.isOpen()) { closePicker(); return; }
     openPicker();
+  }
+
+  /* ── 设置的开合 ──
+   *
+   * 和换模型同一套：框先挪过去**再**亮（在 level=0 时改几何什么都看不出来），
+   * 收的时候**只有这一个出口**（收玻璃 + 收框 + 还焦点）。三条路各写各的
+   * 关闭逻辑，就会留下一块亮着的框（换模型表踩过）。
+   */
+  function openSettings() {
+    if (!open || settings.isOpen()) return;
+    /* 让位：思考过程那栏和换模型表都收掉 —— 框只有一个 */
+    if (picker.isOpen()) closePicker();
+    if (trace?.isOpen()) { tracePinned = true; closeTrace(); }
+    /* 位置**不跟那个按钮走**，而是和另外两块玻璃同一列（内容区左边界）。
+       跟着按钮走的话它会贴在屏幕最右边 —— 而这块屏的全部内容都在左边这一列，
+       一块 560px 宽的玻璃孤零零地挂在右上角，读起来像一张弹窗。 */
+    const a = contentArea();
+    settings.openAt({ left: a.x, bottom: barEl.getBoundingClientRect().bottom });
+    if (frameToSettings()) { tframe?.setHint(false); tframe?.setOpen(true); }
+    setBtn.classList.add('on');
+  }
+
+  /** @param {{focus?:boolean}} [o] 整层收起时 focus=false，别把光标塞回输入行 */
+  function closeSettings({ focus = true } = {}) {
+    const was = settings.close();
+    setBtn.classList.remove('on');
+    if (!was) return false;
+    tframe?.setOpen(false);
+    tframe?.setHint(hasTraceRows() && !trace?.isOpen());
+    if (focus) typeEl.focus();
+    return true;
+  }
+
+  function toggleSettings() {
+    if (settings.isOpen()) closeSettings();
+    else openSettings();
   }
 
   /* ───────────────── 渲染树（DOM 内容） ─────────────────
@@ -692,17 +798,20 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     barEl.style.left = `${a.x}px`;
     barEl.style.top = '20px';
     barEl.style.width = `${a.w}px`;
-    barEl.style.paddingRight = '128px';   // 右端让出记录/停止两个图标位
+    barEl.style.paddingRight = '184px';   // 右端让出「记录/停止」+「设置」两个入口
     /* 粒子状态条和 DOM 那一行同一个起点同一条基线（38 = top 20 + 行高的一半）。
        DOM 现在是透明的，只负责悬停和 tooltip。 */
     abar?.layout({ x: a.x, y: 38 });
     halo?.layout(haloGeom());
 
-    /* 记录 / 停止：状态区右端，不再挂在场角 —— 那里在答案铺开后会被字压住 */
+    /* 记录 / 停止：状态区右端，不再挂在场角 —— 那里在答案铺开后会被字压住。
+       设置再往右一格：它常驻，记录只在有话可翻时出现，常驻那个该在最边上。 */
     histBtn.style.top = '24px';
-    histBtn.style.right = '40px';
+    histBtn.style.right = '96px';
     stopBtn.style.top = histBtn.style.top;
     stopBtn.style.right = histBtn.style.right;
+    setBtn.style.top = '24px';
+    setBtn.style.right = '40px';
 
     /* 「思考过程」那一栏：粒子框和小脸同一个锚点，面板比框内缩 8px。
        两处都要排：只排 DOM 的话，框会留在"上一次 area 的位置"（换分栏时
@@ -1049,15 +1158,6 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   let es = null;
 
-  /* 接口一律走根绝对路径 `/agent/api/*`。
-   *
-   * 相对路径只在"页面正好挂在 /agent/ 下面"时才对（agent.html 就是）。
-   * 但这一层是**桌面**：浏览器地址是 desktop.<id>.olares.com 的 `/`，
-   * 相对的 `api/send` 会被解析成 `/api/send`，然后被壳层 nginx 原样反代回
-   * 官方的 olares-app:91 —— 返回 404，EventSource 一直重连，
-   * 表现就是"场展开了，但永远停在 connecting"。 */
-  const API = '/agent/api';
-
   function send(msg) {
     return fetch(`${API}/send`, {
       method: 'POST',
@@ -1220,6 +1320,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         break;
       }
 
+      /* 别的标签页保存了设置：这块面板开着就重新读一遍（没改动才覆盖，
+         见 settings.js 的 refresh）。不处理的话，同一个账号两个窗口会看到两份值。 */
+      case 'settings':
+        settings.refresh();
+        break;
+
       case 'resume':
         /* 不是"重新长一遍"：用户没有发起任何事，画面应该已经在那儿 */
         if (m.log?.length) { log = m.log.slice(-40); histBtn.hidden = false; if (histOpen) renderHist(); }
@@ -1243,6 +1349,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         /* 开始说话了，那张表就该收：框只有一个，turn 会把框交给「思考过程」，
            面板留在屏幕上就成了一块没有框的玻璃。 */
         if (picker.isOpen()) closePicker();
+        if (settings.isOpen()) closeSettings({ focus: false });
         setBusy(true);
         /* 新问题 = 上一屏作废（进"在想"时屏幕上只该有问 + 环）。
            放在 turn 而不是只放 submit：手势回合也要走这里，而 adjust 不清。 */
@@ -1772,6 +1879,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   function pickAt(x, y) {
     /* 两块玻璃都先问一遍：盖住的地方**不许**产生任何意图 ——
        否则在面板上拖一下，会把背后的仪表拖走（踩过）。 */
+    if (settings.hit(x, y)) return null;
     if (picker.hit(x, y)) return null;
     if (trace?.hit(x, y)) return null;
     return scene.hit(x, y) || faceHit(x, y);
@@ -1850,7 +1958,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (!open) return;
     if (gt.g?.moved) return;
     /* 面板上不换光标：它自己那层的 cursor 更准确（滚动的区域就是滚动的样子） */
-    if (picker.hit(e.clientX, e.clientY) || trace?.hit(e.clientX, e.clientY)) {
+    if (settings.hit(e.clientX, e.clientY) || picker.hit(e.clientX, e.clientY)
+      || trace?.hit(e.clientX, e.clientY)) {
       document.body.style.cursor = 'default';
       return;
     }
@@ -1970,6 +2079,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     field.setAgentMode(false);
     closeSurface();
     closePicker({ focus: false });
+    closeSettings({ focus: false });
     clearTimeout(drawTimer);
     drawTimer = 0;
     drawLine = '';
@@ -2094,6 +2204,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 注意调的是**本地那个函数**，不是 picker.close()：框的收放写在里面。
        直接调 picker.close() 的话玻璃没了、框还亮着（自测里就是这么发现的）。 */
     closePicker: () => closePicker(),
+    /** 设置在最上层（z-index 9）。Esc 先问它 —— 顺序错了的表现是"按 Esc，玻璃还在" */
+    closeSettings: () => closeSettings(),
     /** 「思考过程」是第二层浮窗（在记录之下、场之上）。活着就先收它 */
     closeTrace: () => {
       if (!trace?.isOpen()) return false;
@@ -2143,6 +2255,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     }),
     /* 自测：直接点名开合（DOM click 走不了合成事件，见 tools/dev 那套 CDP 的坑） */
     toggleModelPicker: () => { togglePicker(); return picker.isOpen(); },
+    /* 自测：点状态条右端那个「设置」（走真的 click 监听，和用户点下去同一条路） */
+    tapSettings: () => { setBtn.click(); return settings.isOpen(); },
+    settingsState: () => settings.debug(),
+    toggleSettings: () => { toggleSettings(); return settings.isOpen(); },
     drag: (id, dx, dy) => {
       const h = scene?.layers.get(id)?.hot;
       if (!h) return false;

@@ -295,6 +295,11 @@ spec:
             - name: state
               mountPath: /app/agent/usage
               subPath: usage
+            # 设置（自定义接口 + 提示词 + 温度）。和会话/账本同一个理由：
+            # 它是**用户配的东西**，换个 tag 就该还在。里面还有 key（0600）。
+            - name: state
+              mountPath: /app/agent/config
+              subPath: config
             - name: state
               mountPath: /app/state/home
               subPath: home

@@ -132,7 +132,7 @@ say "  $HOME_PATH"
 # 这两个目录改成挂 $STATE_DIR。不搬的话：token 账本清零，看起来像"用量丢了"。
 # 只在目标为空时搬 —— 不能覆盖新版已经写出来的东西。
 say "迁移会话/用量（如果还有旧的 hostPath 数据）"
-"${SSH[@]}" "mkdir -p '$STATE_DIR'
+"${SSH[@]}" "mkdir -p '$STATE_DIR' '$STATE_DIR'/config
   for D in sessions usage; do
     SRC=/olares/emergent-desktop/app/agent/\$D
     if [ -d \"\$SRC\" ] && [ -z \"\$(ls -A '$STATE_DIR'/\$D 2>/dev/null)\" ]; then

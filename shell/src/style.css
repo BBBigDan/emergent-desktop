@@ -829,3 +829,269 @@ body.agent-open .stat-zone { pointer-events: none; }
   transition: opacity 0.3s ease, transform 0.3s ease;
 }
 .ag-tip.in { opacity: 1; transform: none; }
+
+/* ── 设置面板（settings.js） ──
+ *
+ * 同一套材质、同一条规矩：**它就是屏幕上一块被粒子围住的空间**，不是网页里的
+ * 设置页。所以照样是 0.8 的黑玻璃 + 模糊，外面那圈框由 deskagent 挪过来
+ * （框只有一个：设置 / 换模型 / 思考过程 三者共用）。
+ *
+ * 但它是这块屏幕上**唯一有真输入框**的地方（思考过程是只读的，换模型表只有按钮）。
+ * 输入框要能选中、要有光标、要支持输入法 —— 所以这里的字是 DOM 的字，
+ * 而它的"边界"由那圈粒子负责表达。
+ */
+.ag-set {
+  position: fixed; z-index: 9;
+  /* 和换模型表同一个坑：祖先是 pointer-events:none，不自己打开就"看得见、点不动" */
+  pointer-events: auto;
+  display: flex; flex-direction: column; min-height: 0;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(6, 11, 18, 0.88) 0%, rgba(5, 9, 15, 0.82) 100%);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  box-shadow: 0 20px 52px rgba(0, 0, 0, .5);
+  opacity: 0; transform: translateY(-5px) scale(0.994);
+  transition: opacity .18s ease, transform .18s ease;
+  user-select: none; cursor: default;
+  font: 12px/1.5 ui-monospace, Menlo, "Cascadia Mono", monospace;
+  color: rgba(226, 238, 252, .92);
+}
+.ag-set.in { opacity: 1; transform: none; }
+.ag-set[hidden] { display: none; }
+
+.as-hd {
+  display: flex; align-items: center; gap: 8px;
+  height: 32px; padding: 0 8px 0 12px; flex: 0 0 auto;
+  border-bottom: 1px solid rgba(120, 170, 230, .07);
+}
+.as-title { font-size: 10.5px; font-weight: 400; letter-spacing: .16em; color: rgba(158, 196, 230, .62); }
+.as-meta {
+  margin-left: auto; font: 10px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  color: rgba(147, 184, 216, .3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 210px;
+}
+.as-x {
+  flex: 0 0 auto; width: 20px; height: 20px;
+  background: none; border: 0; border-radius: 6px;
+  color: rgba(147, 184, 216, .42); font-size: 14px; line-height: 1; cursor: pointer;
+  transition: color .2s, background .2s;
+}
+.as-x:hover { color: rgba(226, 238, 252, .9); background: rgba(120, 170, 230, .1); }
+
+/* 三块。用下划线而不是"胶囊按钮"：这一层没有按钮的图形，只有字和一条亮线 */
+.as-tabs { display: flex; gap: 16px; padding: 9px 14px 0; flex: 0 0 auto; }
+.as-tab {
+  background: none; border: 0; padding: 0 0 7px; cursor: pointer;
+  font: 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .1em;
+  color: rgba(147, 184, 216, .42);
+  border-bottom: 1px solid transparent;
+  transition: color .18s, border-color .18s;
+}
+.as-tab:hover { color: rgba(190, 225, 255, .78); }
+.as-tab.on { color: rgba(127, 227, 207, .92); border-bottom-color: rgba(127, 227, 207, .5); }
+
+.as-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 12px 14px 4px;
+  scrollbar-width: thin;
+}
+.as-body::-webkit-scrollbar { width: 6px; }
+.as-body::-webkit-scrollbar-thumb { background: rgba(120, 170, 230, .16); border-radius: 4px; }
+
+.as-sec { display: flex; flex-direction: column; gap: 9px; }
+.as-intro { margin: 0; font-size: 10.5px; line-height: 1.65; color: rgba(147, 184, 216, .48); }
+.as-warn {
+  margin: 0; font-size: 10.5px; line-height: 1.65;
+  color: rgba(255, 196, 120, .72);
+  border-left: 2px solid rgba(255, 196, 120, .3); padding-left: 8px;
+}
+.as-hint2 { font-size: 10px; line-height: 1.6; color: rgba(147, 184, 216, .34); }
+
+/* 一条接口 = 一张卡片。卡片的边**很轻**：重了会变成"表单"，
+   而这块玻璃本身已经有边界了，里面的分组只需要一点呼吸缝。 */
+.as-card {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 9px 10px 10px; border-radius: 10px;
+  background: rgba(148, 190, 235, .03);
+  box-shadow: inset 0 0 0 1px rgba(120, 170, 230, .08);
+}
+.as-card-hd { display: flex; align-items: center; gap: 6px; }
+/* 名字框要 flex 收放，不能靠 width:100% —— 那样它会把「删掉」挤出卡片右边界，
+   而溢出的部分在玻璃上看起来像"这行没排好"。 */
+.as-card-hd .as-in { flex: 1 1 auto; width: auto; min-width: 0; }
+.as-del {
+  flex: 0 0 auto; background: none; border: 0; padding: 2px 4px; cursor: pointer;
+  font: 10px/1 ui-monospace, Menlo, monospace; letter-spacing: .06em;
+  color: rgba(147, 184, 216, .3); transition: color .18s;
+}
+.as-del:hover { color: rgba(255, 124, 147, .85); }
+
+.as-f { display: flex; flex-direction: column; gap: 4px; position: relative; }
+.as-fl { font-size: 10px; letter-spacing: .12em; color: rgba(147, 184, 216, .4); }
+.as-in {
+  width: 100%; box-sizing: border-box;
+  padding: 6px 8px; border-radius: 7px;
+  background: rgba(255, 255, 255, .028);
+  border: 1px solid rgba(120, 170, 230, .13);
+  color: rgba(232, 246, 255, .94);
+  font: 12px/1.5 ui-monospace, Menlo, "Cascadia Mono", monospace;
+  outline: 0; user-select: text;
+  transition: border-color .18s, background .18s;
+}
+.as-in::placeholder { color: rgba(147, 184, 216, .26); }
+.as-in:focus { border-color: rgba(127, 227, 207, .38); background: rgba(127, 227, 207, .04); }
+.as-in-name { font-size: 12.5px; letter-spacing: .02em; }
+/* 「测一下」「清掉」是绝对定位在框内的，长地址会从按钮底下穿过去 ——
+   留出它们的宽度。地址那个按钮更宽（三个字），所以留得多一些。 */
+.as-f .as-in[placeholder^="https"] { padding-right: 66px; }
+.as-f .as-in[type="password"] { padding-right: 44px; }
+.as-ta { min-height: 118px; resize: vertical; line-height: 1.65; }
+.as-ta-model { min-height: 44px; resize: vertical; line-height: 1.6; }
+.as-ta-big { min-height: 240px; }
+
+/* 「测一下」挂在地址那一行的右边 —— 它测的是**这一行**，位置就该在同一行 */
+.as-f .as-test {
+  position: absolute; right: 5px; bottom: 5px;
+  background: rgba(127, 227, 207, .07); border: 0; border-radius: 6px;
+  padding: 3px 7px; cursor: pointer;
+  font: 10px/1.4 ui-monospace, Menlo, monospace; letter-spacing: .08em;
+  color: rgba(127, 227, 207, .72);
+  transition: background .18s, color .18s;
+}
+.as-f .as-test:hover { background: rgba(127, 227, 207, .14); color: rgba(160, 240, 220, .98); }
+.as-f .as-test:disabled { opacity: .45; cursor: default; }
+
+/* 「清掉」key：小字，不是按钮 —— 它是个罕见动作，不该长得像主操作 */
+.as-f .as-clear {
+  position: absolute; right: 6px; bottom: 5px;
+  background: none; border: 0; padding: 2px 4px; cursor: pointer;
+  font: 10px/1 ui-monospace, Menlo, monospace;
+  color: rgba(147, 184, 216, .3); transition: color .18s;
+}
+.as-f .as-clear:hover { color: rgba(255, 124, 147, .8); }
+.as-f .as-clear[hidden] { display: none; }
+
+.as-res { font-size: 10px; line-height: 1.6; color: rgba(147, 184, 216, .34); min-height: 15px; }
+.as-res[data-k="ok"] { color: rgba(127, 227, 207, .72); }
+.as-res[data-k="err"] { color: rgba(255, 124, 147, .78); }
+
+.as-empty {
+  padding: 14px 10px; border-radius: 10px; text-align: center;
+  font-size: 10.5px; line-height: 1.7; color: rgba(147, 184, 216, .34);
+  box-shadow: inset 0 0 0 1px rgba(120, 170, 230, .07);
+}
+.as-add {
+  align-self: flex-start; margin-top: 2px;
+  background: none; border: 0; padding: 3px 0; cursor: pointer;
+  font: 11px/1.6 ui-monospace, Menlo, monospace; letter-spacing: .06em;
+  color: rgba(127, 227, 207, .62); transition: color .18s;
+}
+.as-add:hover { color: rgba(160, 240, 220, .96); }
+
+/* 模式切换：两个词，选中的那个亮一线。**没有滑块、没有胶囊** */
+.as-seg { display: flex; gap: 14px; }
+.as-sg {
+  background: none; border: 0; padding: 0 0 5px; cursor: pointer;
+  font: 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .05em;
+  color: rgba(147, 184, 216, .38);
+  border-bottom: 1px solid transparent;
+  transition: color .18s, border-color .18s;
+}
+.as-sg:hover { color: rgba(190, 225, 255, .72); }
+.as-sg.on { color: rgba(232, 246, 255, .92); border-bottom-color: rgba(127, 227, 207, .42); }
+
+.as-count { font-size: 10px; color: rgba(147, 184, 216, .38); }
+.as-link {
+  align-self: flex-start; background: none; border: 0; padding: 2px 0; cursor: pointer;
+  font: 10.5px/1.6 ui-monospace, Menlo, monospace;
+  color: rgba(147, 184, 216, .45); text-decoration: underline;
+  text-decoration-color: rgba(147, 184, 216, .22); text-underline-offset: 3px;
+}
+.as-link:hover { color: rgba(190, 225, 255, .8); }
+
+.as-det { margin-top: 2px; }
+.as-sum {
+  font-size: 10.5px; color: rgba(147, 184, 216, .42); cursor: pointer;
+  list-style: none; padding: 3px 0;
+}
+.as-sum::-webkit-details-marker { display: none; }
+.as-sum::before { content: '· '; color: rgba(127, 227, 207, .5); }
+.as-sum:hover { color: rgba(190, 225, 255, .78); }
+.as-pre {
+  margin: 6px 0 0; padding: 8px 9px; max-height: 230px; overflow: auto;
+  border-radius: 8px; background: rgba(0, 0, 0, .22);
+  font: 10px/1.7 ui-monospace, Menlo, monospace;
+  color: rgba(147, 184, 216, .52); white-space: pre-wrap; word-break: break-word;
+  user-select: text;
+}
+
+/* 滑块那两行：左边标签、右边当前值 —— 值必须跟着动，否则用户不知道拖到哪了 */
+.as-f-sl { gap: 6px; }
+.as-fl-row { display: flex; align-items: baseline; gap: 8px; }
+.as-num { margin-left: auto; font-size: 11px; font-weight: 400; color: rgba(127, 227, 207, .85); }
+/* 滑块。`accent-color` 在 Chrome 上会给整条轨道上色 —— 在这块黑玻璃上
+   就是一根白色荧光棒，比屏幕里任何东西都亮。所以自己画：细轨 + 一颗青点。 */
+.as-range {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 14px; margin: 2px 0 0;
+  background: transparent; cursor: pointer;
+}
+.as-range::-webkit-slider-runnable-track {
+  height: 3px; border-radius: 2px; background: rgba(147, 184, 216, .16);
+}
+.as-range::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 11px; height: 11px; margin-top: -4px; border-radius: 6px;
+  background: #7fe3cf; box-shadow: 0 0 9px rgba(127, 227, 207, .5);
+}
+.as-range::-moz-range-track {
+  height: 3px; border-radius: 2px; background: rgba(147, 184, 216, .16);
+}
+.as-range::-moz-range-thumb {
+  width: 11px; height: 11px; border: 0; border-radius: 6px;
+  background: #7fe3cf; box-shadow: 0 0 9px rgba(127, 227, 207, .5);
+}
+.as-ro { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; }
+.as-ro-row { display: flex; gap: 10px; font-size: 10px; }
+.as-ro-row span { flex: 0 0 62px; color: rgba(147, 184, 216, .34); }
+.as-ro-row em {
+  flex: 1 1 auto; min-width: 0; font-style: normal;
+  color: rgba(147, 184, 216, .5);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  user-select: text;
+}
+
+.as-foot {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  min-height: 38px; padding: 7px 12px 9px;
+  border-top: 1px solid rgba(120, 170, 230, .06);
+}
+/* 状态行**允许两行**。它要说的是"存哪儿了、几个会话生效了、地址被我怎么改了"——
+   截成一行省略号之后，最有用的那半句（地址的修正）正好被切掉。 */
+.as-status {
+  flex: 1 1 auto; min-width: 0; max-height: 3em;
+  font-size: 10.5px; line-height: 1.45; color: rgba(147, 184, 216, .42);
+  overflow: hidden; white-space: normal; word-break: break-word;
+}
+.as-status[data-k="ok"] { color: rgba(127, 227, 207, .78); }
+.as-status[data-k="err"] { color: rgba(255, 124, 147, .82); white-space: normal; }
+.as-save {
+  flex: 0 0 auto;
+  background: rgba(127, 227, 207, .1); border: 0; border-radius: 7px;
+  padding: 6px 14px; cursor: pointer;
+  font: 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .12em;
+  color: rgba(160, 240, 220, .92);
+  transition: background .18s, color .18s, opacity .18s;
+}
+.as-save:hover { background: rgba(127, 227, 207, .18); }
+.as-save:disabled { opacity: .4; cursor: default; }
+
+/* 状态条右端那个入口。**它也是一个字**，不是齿轮图标 ——
+   这一层不出现按钮的图形（见 .ag-hist-btn 的同一条理由）。 */
+.ag-set-btn {
+  position: fixed; z-index: 5; pointer-events: auto; cursor: pointer;
+  background: transparent; border: 0; padding: 3px 2px;
+  font: 10.5px/1 ui-monospace, Menlo, monospace; letter-spacing: .14em;
+  color: rgba(147, 184, 216, .24); transition: color .2s;
+}
+.ag-set-btn:hover, .ag-set-btn.on { color: rgba(190, 225, 255, .66); }

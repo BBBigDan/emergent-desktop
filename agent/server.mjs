@@ -30,8 +30,16 @@ import { createOpenAIModel } from './model.openai.mjs';
 /* "能换的模型"那张表（含默认模型、单价、本地发现）。默认模型这个常数
    只在 `models.mjs` 里写一次 —— 这里以前也抄了一份，换模型时漏改，
    日志打得像"改了没生效"。 */
-import { DEFAULT_MODEL, catalog, findModel, routeOf } from './models.mjs';
-import { buildSystemPrompt, FORGE_GUIDE } from './prompt.mjs';
+import {
+  DEFAULT_MODEL, catalog, findModel, routeOf, setCustomProviders, _resetCache as resetModelCache,
+} from './models.mjs';
+import { buildSystemPrompt, FORGE_GUIDE, systemPrompt } from './prompt.mjs';
+/* 设置（`settings.json`）：用户在界面上能改的那几件事 —— 额外的接口地址、
+   系统提示词、温度与步数上限。它落盘跟着数据走（见 deploy 的 state 挂载）。 */
+import {
+  loadSettings, getSettings, saveSettings, publicSettings, settingsFile,
+  behavior as settingsBehavior, normalizeBaseURL,
+} from './settings.mjs';
 import { createMemory, EXTRACT_SYS } from './memory.mjs';
 import { createForge } from './tools/forge.mjs';
 import { createMeter, estTokens, ymd } from './usage.mjs';
@@ -69,6 +77,12 @@ async function loadEnv(file) {
   } catch { /* 没有 .env 就用纯环境变量 */ }
 }
 await loadEnv(path.join(HERE, '.env'));
+
+/* 设置要在**任何会话被创建之前**读进来：系统提示词和自定义接口都要用它。
+   这份文件不存在是正常的（第一次跑），读失败也退回默认值 —— 一份坏掉的
+   设置不该让整个 agent 起不来。 */
+await loadSettings();
+setCustomProviders(getSettings().providers);
 
 const PORT = Number(process.env.PORT || 8788);
 const SYS = process.env.SYS || 'k8s';            // k8s | host | mock —— 只决定"数据从哪来"
@@ -192,7 +206,12 @@ function makeModel(id = MODEL_ID) {
     return m;
   }
   try {
-    const m = createOpenAIModel({ model: route.model, baseURL: route.baseURL, apiKey: route.apiKey });
+    const m = createOpenAIModel({
+      model: route.model, baseURL: route.baseURL, apiKey: route.apiKey,
+      /* 温度是**设置**里的，不是环境变量里的。改它要让下一轮立刻用上，
+         所以每次造实例都现取（实例在换模型时才会重建，见 switchModel）。 */
+      temperature: settingsBehavior().temp,
+    });
     m.id = id;
     return m;
   } catch (e) {
@@ -299,6 +318,36 @@ function padded(sys) {
   return sys + '\n\n' + unit.repeat(Math.ceil(CTX_PAD / unit.length)).slice(0, CTX_PAD);
 }
 
+/**
+ * 当前生效的系统提示词。
+ *
+ * 它是**唯一出口**：新建会话、恢复历史会话、改完设置之后刷新，全都走这里。
+ * 以前这行是 `padded(buildSystemPrompt())` 直接散在两处 —— 现在设置里能改
+ * 提示词了，散着写的话"改了没生效"会变成一个找不到原因的现象
+ * （尤其是历史会话：它的第一条 system 早就存进 sessions/*.json 了）。
+ */
+function sysPrompt() {
+  return padded(systemPrompt(getSettings().prompt));
+}
+
+/**
+ * 让一段历史用上**当前**的系统提示词。
+ *
+ * 系统提示词是**配置**，不是历史：它跟着设置走，不该被 10 月 20 日那次保存
+ * 冻住。所以恢复会话时把第一条 system 换掉，其余消息一条不动。
+ *
+ * 换之前先比对（`content === cur`）—— 一样就返回原数组，省得每轮都新建。
+ */
+function withCurrentSystem(msgs) {
+  const cur = sysPrompt();
+  const i = msgs.findIndex((m) => m.role === 'system');
+  if (i < 0) return [{ role: 'system', content: cur }, ...msgs];
+  if (msgs[i].content === cur) return msgs;
+  const out = msgs.slice();
+  out[i] = { ...out[i], content: cur };
+  return out;
+}
+
 async function getSession(sid) {
   let s = sessions.get(sid);
   if (!s) {
@@ -307,7 +356,9 @@ async function getSession(sid) {
       sid,
       /* 系统提示词是会话的第一条消息，进历史。这样 /api/debug 能直接看到
          模型当时到底被喂了什么 —— 调提示词全靠这个。 */
-      messages: saved?.messages?.length ? saved.messages : [{ role: 'system', content: padded(buildSystemPrompt()) }],
+      messages: saved?.messages?.length
+        ? withCurrentSystem(saved.messages)
+        : [{ role: 'system', content: sysPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
       tools: makeTools({ source: SYS, memory, forge, olares, skills }),
       model: null,
@@ -858,6 +909,116 @@ async function switchModel(s, id) {
 }
 
 /**
+ * 设置改完之后，把它**真正接到正在跑的东西上**。
+ *
+ * 三件事，少一件都会出现"改了没生效"：
+ *
+ *   ① 自定义接口要重新注入模型表 —— 不然刚加的地址要等重启才出现在换模型列表里。
+ *   ② 模型表缓存要清 —— 平台/本地那两组有 TTL（60s / 5min），
+ *      用户刚把一条接口删了，列表里还挂着它，点下去就是"表里没有这个模型"。
+ *   ③ **活跃会话的第一条 system 要换掉。** 提示词是配置不是历史，
+ *      但它是以"消息"的形式存在会话里的（这样 /api/debug 才看得到模型当时
+ *      被喂了什么）。不换的话，正在聊的那个会话会一直用旧提示词，
+ *      而用户刷新一下又"生效了" —— 这种一半生效最难查。
+ *
+ * 另外：如果当前用的模型来自一条被删掉的接口，必须退回默认。
+ * 不退回的话，下一轮会往一个已经不存在的地址发请求，报错看起来像"网络问题"。
+ */
+async function applySettings() {
+  const st = getSettings();
+  setCustomProviders(st.providers);
+  resetModelCache();
+
+  const sys = sysPrompt();
+  let swapped = 0;
+  let rebound = 0;
+  for (const s of sessions.values()) {
+    const first = s.messages?.[0];
+    if (first?.role === 'system' && first.content !== sys) {
+      first.content = sys;
+      swapped++;
+    }
+    if (!s.modelId) continue;
+    /* **只校验 `x/` 开头的那些。** 平台 / 本地 / mock 不会因为改设置而消失，
+       而 `findModel` 对平台模型要发一次 `/v1/models`（4 秒超时）——
+       保存设置时不该为了几个不会变的东西等它。 */
+    if (!String(s.modelId).startsWith('x/')) continue;
+    const still = await findModel(s.modelId).catch(() => null);
+    if (still) continue;
+    /* 这条模型没了（比如它属于刚被删掉的那个接口）→ 退回默认 */
+    const prev = s.modelId;
+    s.modelId = DEFAULT_MODEL;
+    liveModelId = DEFAULT_MODEL;
+    try { s.model = makeModel(DEFAULT_MODEL); } catch { /* 没 key 也不该拦着保存设置 */ }
+    s.meter?.retarget(DEFAULT_MODEL);
+    emit(s, {
+      t: 'model', ok: true, id: DEFAULT_MODEL, from: prev,
+      usage: s.meter ? s.meter.snap() : null,
+    });
+    emit(s, { t: 'note', message: `原来的 ${prev} 已经不在了（接口被删），先换回默认的` });
+    scheduleSave(s);
+    rebound++;
+  }
+  console.log(`[settings] 保存；提示词替换 ${swapped} 个会话，模型回退 ${rebound} 个`);
+  return { swapped, rebound };
+}
+
+/**
+ * 「测一下」—— 只问那个地址要模型清单。
+ *
+ * 为什么是 `/models` 而不是发一句话：那要花钱、要等模型回话，而用户在配地址
+ * 这一步真正想知道的是"能不能连上、key 对不对、它有哪些模型"。
+ * `/models` 一次回答三件事，而且几乎每个 OpenAI 兼容接口都有。
+ *
+ * 它**不会**替用户保存 —— 测通了之后要按保存。两个动作分开是有意的：
+ * 一个按钮既测又存，失败时用户不知道"到底是没连上，还是没存上"。
+ */
+async function probeEndpoint({ baseURL, apiKey, id }) {
+  const base = normalizeBaseURL(baseURL || '');
+  if (!base) return { ok: false, error: '这不是一个网址（要 http:// 或 https:// 开头）' };
+  let key = String(apiKey ?? '').trim();
+  /* 面板里 key 是脱敏的（只显示 …abcd），所以"测一下"要能沿用已存的那个 */
+  if (!key && id) key = getSettings().providers.find((p) => p.id === id)?.apiKey || '';
+
+  let r;
+  try {
+    r = await fetch(`${base}/models`, {
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (e) {
+    const why = e?.name === 'TimeoutError' ? '8 秒没有响应'
+      : e?.cause?.code === 'ENOTFOUND' ? '这个域名解析不到'
+        : e?.cause?.code === 'ECONNREFUSED' ? '这个地址拒绝连接'
+          : (e?.cause?.code || e?.message || String(e));
+    return { ok: false, error: `连不上：${why}`, base };
+  }
+
+  let text = '';
+  try { text = await r.text(); } catch { /* 有的网关会中途断 */ }
+  if (!r.ok) {
+    /* 401/403 单独说清楚：地址是通的，是 key 的问题 —— 这两件事用户会当成同一件 */
+    const hint = r.status === 401 || r.status === 403 ? '（地址是通的，是 key 不对）' : '';
+    return {
+      ok: false, status: r.status, base, error: `HTTP ${r.status}${hint}`,
+      body: text.slice(0, 200),
+    };
+  }
+  let list = [];
+  try {
+    const j = JSON.parse(text);
+    list = (j.data || j.models || []).map((m) => m.id || m.name).filter((x) => typeof x === 'string');
+  } catch {
+    /* 有的接口 /models 返回的是一段 HTML（反代登录页）—— 那说明地址指错了层 */
+    return { ok: false, status: r.status, base, error: '这个地址回的不是 JSON，可能指到了别的东西上' };
+  }
+  return {
+    ok: true, base, models: list.slice(0, 100),
+    note: list.length ? '' : '能连上，但这个接口不返回模型清单 —— 模型名手动填',
+  };
+}
+
+/**
  * 打断时，历史可能停在"助手要调工具、结果还没回来"。
  * 下一次请求会因此 400 —— OpenAI 协议要求每个 tool_call 都有对应的 tool 消息。
  * 补一条"被打断"的结果：这不是假装执行过，是把"它确实没拿到结果"如实写进历史。
@@ -1323,7 +1484,10 @@ async function runTurn(s, goal) {
     let lastSig = '';
     let repeats = 0;
     let nudges = 0;
-    const stepCap = () => (s.forgeStep ? MAX_STEPS_FORGE : MAX_STEPS);
+    /* 步数上限现在可以在设置里改（默认还是 10）。造工具那几轮仍然更宽 ——
+       那是**任务形状**决定的，不该被一个滑块改掉。 */
+    const stepCap = () => (s.forgeStep ? MAX_STEPS_FORGE
+      : Math.max(3, Number(settingsBehavior().maxSteps) || MAX_STEPS));
     /* ── 这一轮怎么结束 ──
      *
      * **不是"走完 N 步"。** 参考的是几个真跑在生产里的循环：
@@ -2487,6 +2651,78 @@ const server = http.createServer(async (req, res) => {
     if (!hasModel) body.hint = 'MODEL_KEY 没配。装的时候要建 Secret emergent-desktop-env';
     res.writeHead(hasModel ? 200 : 503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(body));
+    return;
+  }
+
+  /* 设置：看一眼 / 改一下 / 测一个地址。
+   *
+   * GET 不回 key 明文（见 settings.mjs 的 publicSettings）—— 这块面板会被投到
+   * 屏幕上、被截图，而一个 key 泄露和一句提示词泄露完全不是一回事。
+   */
+  if (p === '/api/settings' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      const ps = publicSettings();
+      res.end(JSON.stringify({
+        ...ps,
+        /* 内置那套的全文。**要给出去**：用户改提示词时最常犯的错是"重复说一遍
+           它已经知道的"，而只有让他读到原文才知道哪些说过了。约 10KB，
+           单用户桌面上这点开销远小于"改了但不知道为什么没用"。 */
+        builtin: systemPrompt(),
+        /* 两段字数：面板上要能说清"你写的是加在 9745 字后面的，还是替掉了它" */
+        builtinChars: systemPrompt().length,
+        sysChars: sysPrompt().length,
+        sys: SYS,
+        model: MODEL_ID,
+        defaultModel: DEFAULT_MODEL,
+      }));
+    } catch (e) {
+      res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
+    return;
+  }
+
+  if (p === '/api/settings' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch { body = null; }
+    if (!body) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: '请求体不是合法 JSON' }));
+      return;
+    }
+    try {
+      const saved = await saveSettings({
+        providers: body.providers,
+        prompt: body.prompt,
+        behavior: body.behavior,
+      });
+      /* 落盘之后**立刻**接到运行中的东西上（见 applySettings 的三件事） */
+      const applied = await applySettings();
+      /* 通知这个进程里的所有连接：别的标签页里打开的设置面板要跟着更新 */
+      for (const x of sessions.values()) emit(x, { t: 'settings', at: Date.now() });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({
+        ok: true, settings: publicSettings(), notes: saved.notes, applied,
+        sysChars: sysPrompt().length,
+      }));
+    } catch (e) {
+      /* 写盘失败（权限/磁盘）时内存里已经改了 —— 必须说清楚"只在本次运行有效"，
+         否则用户会以为保存成功了，下次重启才发现没了。 */
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: `没能写进 ${settingsFile()}：${e?.message || e}` }));
+    }
+    return;
+  }
+
+  if (p === '/api/settings/probe' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse((await readBody(req)) || '{}'); } catch { body = null; }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    try {
+      res.end(JSON.stringify(await probeEndpoint(body || {})));
+    } catch (e) {
+      res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
+    }
     return;
   }
 

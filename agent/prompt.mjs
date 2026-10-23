@@ -388,6 +388,30 @@ apps（每个应用什么状态）。你还不知道任何真实数字，这是�
 
 **这里不要调 mem_trim。** 他还没点。等他点了「压到 34%」才轮到它。`;
 
+/**
+ * 当前生效的系统提示词 —— **设置页改的就是这个函数的输入**。
+ *
+ * 两种模式（见 settings.mjs 的 `prompt`）：
+ *
+ *   · **追加**（默认）：内置那套一个字不动，用户的写在末尾。为什么默认是这个 ——
+ *     内置那段不是"关于这个助手的一段介绍"，它是**这套界面的说明书**：
+ *     有哪些工具、`scene_show` 的字段是什么、label 最多几个字、一轮该说多少。
+ *     把这些删掉，模型仍然会聊天，但再也铺不出一屏 —— 而用户会以为"它变笨了"。
+ *   · **整段替换**：从零写。留这个口子是因为有人确实想要另一套人格/协议，
+ *     但它默认关着，且面板上写清了代价。
+ *
+ * 空字符串一律当作"没写"：替换栏被删空不该让系统提示词变成空的
+ * （那样模型连"你面前是一片粒子场"都不知道，第一句就会开始推荐网页链接）。
+ */
+export function systemPrompt({ append = '', replace = '' } = {}) {
+  const extra = String(append || '').trim();
+  const full = String(replace || '').trim();
+  if (full) return extra ? `${full}
+
+${extra}` : full;
+  return buildSystemPrompt(extra);
+}
+
 export function buildSystemPrompt(extra = '') {
   return [
     '你是这台 Olares 的管家。它就在用户桌面上跑着，你看得到它的真实状态；'

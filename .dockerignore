@@ -23,6 +23,8 @@ agent/.kube
 # ── 运行时数据（跑出来的，属于用户不属于镜像）──
 agent/sessions
 agent/usage
+# 设置里有自定义接口的 key —— 和 .env 同一条规矩，一个字节都不进镜像
+agent/config
 agent/memory
 agent/.tools
 **/__pycache__
