@@ -67,33 +67,52 @@ console.log('\n思考：中文照句切');
   ok(L.every((x) => !x.includes('。')), '每行不以句号结尾');
 }
 
-console.log('\n思考：英文句不显示（线上实测原样）');
+console.log('\n思考：英文照实显示（不许为了"看起来全中文"而丢）');
 {
-  /* 2026-10-23 真实返回：没要求"思考用中文"时 V4.1-Flash 就这么想 */
+  /* 2026-10-23 线上原样：没要求"思考用中文"时 V4.1-Flash 就这么想。
+     这里曾经期望"一条都没有"，被用户否了 —— 模型用英文想是它真实的思考过程，
+     丢掉就是信息缺失，而且丢的往往正是推理链（越复杂越容易切回母语）。
+     语言是**提示词**的责任，不是出口的责任。 */
   const en = 'Need to report. Maybe also scene_show? The tool is a device assistant. '
     + 'I think calling scene_show with reading is appropriate to display';
-  ok(reasonLines(en).length === 0, '纯英文 → 一条都不显示（英文夹在中文界面里比不显示更糟）');
-  ok(reasonLines('好的。').length === 0, '太短的碎片不要');
+  const L = reasonLines(en);
+  ok(L.length >= 3, `纯英文 → 照实留下 ${L.length} 条：${JSON.stringify(L)}`);
+  ok(L[0].startsWith('Need to report'), '第一句原样');
+  ok(reasonLines('好的。').length === 0, '太短的碎片还是不要（那不是"一句思考"）');
   ok(reasonLines('').length === 0 && reasonLines(undefined).length === 0, '空/undefined → 空数组');
 }
 
-console.log('\n思考：中英混排只留中文句');
+console.log('\n思考：中英混排一句都不许丢');
 {
   const L = reasonLines('用户想知道装了哪些应用。I need to call olares with op=apps. '
     + '这个工具会返回应用清单、版本和来源。然后画三个仪表。');
-  ok(L.length === 3, `留下三句中文：${JSON.stringify(L)}`);
-  ok(!L.some((x) => /^[A-Za-z]/.test(x)), '没有一句以英文开头（英文句被切掉并丢弃）');
-  ok(L.some((x) => x.includes('应用清单')), '英句后面的中文还是完整的一句（没被当成同一句截掉）');
+  ok(L.length === 4, `四句都在：${JSON.stringify(L)}`);
+  ok(L.some((x) => x.startsWith('I need to call')), '夹在中间那句英文也在（它同样是它想的）');
+  ok(L.some((x) => x.includes('应用清单')), '英句后面的中文是完整的一句');
 }
 
-console.log('\n思考：一句话里夹中文也骗不过去');
+console.log('\n思考：一句话里夹中文 —— 整句留着');
 {
-  /* 2026-10-23 线上原样：这句中文占了五成，光看整句占比是拦不住的 */
+  /* 2026-10-23 线上原样。以前这句会被"中文占比"筛掉，现在整句都在。 */
   const half = 'User asks "挑一个占内存最多的说说" — the user wants me to pick the biggest one';
-  ok(reasonLines(half).length === 0, '半中半英 → 一条都不显示');
-  /* 反过来，专有名词开头的正经中文句子不能被误杀 */
-  ok(reasonLines('n8n 占内存最多：355MB，2.2%节点').length === 1, '"n8n 占内存最多…" 要留下');
-  ok(reasonLines('CPU 21% 和内存 41%，都不高').length === 1, '"CPU 21% 和内存…" 要留下（前 10 字有汉字）');
+  const L = reasonLines(half);
+  ok(L.length === 1, `一条，整句留着：${JSON.stringify(L)}`);
+  ok(L[0].includes('占内存最多'), '中文片段在（没被当成"英文句"砍掉）');
+  ok(reasonLines('n8n 占内存最多：355MB，2.2%节点').length === 1, '专有名词开头的中文句照旧');
+  ok(reasonLines('CPU 21% 和内存 41%，都不高').length === 1, '"CPU 21% 和内存…" 照旧');
+}
+
+console.log('\n思考：英文按宽度收，不按字数');
+{
+  /* 同样一句意思，英文比中文长一倍多。按字数切的话英文只剩三个词。 */
+  const en = 'The user needs to check which application currently uses the most memory on this machine';
+  const L = reasonLines(en);
+  ok(L.length === 1, '一句');
+  ok(Array.from(L[0]).length > 30, `英文放得下 30+ 个字符：${JSON.stringify(L[0])}（${Array.from(L[0]).length} 字符）`);
+  ok(!/\b[a-z]{1,2}…$/.test(L[0]), '不在一个词的两三个字母处断掉');
+  /* 中文那条的额度不能被英文撑大 */
+  const cn = reasonLines('这是一句需要被截断的很长的中文思考'.repeat(3));
+  ok(Array.from(cn[0]).length <= 30, `中文仍收在 30 字内：${Array.from(cn[0]).length}`);
 }
 
 console.log('\n思考：有的模型把标签原样吐出来');

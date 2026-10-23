@@ -134,33 +134,29 @@ export { OP_ZH, ACT_ZH };
 
 /* ───────────────────── 它的思考：一段自由文本 → 几条能上屏的短句 ───────────────────── */
 
-/** 一个字符里有多少"像中文"的份量（汉字 1、全角标点 0.5、字母数字 0） */
-function zhWeight(s) {
-  const ch = Array.from(s);
-  if (!ch.length) return 0;
-  let w = 0;
-  for (const c of ch) {
-    if (/[\u4e00-\u9fa5]/.test(c)) w += 1;
-    else if (/[\u3000-\u303f\uff00-\uffef“”‘’—…]/.test(c)) w += 0.5;
-    else if (/\s/.test(c)) w += 0;
-    else w += 0;
-  }
-  return w / ch.length;
-}
-
-/** 按长度收口，但**不把英文单词劈成两半**。
+/** 按**显示宽度**收口，但**不把英文单词劈成两半**。
  *
- *  踩到的样子：`总盘容量未知，但可以用 olares overvi…` —— "overview" 被切成
+ *  为什么按宽度而不是字数：同样一句意思，英文比中文长一倍多。按字数切的话，
+ *  中文那行读得完整，英文那行只剩三个词。一个汉字算 1、一个 ASCII 字符算 0.55
+ *  —— 28 的额度下中文 28 字、英文 50 个字符，屏幕上占的宽度一样。
+ *
+ *  为什么不在词中间下刀：`总盘容量未知…olares overvi…` —— "overview" 被切成
  *  "overvi"，读起来像个拼错的函数名。中文没有这个问题（一个字就是一个词），
- *  所以只在"断点两侧都是字母数字"时往回退，退到空格/标点为止。
- *  最多退到 60%，再退就丢太多信息了，宁可劈开。
+ *  所以只在"断点两侧都是字母数字"时往回退，最多退到 60%，再退就丢太多信息了。
  */
-function fitSent(s, n) {
+function fitSent(s, w) {
   const ch = Array.from(s);
-  if (ch.length <= n) return s;
-  let k = n - 1;
-  while (k > Math.floor(n * 0.6) && /[A-Za-z0-9]/.test(ch[k - 1] || '') && /[A-Za-z0-9]/.test(ch[k] || '')) k--;
-  return `${ch.slice(0, k).join('').replace(/[\s,;:，、；：]+$/u, '')}…`;
+  const wide = (c) => (/[\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef]/.test(c) ? 1 : 0.55);
+  let acc = 0;
+  let k = 0;
+  for (; k < ch.length; k++) {
+    acc += wide(ch[k]);
+    if (acc > w) break;
+  }
+  if (k >= ch.length) return s;
+  let cut = k;
+  while (cut > Math.floor(k * 0.6) && /[A-Za-z0-9]/.test(ch[cut - 1] || '') && /[A-Za-z0-9]/.test(ch[cut] || '')) cut--;
+  return `${ch.slice(0, cut).join('').replace(/[\s,;:，、；：]+$/u, '')}…`;
 }
 
 /**
@@ -170,12 +166,15 @@ function fitSent(s, n) {
  *
  *   · 一段思考 300~1000 字，那一栏只有 250px 高（约 10 行）。原样放进去就是
  *     一堵墙，用户不会读；而"它在想什么"恰恰只需要开头那几句。
- *   · **思考不一定是中文。** 实测 DeepSeek-V4.1-Flash 在没被要求时会用英文想
- *     （"Need to report. Maybe also scene_show?…"）。英文思考排在中文界面里
- *     比不显示更糟 —— 用户会以为界面坏了。所以按中文占比筛，筛不出就不显示。
  *   · 有的模型会把 `<think>` 原样吐在 reasoning_content 里（GLM-Z1），要剥掉。
  *
- * 三条弃用规则：纯英文句、太短的碎片（"好的。"）、同一句重复。
+ * **语言的筛法已经删掉了**（2026-10-23）。这里曾经有一条"中文占比 < 30% 就丢"，
+ * 理由是"英文夹在中文界面里看着像坏了"。那是个错误：模型用英文想，是它真实的
+ * 思考过程，丢掉就是信息缺失 —— 而且丢的往往正是推理链（越复杂的事越容易切回
+ * 母语）。让思考说中文是**提示词的责任**（"思考也用中文"），不是出口的责任。
+ * 模型不吃那一套，屏幕上就照实显示英文。
+ *
+ * 三条弃用规则：太短的碎片（"好的。"）、同一句重复、屏幕放不下的长度。
  *
  * @param {string} thinking 模型返回的 reasoning_content
  * @param {number} max 最多几条（屏幕上放得下的量，不是"能切出几条"）
@@ -196,8 +195,8 @@ export function reasonLines(thinking, max = 4) {
     .replace(/^\s*[-•]\s*/gm, '');
 
   /* 中文句末 + 分号 + 换行，外加**英文句号后跟空格**。
-     英文句号不切的话，"I need to call X. 这个工具会…" 会被当成**一句**
-     （它含中文，能过中文占比筛），然后被 cut 掉后半截 —— 屏幕上就剩一句英文。 */
+     英文句号不切的话，"I need to call X. Then draw three gauges." 会被当成
+     一句超长的，然后被宽度截掉一半 —— 屏幕上只剩半句。 */
   const raw = t
     .split(/(?<=[。！？!?；;])|(?<=[.!?])\s+|\n+/)
     .map((x) => x.trim())
@@ -208,20 +207,14 @@ export function reasonLines(thinking, max = 4) {
   for (const s0 of raw) {
     /* 尾部标点去掉：屏幕上每行都以"。"结尾会显得像文稿，不像在说给自己听 */
     const s = s0.replace(/[。！？；，,、\s]+$/u, '').trim();
-    if (s.length < 6 || s.length > 120) continue;
-    /* 纯英文句：中文占比不足三成就是英文思考，不显示 */
-    if (zhWeight(s) < 0.3) continue;
-    /* 整句占比不够狠 —— 中英混排里夹一句中文就能骗过去。
-       线上原样：`User asks "挑一个占内存最多的说说" —…` 中文占了五成，
-       过了上一关，屏幕上就是一行半中半英。所以再看**开头 10 个字**：
-       思考的中文句子开头几乎不可能是纯英文（"n8n 占内存最多：…" 这种
-       专有名词开头，前 10 个字里也有四五个汉字）。 */
-    const head = Array.from(s).slice(0, 10).join('');
-    if ((head.match(/[一-龥]/g) || []).length < 2) continue;
+    /* 下限挡碎片（"好的。"），上限挡"一整段没有标点"的思考 ——
+       那截到 28 宽也只剩开头，白占一个名额。160 对英文也算宽了。 */
+    if (s.length < 6 || s.length > 160) continue;
     const k = s.slice(0, 12);
     if (seen.has(k)) continue;
     seen.add(k);
     out.push(fitSent(s, 28));
+
     if (out.length >= max) break;
   }
   return out;
