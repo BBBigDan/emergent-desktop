@@ -215,8 +215,9 @@ export function createSettings(o = {}) {
 
     const list = el('div', 'as-list');
     if (!draft.providers.length) {
+      /* 空态那行要**短**：它居中显示，长了会断成两行、第二行只剩两三个字。 */
       list.appendChild(el('div', 'as-empty',
-        '还没有自定义接口。点下面那行加一个：地址填到 /v1 为止（贴了 /chat/completions 也会自动去掉）。'));
+        '还没有自定义接口。点下面加一个 —— 地址填到 /v1 就行。'));
     }
     draft.providers.forEach((p, i) => list.appendChild(providerCard(p, i)));
     wrap.appendChild(list);
