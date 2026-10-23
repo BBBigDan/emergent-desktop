@@ -141,12 +141,15 @@ say "迁移会话/用量（如果还有旧的 hostPath 数据）"
     fi
   done; true"
 
-# ── 2. 模型 key ─────────────────────────────────────────
+# ── 2. 模型 key + Olares 身份 ───────────────────────────
 if [ -f "$REPO/agent/.env" ]; then
   say "写 Secret emergent-desktop-env"
   cat "$REPO/agent/.env" | "${SSH[@]}" \
     "kubectl -n $NS create secret generic emergent-desktop-env --from-env-file=/dev/stdin \
        --dry-run=client -o yaml | kubectl apply -f - >/dev/null && echo ok"
+  # 身份凭据是可选的，但没有它就只能"token 被撤了等用户来配"。提醒一次。
+  grep -q '^OLARES_' "$REPO/agent/.env" \
+    || say "提示：agent/.env 里没有 OLARES_ID / OLARES_PASSWORD，CLI 身份被撤销后要人工处理"
 fi
 
 # ── 3. 工作负载 ─────────────────────────────────────────

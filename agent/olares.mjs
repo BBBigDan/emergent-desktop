@@ -23,9 +23,37 @@
  *   它们要走 tools.mjs 的 danger 级和审批门。
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
 const BIN = process.env.OLARES_CLI || 'olares-cli';
+
+/**
+ * `profile list` 的 `status` → 我们该不该当成"能干活"。
+ *
+ * 这张表**不是猜的**，是 CLI 自己文档里的（`cli/skills/shared/references/auth.md`）：
+ *
+ *   logged-in  → 继续
+ *   expired    → **继续**：只是 access token 过了期，下一条命令会自己刷新
+ *   pending    → 继续：平台发的 profile 还没交换 grant，下一条命令会交换
+ *   unknown    → 继续：本地判断不了，跑一条命令看
+ *   invalidated→ 停：服务端拒了 refresh，要重新登录
+ *   never      → 停：从来没有存过 token
+ *
+ * 这里踩过一次，而且踩得很像"设计如此"：原来判的是 `status.includes('logged')`，
+ * 于是 `expired` 被当成"没授权"，工具直接回一句"去终端跑 olares-cli profile login"。
+ * 实测后果（2026-10-23）：pod 里 profile 一直是 `expired`，而 `market list --mine`
+ * 照样能跑通（它自己刷新了），跑完 `profile list` 就变回 `logged-in`。
+ * 也就是说**我们拦住了一次本来会成功的调用，还让用户去开终端**。
+ */
+export function authState(status) {
+  const s = String(status || '').toLowerCase();
+  if (!s) return 'unknown';
+  if (s.includes('invalidat')) return 'reauth';
+  if (s.includes('never')) return 'reauth';
+  if (s.includes('expired')) return 'stale';     // 能干活，只是 token 该刷了
+  if (s.includes('pending')) return 'pending';
+  return 'ok';
+}
 
 /* 读操作白名单：op → argv。**不带 `-o json`**，统一在 run() 里加。 */
 const READ = {
@@ -132,6 +160,9 @@ export const OP_DOC = [
 export function createOlares(o = {}) {
   const bin = o.bin || BIN;
   const ttl = o.ttl ?? 30_000;
+  /* 自测口子之二：密码登录要 spawn 一个进程、从 stdin 灌密码，
+     整个这一条（"身份坏了 → 自己登一次 → 继续查"）在 CI 里没法真跑。 */
+  const loginFn = o.login || ((id, pw, totp) => runLogin(id, pw, totp));
 
   let probeCache = null;   // { at, ok, code, message, who }
   /* 读结果缓存（见 read 里那段注释）。键是 `op:name`，只存成功的读。 */
@@ -158,10 +189,15 @@ export function createOlares(o = {}) {
    * 跑一次。**argv 必须是白名单里拼好的数组**，不做字符串拼接。
    * @returns {{ok:boolean, data?:any, error?:{code:string,message:string}, ms:number, stderr?:string}}
    */
-  function run(argv, { timeout = 25_000 } = {}) {
+  function run(argv, { timeout = 25_000, json = true } = {}) {
+    /* 自测口子：把整条 CLI 换成一个函数。
+       认证判断（哪几种 status 该放行）决定"会不会拦住用户"，而它原来只能在
+       真 pod 里验 —— 没有这个口子，这类 bug 就只能靠线上复现一次、再修一次。 */
+    if (o.exec) return o.exec(argv, { timeout, json });
     const t0 = Date.now();
+    const full = json ? [...argv, '-o', 'json'] : argv;
     return new Promise((resolve) => {
-      execFile(bin, [...argv, '-o', 'json'], {
+      execFile(bin, full, {
         timeout,
         killSignal: 'SIGTERM',
         maxBuffer: 8 * 1024 * 1024,
@@ -233,14 +269,19 @@ export function createOlares(o = {}) {
            踩过：按 config 的形状读，永远读到空，于是"已经登录"被判成"没授权"。 */
         const list = Array.isArray(r.data) ? r.data : (r.data?.profiles || []);
         const cur = list.find((p) => p.current === true) || (list.length === 1 ? list[0] : null);
-        const ok = !!cur && String(cur.status || '').includes('logged');
+        const st = authState(cur?.status);
+        /* `expired` / `pending` 都算能干活（见上面 authState 的注释）。 */
+        const ok = !!cur && st !== 'reauth';
         out = {
           at: now,
           ok,
           who: cur?.name || cur?.olaresId || '',
+          olaresId: cur?.olaresId || cur?.name || '',
           role: cur?.ownerRole || cur?.role || '',
+          status: cur?.status || '',
+          stale: st === 'stale',
           code: ok ? '' : (list.length ? 'auth_not_logged_in' : 'auth_no_profile'),
-          message: ok ? '' : '这台机器还没有授权过 Olares 身份',
+          message: ok ? '' : '这台机器上的 Olares 身份失效了（不是没有数据）',
         };
       }
       probeCache = out;
@@ -251,12 +292,146 @@ export function createOlares(o = {}) {
   }
 
   const NOAUTH = () => ({
-    error: '还没授权 Olares 身份，查不了系统层（不是"没有数据"）。'
-      + '告诉用户去授权一次：在安装时加 --login，或者在终端跑 '
-      + '`olares-cli profile login --olares-id <你的 Olares ID>`。'
+    error: '这台机器上的 Olares 身份现在用不了（不是"没有数据"）。'
+      + (authNote ? `自动重登试过了：${authNote}。` : '')
+      /* 这条最要紧：**不要叫用户去敲命令。** 他面对的是桌面，不是 shell。
+         程序跑在这台机器上，能自己做的事就不该转交给用户。 */
+      + '不要叫用户去终端跑什么命令 —— 他打开的是桌面。'
+      + '要恢复只有一条路：把 Olares 的 refresh token 或密码放进服务端环境变量 '
+      + '（`OLARES_REFRESH_TOKEN`，或 `OLARES_PASSWORD` + `OLARES_ID`），程序会自己接上。'
       + '在那之前，机器负载和文件仍然能查（走的是另一条路）。',
     needAuth: true,
   });
+
+  /* ───────────── 自己重登（不是让用户去开终端） ─────────────
+   *
+   * 判据来自 CLI 的 auth.md：它自己会刷新过期的 access token，
+   * 所以**我们不做认证重试循环**；但 `invalidated`（服务端拒了 refresh）
+   * 它自己救不了 —— 那时只有一条出路：用配置里的凭据重登一次。
+   *
+   * 三件事不能省：
+   *   ① 冷却 5 分钟。否则每条业务命令都会带一次登录，几秒变几十秒；
+   *   ② 单飞。一轮里四五个工具同时撞 auth 时只登一次；
+   *   ③ 密码只走 stdin。`profile login` 的 help 里写死了：参数里放密码会进 `ps`。
+   */
+  let authAt = 0;
+  let authInflight = null;
+  let authNote = '';
+
+  function creds() {
+    return {
+      id: String(process.env.OLARES_ID || '').trim(),
+      rt: String(process.env.OLARES_REFRESH_TOKEN || '').trim(),
+      pw: process.env.OLARES_PASSWORD || '',
+    };
+  }
+
+  /** 密码登录：`--password-stdin` 要求密码走管道，不能进 argv。 */
+  function runLogin(id, password, totp = '') {
+    const t0 = Date.now();
+    const argv = ['profile', 'login', '--olares-id', id, '--password-stdin',
+      ...(totp ? ['--totp', totp] : []), '-o', 'json'];
+    return new Promise((resolve) => {
+      const p = spawn(bin, argv, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+          HOME: process.env.HOME || '/root',
+          TZ: process.env.TZ || 'Asia/Shanghai',
+        },
+      });
+      let out = '';
+      let err = '';
+      const t = setTimeout(() => { try { p.kill('SIGTERM'); } catch { /* 已退出 */ } }, 20_000);
+      p.stdout.on('data', (d) => { out += d; });
+      p.stderr.on('data', (d) => { err += d; });
+      p.on('error', (e) => { clearTimeout(t); resolve({ ok: false, ms: Date.now() - t0, error: { code: 'spawn_failed', message: String(e.message) } }); });
+      p.on('close', (code) => {
+        clearTimeout(t);
+        const ms = Date.now() - t0;
+        const j = tryJSON(out) || tryJSON(err);
+        const r = code === 0
+          ? { ok: true, data: j, ms }
+          : { ok: false, ms, error: { code: j?.error?.code || 'login_failed', message: String(j?.error?.message || err || out || `退出码 ${code}`).slice(0, 300) } };
+        console.log(`[olares] profile login ${id} → ${r.ok ? 'ok' : r.error.code} (${ms}ms)`);
+        resolve(r);
+      });
+      try { p.stdin.write(password + '\n'); p.stdin.end(); } catch { /* 进程已经没了 */ }
+    });
+  }
+
+  /**
+   * 用配置里的凭据重新登录一次。**没有凭据就什么都没有** —— 不假装。
+   * @returns {Promise<{ok:boolean, how?:string, reason?:string}>}
+   */
+  async function reauth() {
+    if (authInflight) return authInflight;
+    const now = Date.now();
+    if (now - authAt < 5 * 60_000) return { ok: false, reason: 'cooling' };
+    authAt = now;
+    authInflight = (async () => {
+      const c = creds();
+      const id = c.id || probeCache?.olaresId || '';
+      if (!c.rt && !c.pw) {
+        authNote = '没配凭据（OLARES_REFRESH_TOKEN / OLARES_PASSWORD），无从下手';
+        return { ok: false, reason: 'no-credentials' };
+      }
+      if (!id) {
+        authNote = '不知道该用哪个 Olares ID（配 OLARES_ID）';
+        return { ok: false, reason: 'no-id' };
+      }
+      /* refresh token 优先：不用密码，也不会因为改密码而失效 */
+      if (c.rt) {
+        const r = await run(['profile', 'import', '--olares-id', id, '--refresh-token', c.rt],
+          { json: false, timeout: 20_000 });
+        if (r.ok) { authNote = ''; probeCache = null; cache.clear(); return { ok: true, how: 'refresh-token' }; }
+        authNote = `refresh token 被拒（${r.error.code}）`;
+        console.warn('[olares] import 失败：' + r.error.message);
+      }
+      if (c.pw) {
+        const r = await loginFn(id, c.pw);
+        if (r.ok) { authNote = ''; probeCache = null; cache.clear(); return { ok: true, how: 'password' }; }
+        authNote = `密码登录也失败（${r.error.code}）`;
+        console.warn('[olares] login 失败：' + r.error.message);
+      }
+      return { ok: false, reason: 'failed' };
+    })().finally(() => { authInflight = null; });
+    return authInflight;
+  }
+
+  /**
+   * 确保这一刻能干活。
+   *
+   * `expired` / `pending` **直接算能**（CLI 下一次调用会自己刷新/交换）；
+   * `invalidated` / `never` 先自己重登一次再探（冷却 5 分钟，撞了就用上次的结论）。
+   *
+   * 这个函数存在的原因是：原来的闸只看"profile list 说没说 logged"，
+   * 而那个判断会**拦住一次本来会成功的调用** —— 拦住之后，也就永远等不到
+   * "命令失败 → 触发重登"的机会。闸和自救必须在同一个地方。
+   */
+  async function ensure() {
+    const p = await probe();
+    if (p.ok) return p;
+    const re = await reauth();
+    if (!re.ok) return p;
+    return probe();
+  }
+
+  /**
+   * 跑一条业务命令；认证类失败时**自己重登一次再试**。
+   *
+   * 只在 `auth*` 上这么做：那是"身份被拒"，重试业务命令本身不会有别的结果。
+   * 其它错误（超时、权限 403）原样回去 —— 403 不是登录能修的（CLI 的 auth.md 也这么说）。
+   */
+  async function runAuthed(argv, opts) {
+    let r = await run(argv, opts);
+    if (r.ok || !String(r.error?.code || '').startsWith('auth')) return r;
+    const re = await reauth();
+    if (!re.ok) return r;
+    console.log(`[olares] 身份已自动恢复（${re.how}），重试 ${argv.slice(0, 3).join(' ')}`);
+    r = await run(argv, opts);
+    return r;
+  }
 
   /**
    * 读一个 op。
@@ -281,7 +456,7 @@ export function createOlares(o = {}) {
       return { ...hit.data, cached: true, ageMs: Date.now() - hit.at };
     }
 
-    const p = await probe();
+    const p = await ensure();
     if (!p.ok) return NOAUTH();
 
     /* apps 要三份数据才够用：清单（版本/来源）、占用（cpu/内存）、总量（算占比）。
@@ -292,12 +467,12 @@ export function createOlares(o = {}) {
     /* events 要带命名空间（CLI 强制要求），而模型只记得住 pod 名 —— 这里替它查 */
     if (op === 'events') return remember(key, await readEvents(name));
 
-    const r = await run(make(name));
+    const r = await runAuthed(make(name));
     if (!r.ok) {
-      /* 认证类错误要说得比 CLI 原文更像人话，并且**提示可恢复** */
-      if (r.error.code?.startsWith('auth_')) {
+      /* 走到这里说明**自动重登也没救回来**（runAuthed 已经试过一次）。 */
+      if (r.error.code?.startsWith('auth')) {
         probeCache = null;      // 让下一次重新探
-        return { error: `Olares 那边不认这个身份了（${r.error.code}）。可能是 token 过期或被撤销，需要重新授权一次。` };
+        return NOAUTH();
       }
       return { error: r.error.message, code: r.error.code };
     }
@@ -339,7 +514,7 @@ export function createOlares(o = {}) {
 
     if (!quotaInflight) {
       quotaInflight = (async () => {
-        const r = await run(['dashboard', 'overview'], { timeout: 30_000 });
+        const r = await runAuthed(['dashboard', 'overview'], { timeout: 30_000 });
         const t = r.ok
           ? (r.data?.sections?.physical?.items || []).find((x) => x?.raw?.metric === 'memory')?.raw?.total
           : null;
@@ -369,7 +544,7 @@ export function createOlares(o = {}) {
     if (pod.includes('/')) { const [a, b] = pod.split('/'); ns = a; pod = b; }
     if (!ns) {
       if (!podNs.size) {
-        const r = await run(['cluster', 'pod', 'list'], { timeout: 30_000 });
+        const r = await runAuthed(['cluster', 'pod', 'list'], { timeout: 30_000 });
         if (r.ok) {
           for (const p of r.data?.items || []) {
             if (p?.metadata?.name) podNs.set(p.metadata.name, p.metadata.namespace || 'default');
@@ -391,7 +566,7 @@ export function createOlares(o = {}) {
           + '或者用「命名空间/pod名」的形式给 name。',
       };
     }
-    const r = await run(['cluster', 'pod', 'events', pod, '-n', ns], { timeout: 30_000 });
+    const r = await runAuthed(['cluster', 'pod', 'events', pod, '-n', ns], { timeout: 30_000 });
     if (!r.ok) return { error: r.error.message, code: r.error.code };
     return { ns, ...shape('events', r.data, pod) };
   }
@@ -657,17 +832,23 @@ export function createOlares(o = {}) {
     if (!make) return { error: `不能执行「${op}」。能写的只有：${ACTS.join(' / ')}` };
     if (op !== 'cancel' && !name) return { error: `${op} 要给 name（应用名，例如 n8n）` };
 
-    const p = await probe();
+    const p = await ensure();
     if (!p.ok) return NOAUTH();
 
     /* 装 / 升级要等 `--watch`，所以 exec 的超时必须**大于** watch-timeout，
        否则 CLI 还没说话就被我们掐了，报出来的是"超时"而不是"还在装"。 */
     const long = op === 'install' || op === 'upgrade';
-    const r = await run(make(name), { timeout: long ? 130_000 : 60_000 });
+    const r = await runAuthed(make(name), { timeout: long ? 130_000 : 60_000 });
     /* 写完必须让读缓存全失效 —— 否则下一次 apps 拿到的还是写之前那 15 秒的快照，
        用户会看到"我明明停了它，怎么还显示 running"。 */
     cache.clear();
     if (!r.ok) {
+      /* 写操作也一样：身份不行就说"身份不行 + 怎么自己恢复"，
+         别把 CLI 的 code 丢给模型让它自己猜（它会猜成"要不要重试一次"）。 */
+      if (String(r.error.code || '').startsWith('auth')) {
+        probeCache = null;
+        return { ...NOAUTH(), op, name };
+      }
       return { error: r.error.message, code: r.error.code, op, name };
     }
     const d = r.data || {};
@@ -713,7 +894,19 @@ export function createOlares(o = {}) {
      * 失败不抛：预热是**优化**，不是前置条件。
      */
     async warm() {
-      const p = await probe();
+      let p = await probe();
+      /* 起来就发现身份坏了，就**自己登一次** —— 这一条是"程序自己应该能 auth"的
+         落点：用户不该知道 token 有过期这回事，更不该被叫去开终端。
+         失败不抛：预热是优化，不是前置条件。 */
+      if (!p.ok) {
+        const re = await reauth();
+        if (re.ok) {
+          console.log(`[olares] 启动时自动恢复了身份（${re.how}）`);
+          p = await probe();
+        } else if (re.reason !== 'cooling') {
+          console.warn('[olares] 身份用不了，且自动恢复失败：' + (authNote || re.reason || '未知'));
+        }
+      }
       if (!p.ok) return { ok: false, code: p.code };
       /* 只触发不等 —— 用户第一次问 apps 时如果配额还没到，readApps 会等它 */
       memTotal(false);

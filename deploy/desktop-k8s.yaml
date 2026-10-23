@@ -279,7 +279,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-          # 模型 key 走 Secret，不写进 yaml（更不能进镜像）
+          # 模型 key 走 Secret，不写进 yaml（更不能进镜像）。
+          # 同一个 Secret 里还有 Olares 身份（可选）：OLARES_ID +
+          # OLARES_REFRESH_TOKEN（优先）或 OLARES_PASSWORD。有它，CLI 的
+          # refresh 被拒时程序会**自己重登一次**，不用叫用户去开终端。
+          # install.sh 从 agent/.env 整份灌进来，所以加在 .env 里就会上线。
           envFrom:
             - secretRef:
                 name: emergent-desktop-env

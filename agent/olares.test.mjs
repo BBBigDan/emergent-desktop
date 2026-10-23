@@ -17,7 +17,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { createOlares, OPS, OP_DOC } from './olares.mjs';
+import { createOlares, OPS, OP_DOC, authState } from './olares.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const fx = (n) => JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures/olares', n), 'utf8'));
@@ -97,6 +97,87 @@ console.log('\n其它 op 的兜底');
   /* 没有 utilisaton 的不补 0 —— 补 0 会画出满格 */
   const noPct = shape('overview', { sections: { physical: { items: [{ raw: { metric: 'disk', value: 5, total: 10 } }] } } });
   ok(noPct.physical.disk.pct === undefined, '没有 pct 就不给（不补 0）');
+}
+
+/* ───────────────── 认证：哪些"没登录"其实能干活 ─────────────────
+ *
+ * 线上踩过（2026-10-23）：pod 里 `profile list` 一直是 `expired`，
+ * 而 `market list --mine` 照样跑得通（CLI 自己刷新了 token，跑完就变 `logged-in`）。
+ * 我们的闸判的是 `status.includes('logged')`，于是**拦住了一次本来会成功的调用**，
+ * 还让用户去终端跑 `olares-cli profile login` —— 而他面对的是一片桌面。
+ *
+ * 判据不是猜的：CLI 自己的 auth.md 写着 `expired` → "Proceed; the next command
+ * normally refreshes it"。所以这里钉的是**那张表**。
+ */
+console.log('\n认证状态');
+{
+  ok(authState('logged-in') === 'ok', 'logged-in → 干活');
+  ok(authState('expired') === 'stale', '**expired → 干活**（只是该刷 token 了，CLI 自己会刷）');
+  ok(authState('pending') === 'pending', 'pending → 干活（下一条命令会交换 grant）');
+  ok(authState('invalidated') === 'reauth', 'invalidated → 才需要重登');
+  ok(authState('never') === 'reauth', 'never → 需要登录');
+  ok(authState('') === 'unknown', '空 → unknown（去跑一条命令看）');
+  ok(authState('logged-in (unparseable token)') === 'ok', '解析不了的 token → 照跑');
+}
+
+/* 一个假 CLI：只回答 profile list 和 market list，其余给空数组。 */
+function fakeCli({ statusOf, onCall }) {
+  return async (argv) => {
+    onCall?.(argv);
+    if (argv[0] === 'profile' && argv[1] === 'list') {
+      return {
+        ok: true,
+        data: [{ name: 'a@b.com', olaresId: 'a@b.com', status: statusOf(), current: true }],
+      };
+    }
+    if (argv[0] === 'market' && argv[1] === 'list') {
+      return { ok: true, data: [{ name: 'jellyfin', title: 'Jellyfin', version: '1.0.35', source: 'market.olares', state: 'running' }] };
+    }
+    return { ok: true, data: [] };
+  };
+}
+
+/* 这两条不许被"环境里恰好有 key"影响 */
+delete process.env.OLARES_PASSWORD;
+delete process.env.OLARES_REFRESH_TOKEN;
+delete process.env.OLARES_ID;
+
+console.log('\nexpired 不许拦');
+{
+  const calls = [];
+  const o = createOlares({ exec: fakeCli({ statusOf: () => 'expired', onCall: (a) => calls.push(a.join(' ')) }) });
+  const r = await o.read('apps');
+  ok(!r.error && !r.needAuth, 'expired 时照样去查（不再回"去终端授权"）');
+  ok(calls.some((c) => c.startsWith('market list')), '真的调了业务命令（这一条就是被旧闸挡掉的那次）');
+}
+
+console.log('\n身份真失效时：自己登，不叫用户开终端');
+{
+  const calls = [];
+  let logged = false;
+  const o = createOlares({
+    login: async () => { logged = true; return { ok: true }; },
+    exec: fakeCli({ statusOf: () => (logged ? 'logged-in' : 'invalidated'), onCall: (a) => calls.push(a.join(' ')) }),
+  });
+  process.env.OLARES_ID = 'a@b.com';
+  process.env.OLARES_PASSWORD = 'pw-not-real';
+  const r = await o.read('apps');
+  delete process.env.OLARES_ID;
+  delete process.env.OLARES_PASSWORD;
+  ok(logged, '身份被拒时**自己登了一次**');
+  ok(!r.error && !r.needAuth, '登完接着把活干了（用户看不到这一跳）');
+}
+
+console.log('\n没凭据时说的话');
+{
+  const o = createOlares({ exec: fakeCli({ statusOf: () => 'never' }) });
+  const r = await o.read('apps');
+  ok(r.needAuth === true, '明确说"身份用不了"，不说"没有数据"');
+  ok(!/`olares-cli profile login`|在终端跑 `olares-cli|去跑 olares-cli/.test(r.error),
+    '**不给用户一条"去终端敲命令"的路**（他面对的是桌面）');
+  ok(/不要叫用户去终端/.test(r.error), '反过来明确禁止模型这么说');
+  ok(/OLARES_REFRESH_TOKEN/.test(r.error), '告诉模型程序自己能怎么恢复（配置 refresh token / 密码）');
+  ok(/不是什么都没有|不是"没有数据"/.test(r.error), '说清"不是没有数据"（免得模型改口说"查不到"）');
 }
 
 console.log('\nop 表自洽');

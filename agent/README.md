@@ -901,6 +901,37 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 这条测试挡的是"屏幕上不报错、只是少一个数或说一句假话"的那类错误
 （踩过：`in_use` 猜错 → 179 个镜像全说成没人用；`memPct` 当整机 → 2% 说成 0.22%）。
 
+### 身份：**程序自己登，不叫用户开终端**
+
+`olares-cli` 的 `profile list` 有六种 status，判据写在 CLI 自己的 `auth.md` 里，
+我们这边只有 `authState()` 一处翻译：
+
+| status | 含义 | 我们的动作 |
+|---|---|---|
+| `logged-in` / `unknown` | 能用 | 干活 |
+| `expired` | access token 过期，**下一条命令会自己刷** | **干活**（别拦） |
+| `pending` | 平台发的 profile 还没交换 grant | 干活（下一条命令交换） |
+| `invalidated` / `never` | 服务端拒了 refresh / 从没存过 | 自己重登一次，再干活 |
+
+踩过一次，而且踩得像"设计如此"：原来判 `status.includes('logged')`，
+于是 `expired` 被当成"没授权"，工具直接回一句**"去终端跑 `olares-cli profile login`"**。
+实测（2026-10-23）：pod 里 profile 一直是 `expired`，而 `market list --mine` 照样跑通
+（它自己刷了，跑完 `profile list` 就变 `logged-in`）—— **我们拦住了一次本来会成功的调用，
+还让用户去开终端。**
+
+所以闸门和自救必须在一起（`ensure()`）：`expired` 直接放行；真失效时**先自己登一次**
+（冷却 5 分钟、单飞），登不上才说话。恢复凭据从环境变量来，走同一个 Secret：
+
+| 变量 | 说明 |
+|---|---|
+| `OLARES_ID` | 用哪个身份登录（不给就用 profile list 里那个） |
+| `OLARES_REFRESH_TOKEN` | 优先：不用密码，改密码也不失效 |
+| `OLARES_PASSWORD` | 兜底：密码只走 stdin（`--password-stdin`，不进 argv / `ps`） |
+
+`warm()` 在启动时也走这条路 —— 起来发现身份坏了就自己接上，
+用户不该知道 token 有过期这回事。没配凭据时，工具返回的话里**不许出现**
+"去终端敲命令"，只说明缺哪个变量（`agent/olares.test.mjs` 钉住了这一条）。
+
 ### 写操作（`olares_act`，P5）
 
 停 / 开 / 重启 / 装 / 升级 / 卸载 / 取消 —— **单独一个工具，level=danger**。
