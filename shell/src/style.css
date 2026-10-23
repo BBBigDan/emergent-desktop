@@ -405,6 +405,11 @@ body.launching .rail-zone { display: none; }
  */
 .ag-mp {
   position: fixed; z-index: 8;
+  /* **必须自己打开指针**：祖先是 `.ag-layer { pointer-events: none }`（那一层
+     本来就不该接手势，桌面要能从它下面拖球）。少了这一行，面板看得见、点不动 ——
+     而 DOM 的 click 又不会报错，表现就是"点了没反应"（线上第一次就是这样）。
+     自测里用 `el.click()` 是**绕过命中测试**的，所以那份自测全绿也没挡住这个 bug。 */
+  pointer-events: auto;
   display: flex; flex-direction: column;
   border-radius: 14px;
   background: linear-gradient(180deg, rgba(6, 11, 18, 0.86) 0%, rgba(5, 9, 15, 0.8) 100%);

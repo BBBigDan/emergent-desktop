@@ -340,8 +340,19 @@ SYS=k8s                                   # k8s 读集群 / host 读本机 / moc
 本地服务怎么指：`MODEL_LOCAL_BASE=http://127.0.0.1:11434/v1`（默认值就是它）。
 集群里要指向 ollama 的 Service 名，例如 `http://ollama.app-xxx.svc:11434/v1`。
 
-自测：`node agent/models.test.mjs`（30 项，查三态齐全、不可用必写原因、价格 null≠0、
+自测：`node agent/models.test.mjs`（64 项，查三态齐全、不可用必写原因、价格 null≠0、
 id→接口的翻译只有一处）。
+
+**两个只会在真浏览器里现形的坑**（自测全绿也挡不住，都踩过）：
+
+1. **`.ag-layer` 是 `pointer-events:none`**，面板要自己 `pointer-events:auto`。
+   少了这一行：玻璃看得见、点不动，而 DOM 的 click 不报错 —— 线上第一次就是这样。
+   `el.click()` 绕过命中测试，所以要验"能不能点"，看 `document.elementFromPoint()`
+   或走 CDP 的 `Input.dispatchMouseEvent`（真实鼠标）。
+2. **粒子框只有一个**。它画的是"哪块空间被圈住了"，而两块玻璃（思考过程 / 换模型表）
+   同时只开一块 —— 挪过去比再开一个划算（第二个框要多吃 1140 个槽位，那是场景的预算）。
+   框的几何必须在 `setOpen(true)` **之前**改，否则它先在老地方亮起来再跳过去。
+   `closePicker()` 是唯一出口（收玻璃 + 收框 + 还光标），`picker.close()` 直接调会留一个亮着的框。
 
 ### 免费模型的实测：它们会"看"，但不可靠地"画"
 

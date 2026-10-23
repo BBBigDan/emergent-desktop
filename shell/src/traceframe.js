@@ -44,11 +44,23 @@ const SLOTS = N_FRAME + N_LINK + N_DUST + N_RING + N_SPARK;
    （踩过的现场：收起之后边框还留着两串大点在边上亮着）。 */
 const HIDDEN = { x: -9999, y: -9999, ink: 0 };
 
+/* 点距是这套粒子边框唯一的"能不能连成线"的开关，而点数（900）是**固定的** ——
+   于是周长越长，点距越大：那一栏（≈1300px）是 1.56px，换模型表面板
+   （≈1800px）就变成 2.0px，屏幕上是一条**虚线**（截图里一眼看出来）。
+   补不了点数（槽位是场景的），就按点距把**点径**放大同样的比例 ——
+   "点和点相切"这件事只跟 点径÷点距 有关，跟绝对尺寸无关。
+   1.32 是上限：再粗就成了霓虹灯管，不如让它细一点、看得出是点。 */
+const PER_REF = 1300;
+const DOT_REF = 1.55;
+
 export function createTraceFrame({ field, alloc, slots = SLOTS }) {
   const base = alloc.alloc(slots, 'trace');
 
   let rect = { x: 0, y: 0, w: 430, h: 236, r: 18 };
-  let anchor = { x: 0, y: 0 };     // 小脸的中心
+  /* 牵引线的起点（小脸的圆心）。可以**没有**：换模型那张表是从状态条上那个名字
+     长出来的，它就在表的正上方，再拉一根从名字到左中点的曲线会绕一个多余的圈 ——
+     那种面板不该有牵引线。`anchor:null` 就是"这块地方是独立的"。 */
+  let anchor = { x: 0, y: 0 };
   let raf = 0;
   let t0 = 0;
   /* 0 = 收起，1 = 全开。rev 是"生长到哪一步"，和 level 分开：
@@ -200,9 +212,13 @@ export function createTraceFrame({ field, alloc, slots = SLOTS }) {
        读起来是"那团东西伸出来一块"。 */
     const lx = rect.x;
     const ly = rect.y + rect.h / 2;
-    const ax = anchor.x + 22;
-    const ay = anchor.y + 2;
+    /* 没有锚点（换模型那张表）就整批挪出屏幕。**判断必须在取 anchor.x 之前** ——
+       写在循环里的话，`ax` 那两行会先抛 TypeError，而 rAF 里的异常是静默的：
+       框不动了、控制台一行都没有（这一条在模块头上写过，别再踩）。 */
+    const ax = anchor ? anchor.x + 22 : 0;
+    const ay = anchor ? anchor.y + 2 : 0;
     for (let i = 0; i < N_LINK; i++) {
+      if (!anchor) { pts.push(HIDDEN); continue; }
       const f = i / (N_LINK - 1);
       /* 二次贝塞尔：控制点在下方，线微微下垂，像被拉出来的一道丝 */
       const mx = (ax + lx) / 2;
@@ -220,7 +236,9 @@ export function createTraceFrame({ field, alloc, slots = SLOTS }) {
        也就是一条虚线边框。1.55 时可见芯 ≈ 1.7px，点与点相接，边才成一条线（再往上就糊成一条粗光带，
        1.85 试过 —— 厚得像霓虹灯管）；
        流动感由那两道更大的流光给（见下面 spark）。 */
-    field.slotPut(base, pts, [0.44, 0.80, 1.0], 0.88, null, 1.55);
+    /* 点径跟着周长走：1.55 是在 ≈1300px 的周长上量的（见 PER_REF） */
+    const dotK = Math.min(1.32, Math.max(1, per / PER_REF));
+    field.slotPut(base, pts, [0.44, 0.80, 1.0], 0.88, null, DOT_REF * dotK);
 
     /* ── 内部尘埃：框里那点"空气" ──
        面板是半透明的玻璃（0.72 + blur），这些点透过它变成一层很淡的底噪。
@@ -296,7 +314,7 @@ export function createTraceFrame({ field, alloc, slots = SLOTS }) {
         w: Math.round(o.w), h: Math.round(o.h),
         r: o.r ?? 18,
       };
-      if (o.anchor) anchor = { x: o.anchor.x, y: o.anchor.y };
+      anchor = o.anchor ? { x: o.anchor.x, y: o.anchor.y } : null;
       if (prev.x !== rect.x || prev.y !== rect.y || prev.w !== rect.w || prev.h !== rect.h) build();
     },
 

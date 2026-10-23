@@ -11,8 +11,13 @@
  *   · **会不会调工具**：不会调的模型**能看见但不能选** —— 它连一屏都铺不出来
  *     （`scene_show` 本身就是工具）。灰着不说原因等于让用户猜。
  *
- * 它是 glass 面板（和「思考过程」同一套材质），因为它要读、要被点；
- * 但**面板本身不吃背后的手势**（deskagent 的 pick 会在这里让路）。
+ * 它是 glass 面板（和「思考过程」同一套材质），外面围同一圈**粒子框** ----
+ * 这一层里没有"边框"，一块区域要被圈出来只能是粒子自己围（traceframe.js）。
+ * 框由 deskagent 管：它俩同时只开一块玻璃，所以框在两者之间挪，不是各开一个。
+ *
+ * 还有一条只有真浏览器才看得见的：**它必须自己 `pointer-events: auto`**
+ * （`.ag-layer` 是 none，桌面要能从这一层下面拖球）。少了它就是"看得见、点不动"，
+ * 而 DOM 的 click 不报错 —— 用 `el.click()` 做自测是绕过命中测试的，挡不住这个。
  */
 
 const el = (tag, cls, txt) => {
@@ -78,6 +83,7 @@ export function createModelPicker(o = {}) {
   }
 
   function render() {
+    const hadRows = rowById.size;
     list.innerHTML = '';
     rowById.clear();
     if (!data) return;
@@ -138,6 +144,9 @@ export function createModelPicker(o = {}) {
     const cur = currentModel();
     meta.textContent = cur ? cur.name : '';
     say(null);
+    /* 行数变了面板就长高了（比如表刚从服务端回来），外面那圈粒子框跟着走 ——
+       否则框会停在"空玻璃"那个高度上，看起来像围错了地方。 */
+    if (open && rowById.size !== hadRows) requestAnimationFrame(() => o.onResize?.());
   }
 
   x.addEventListener('click', (e) => { e.stopPropagation(); o.onClose?.(); close(); });
@@ -151,10 +160,13 @@ export function createModelPicker(o = {}) {
     const left = Math.max(16, Math.min(rect.left, innerWidth - w - 16));
     root.style.width = `${w}px`;
     root.style.left = `${left}px`;
-    root.style.top = `${Math.round(rect.bottom + 8)}px`;
+    /* 16 而不是 8：外面还有一圈 8px 的粒子框，贴太近那圈会压在状态条那行字上 */
+    root.style.top = `${Math.round(rect.bottom + 16)}px`;
     /* 高度上限按"到屏幕底部还剩多少"算，不写死 —— 短窗口里写死会顶出去 */
-    root.style.maxHeight = `${Math.max(220, innerHeight - rect.bottom - 48)}px`;
+    root.style.maxHeight = `${Math.max(220, innerHeight - rect.bottom - 56)}px`;
     open = true;
+    /* 先报一次几何：框要在玻璃出现的同时就在那儿，不能等第一行数据回来才长出来 */
+    requestAnimationFrame(() => o.onResize?.());
     /* 表是现取的（本地要探测）。这一两百毫秒里**不能是一块空玻璃**——
        看起来像"点了没反应"。底下那行先说一句它在干什么。 */
     if (!data) { list.innerHTML = ''; foot.textContent = '正在看有哪些模型…'; }
@@ -181,8 +193,16 @@ export function createModelPicker(o = {}) {
     return px >= r.left && px <= r.right && py >= r.top && py <= r.bottom;
   }
 
+  /** 面板现在占的那块地方（页面坐标）。粒子框照着它画，所以必须是**真实**盒子。 */
+  function rect() {
+    if (!open) return null;
+    const r = root.getBoundingClientRect();
+    return { x: r.x, y: r.y, w: r.width, h: r.height };
+  }
+
   return {
     el: root,
+    rect,
     openAt,
     close,
     isOpen,

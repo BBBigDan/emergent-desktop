@@ -130,9 +130,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
    */
   const picker = createModelPicker({
     onPick: (id) => send({ t: 'model', id }),
-    /* 用户自己收起来：点名字时输入框会失焦（那一行不可聚焦），
-       这里把光标还回去 —— 他刚才很可能正打到一半。 */
-    onClose: () => { if (pickerWasTyping) typeEl.focus(); },
+    /* 表回来后行数一变，面板会长高 —— 框跟着重画（见 pickerResize） */
+    onResize: () => { if (picker.isOpen()) frameToPicker(); },
+    /* **面板里自己收起来的那两条路**（点 ×、点了当前那个）也要走同一个出口：
+       出口里除了收玻璃，还要把外面那圈粒子框一起收、把光标还回输入框。
+       少走这一步的表现是"玻璃没了，框还亮在原处"（自测里撞到过）。 */
+    onClose: () => { closePicker(); },
   });
   layer.appendChild(picker.el);
   let pickerData = null;      // 服务端给的那张表（含 current / busy）
@@ -250,6 +253,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (!trace || trace.isOpen() || !open) return;
     clearTimeout(traceTimer);
     traceTimer = 0;
+    /* 框可能还停在换模型表面上（几何是那一块的），开之前先挪回来 */
+    frameToTrace();
     trace.open({ toTop });
     hideTip();
   }
@@ -280,7 +285,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   addEventListener('pointerdown', (e) => {
     if (!picker.isOpen()) return;
     if (e.target instanceof Element && e.target.closest('.ag-mp, .ag-model')) return;
-    picker.close();
+    closePicker();
   });
 
   /** 点小脸：开着就收，收着就开（再看一遍刚才的经过） */
@@ -328,28 +333,65 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     }
   }
 
+  /* ── 那一圈粒子框归谁 ──
+   *
+   * 这一层同时只会有一块玻璃，所以**框只有一个**：它画的是"哪一块空间被圈住了"，
+   * 不是"哪一栏的装饰"。再开第二个框要多吃 1140 个槽位，而那份预算现在是场景的
+   * （场景挤不下就整屏不铺）。所以换模型表面板开的时候，把同一个框挪过去。
+   *
+   * 挪必须在 setOpen(true)**之前**：框在 level=0 时是不可见的，这时候改几何什么都看不出来；
+   * 反过来就是"框先在老地方亮起来，然后跳过去"。 */
+  function frameToTrace() {
+    tframe?.layout({ ...traceGeom(), anchor: faceGeom() });
+  }
+
+  /* 玻璃外面留 8px：和那一栏同一条规矩 —— 框画在玻璃**外面**才看得见，
+     压到边上就被玻璃盖住了（canvas 在 DOM 下面）。 */
+  function frameToPicker() {
+    const r = picker.rect();
+    if (!r || !r.w || !r.h) return false;
+    const m = 8;
+    tframe?.layout({
+      x: Math.round(r.x - m), y: Math.round(r.y - m),
+      w: Math.round(r.w + 2 * m), h: Math.round(r.h + 2 * m),
+      /* 没有牵引线：这个面板就在那个名字的正下方，再拉一根线是多余的绕环 */
+      anchor: null,
+    });
+    return true;
+  }
+
   function openPicker({ force = false } = {}) {
     if (!open) return;
-    /* 先收那一栏：它和新面板抢同一块地方，而且它的框会从玻璃边缘漏出来 */
-    if (trace?.isOpen()) { tracePinned = true; closeTrace(); }
+    /* 先收那一栏：它和新面板抢同一块地方，而且它的框会从玻璃边缘漏出来。
+       **不设 tracePinned** —— 是"让位"，不是"用户关掉了它"；这一轮要是还在跑，
+       后面那条 `think` 会把它放回来（但那时面板已经让位了）。 */
+    if (trace?.isOpen()) closeTrace();
     /* 点名字会让输入框失焦（那一行是不可聚焦的 DOM），关了面板要还回去 ——
        否则用户"点一下看看有哪些模型"，回来发现自己打的半句话不在光标上了。 */
     pickerWasTyping = document.activeElement === typeEl;
     const r = barModel.getBoundingClientRect();
     picker.openAt(r);
+    /* 框先挪过去、再亮：openAt 之后 DOM 盒子已经是最终位置了（同步取得到） */
+    if (frameToPicker()) { tframe?.setHint(false); tframe?.setOpen(true); }
     /* 开着的时候先显示上一次拿到的表（立刻有东西看），同时去要一份新的 */
     if (pickerData) picker.setData(pickerData);
     loadModels(force);
   }
 
-  function closePicker() {
+  /** @param {{focus?:boolean}} [o] focus=false 用于"整层收起"：那时候不该把光标塞回输入框 */
+  function closePicker({ focus = true } = {}) {
     const was = picker.close();
-    if (was && pickerWasTyping) typeEl.focus();
-    return was;
+    if (!was) return false;
+    /* 框跟着收。收完把"点脸还能看经过"那道弧恢复成它本来该有的样子 ——
+       框是同一圈粒子，状态也得跟着还回去。 */
+    tframe?.setOpen(false);
+    tframe?.setHint(hasTraceRows() && !trace?.isOpen());
+    if (focus && pickerWasTyping) typeEl.focus();
+    return true;
   }
 
   function togglePicker() {
-    if (picker.isOpen()) { picker.close(); return; }
+    if (picker.isOpen()) { closePicker(); return; }
     openPicker();
   }
 
@@ -1198,6 +1240,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         break;
 
       case 'turn':
+        /* 开始说话了，那张表就该收：框只有一个，turn 会把框交给「思考过程」，
+           面板留在屏幕上就成了一块没有框的玻璃。 */
+        if (picker.isOpen()) closePicker();
         setBusy(true);
         /* 新问题 = 上一屏作废（进"在想"时屏幕上只该有问 + 环）。
            放在 turn 而不是只放 submit：手势回合也要走这里，而 adjust 不清。 */
@@ -1215,7 +1260,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       case 'think':
         setThink(m.on);
         trace?.think(m.on, m.step);
-        if (m.on) { cancelCloseTrace(); if (!tracePinned) openTrace(); }
+        /* 换模型那表面板开着就别抢：框只有一个，抢过去面板就成了一块没框的玻璃 */
+        if (m.on) { cancelCloseTrace(); if (!tracePinned && !picker.isOpen()) openTrace(); }
         break;
 
       case 'say':
@@ -1923,7 +1969,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     /* 球面在 700ms 里回来；池子同步缩回，那一万多个槽位不该继续挂在界面上 */
     field.setAgentMode(false);
     closeSurface();
-    picker.close();
+    closePicker({ focus: false });
     clearTimeout(drawTimer);
     drawTimer = 0;
     drawLine = '';
@@ -2045,7 +2091,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       return true;
     },
     /** 换模型的表在最上层（它从状态条长出来，盖住那一栏）。活着就先收它 */
-    closePicker: () => picker.close(),
+    /* 注意调的是**本地那个函数**，不是 picker.close()：框的收放写在里面。
+       直接调 picker.close() 的话玻璃没了、框还亮着（自测里就是这么发现的）。 */
+    closePicker: () => closePicker(),
     /** 「思考过程」是第二层浮窗（在记录之下、场之上）。活着就先收它 */
     closeTrace: () => {
       if (!trace?.isOpen()) return false;
@@ -2120,6 +2168,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       mood: face?.mood,
       layers: scene ? [...scene.layers.keys()] : [],
       spec: scene?.spec?.layers?.map((l) => l.kind + ':' + l.id).join(' ') || '',
+      /* 那一圈粒子框现在围的是哪块地方 —— 两块玻璃（思考过程 / 换模型）
+         共用它，"框围错了地方"是这块最容易出的错，所以这个数要能一眼看到。 */
+      frame: tframe ? tframe.dbg() : null,
       /* 调试用：几何是这一屏所有"看起来不对"的第一现场 */
       area: area ? { x: area.x, y: area.y, w: area.w, h: area.h } : null,
       face: faceGeom(),
