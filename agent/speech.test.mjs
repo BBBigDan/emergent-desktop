@@ -59,5 +59,31 @@ console.log('\n其它形态');
   ok(cleanSpeech('正常。\n    {"ask":"要看吗"}') === '正常。', '缩进的 JSON 也切');
 }
 
+/* ── 收口那一次的副产品：模型改用 XML 文本表达工具调用 ──
+ *
+ * 实测（2026-10-23，真模型 + MAX_STEPS=2）：工具表一撤，它把
+ * `<｜DSML｜ parameter name="reading">…` 整段当回答吐了出来，尖括号直接上屏。
+ * 答案就在 reading 里 —— 抽出来，别整段丢。
+ */
+{
+  const DSML = `<｜DSML｜ calls>
+<｜DSML｜ invoke name="scene_show">
+<｜DSML｜ parameter name="reading" string="true">完整的应用清单现在看不到，因为身份没授权。</｜DSML｜ parameter>
+<｜DSML｜ parameter name="gauges" string="false">[{"label":"CPU","value":0.71}]</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>`;
+  ok(cleanSpeech(DSML) === '完整的应用清单现在看不到，因为身份没授权。',
+    'XML 形式的调用被拆开，只留 reading 那句');
+  ok(!/[<>｜]/.test(cleanSpeech(DSML)), '上屏的文本里不剩尖括号和全角竖线');
+  /* Qwen / Anthropic 的写法是同一类东西，别只认 DSML 一个标 */
+  const QWEN = '<tool_call>\n{"name":"scene_show","arguments":{"reading":"这台机器现在很闲，CPU 只有 3%。"}}\n</tool_call>';
+  ok(!/<tool_call>/.test(cleanSpeech(QWEN)), 'Qwen 的 <tool_call> 也拦得住');
+  /* 抽不出人话就返回空 —— 上层据此走"系统说实话"，而不是把尖括号糊上屏 */
+  ok(cleanSpeech('<｜DSML｜ invoke name="x">') === '', '抽不出内容时返回空');
+  /* 正文里正常的尖括号不能误伤（"温度 <5℃"这种） */
+  ok(cleanSpeech('温度 <5℃ 的时候它会降频。') === '温度 <5℃ 的时候它会降频。',
+    '正文里的普通尖括号不动');
+}
+
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');
 process.exit(failed ? 1 : 0);

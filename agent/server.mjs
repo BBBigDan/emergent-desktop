@@ -85,10 +85,19 @@ const MODEL_ID = process.env.MODEL || (process.env.MODEL_KEY ? DEFAULT_MODEL : '
  * 拒掉的调用（k8s_restart / scene_ask），有效工具只有 3 个。
  * 每多一步就是**多一次整份上下文**（12k 起），8 步 = 10 万 token 输入。
  *
- * 所以拆成两个上限：默认 5，一旦这一轮动了造工具的那几个，才放宽到 8。
- * 判据写在代码里（看到 tool_* / skill_save 被调用），不靠模型自己声明。 */
-const MAX_STEPS = Number(process.env.MAX_STEPS || 5);
-const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 8);
+ * 所以拆成两个上限：默认 10，一旦这一轮动了造工具的那几个，才放宽到 16。
+ * 判据写在代码里（看到 tool_* / skill_save 被调用），不靠模型自己声明。
+ *
+ * **这两个数是"安全网"，不是"正常终点"。**
+ * 以前默认 5，后果是"查了几次就被掐断、而且一句话都不说"（见 runTurn 里
+ * 那个 while 的注释）。业界默认也是这个量级（OpenAI Agents SDK 的 max_turns
+ * 是 10），区别在于它们撞上上限会**报错**；我们要的是"撞上了也把结论说出来"，
+ * 那一层由 `finalize()` 负责。 */
+const MAX_STEPS = Number(process.env.MAX_STEPS || 10);
+const MAX_STEPS_FORGE = Number(process.env.MAX_STEPS_FORGE || 16);
+/* 一整轮的墙钟上限。步数管不住"每一步都很慢"（一次工具 40 秒），
+   而用户对"没结果"和"等太久"的感受是同一件事。到点就收口，不再往下等。 */
+const TURN_MS = Number(process.env.TURN_MS || 120000);
 /* 上下文满窗自收的水位（见 history.mjs）。78% 动手，收到 45% ——
    留出滞回，否则每轮都会裁一点点，而"每轮都变"对前缀缓存是最坏的事。 */
 const CTX_TRIM_AT = Number(process.env.CTX_TRIM_AT || 0.78);
@@ -1053,6 +1062,125 @@ function coldAllow(goal) {
   return allow;
 }
 
+/* ───────────────────── 收口：这一轮必须有结局 ───────────────────── */
+
+/**
+ * 最后一句话，**不经过模型**。
+ *
+ * 走到这里说明：预算用尽 / 墙钟到点 / 原地打转 / 空回复，而且模型连
+ * "总结一下"都没说出来。这时候屏幕上绝不能是空的 —— 空白会被读成"它没听见"。
+ *
+ * 但**也不能拿不相干的东西顶上**。这一轮问的是"系统里装了什么"，
+ * 摆一段旧记忆就是答非所问，比空白更糟：用户会以为它答了，只是答歪了。
+ * （实测就是这么发生的：屏幕上最后一句是"我记得这件事"。）
+ *
+ * 所以这里只用**这一轮真的发生过的事**说话：调过哪几个工具（翻成人话）、
+ * 几次没成。宁可说"我查了三遍都没拿到东西"，也不装作答上了。
+ */
+function closeFallback(s, why) {
+  const acts = (s.acts || []).filter((a) => !a.denied);
+  const verbs = [...new Set(acts.map((a) => {
+    try { return toolLine(a.name, {}).verb; } catch { return '查了一下'; }
+  }))].slice(0, 3);
+  const bad = acts.filter((a) => !a.ok).length;
+
+  let line;
+  if (!acts.length) {
+    /* 一步都没走成：它连工具都没调。原因只可能是模型那边（空回复、被截断）。 */
+    line = '这次我没能给出回答 —— 模型返回的是空的。要我再来一次吗？';
+  } else {
+    const what = verbs.length ? `（${verbs.join('、')}）` : '';
+    const tail = why === 'slow' ? '这次太慢了，先停在这儿。'
+      : why === 'stuck' ? '我一直在查同一个地方，卡住了。'
+        : why === 'cap' ? '要接着查就说一声。'
+          : '';
+    line = `我查了 ${acts.length} 次${what}${bad ? `，其中 ${bad} 次没成` : ''}，`
+      + `但没能把这些串成答案。${tail}`;
+  }
+  s.spoke = true;
+  speak(s, line);
+  return line;
+}
+
+/**
+ * 收口（finalize）：这一轮不是"模型把话说完了"结束的，所以**再问它一次结论**。
+ *
+ * 参考的是几个真跑在生产里的循环怎么处理"没说完"：
+ * OpenAI Agents SDK 撞上 `max_turns` 会抛 `MaxTurnsExceeded`（带上已有结果），
+ * Anthropic 的服务端循环撞上限回 `pause_turn` —— 含义都是"**没做完**"，
+ * 而不是"结束了"。我们这边的对应做法是：关掉工具，再要一次结论，
+ * 拿不到就由系统说一句实话（`closeFallback`）。
+ *
+ * 三个刻意的决定：
+ *
+ * ① **撤掉工具表，而不是只写 `tool_choice:'none'`。** 那个参数不是每个
+ *    服务端都认（`required` 已经被拒过，见 `model.openai.mjs` 的降级），
+ *    而"没有工具可用"在任何 OpenAI 兼容接口上都成立 —— 空表意味着适配器
+ *    根本不会带 `tools` 字段。
+ * ② **要结论，不要道歉。** 提示里明确写"不要说抱歉、不要解释这件事本身"：
+ *    7B 会写"很抱歉我无法完成"，那句话对用户零信息，还占满一屏。
+ * ③ **`force` 写进去。** `putVoice` 默认"长回答优先"，而这一轮很可能
+ *    已经说过一句"我先看看"——不强制的话，真正的结论会被那句客套挡住。
+ */
+async function finalize(s, why, ctxNote, steps = 0) {
+  if (s.abortCtl?.signal?.aborted) return false;
+  const reason = {
+    cap: `这一轮已经调了 ${steps} 次工具，次数到上限了。`,
+    slow: '这一轮花的时间太长了，先停在这儿。',
+    stuck: '你连着几次在调同一个工具、同一组参数，没有进展。',
+    silent: '你刚才那句话是空的，屏幕上什么都没有。',
+  }[why] || '这一轮停下来了。';
+
+  const ask = `${reason}现在不要再调工具（工具已经关掉了），`
+    + '用**已经拿到的结果**直接回答用户刚才的问题。'
+    + '如果没查到想要的，就说清楚：查了什么、拿到了什么、卡在哪一步。'
+    + '2~5 句，直接说结论。不要说抱歉，也不要解释这件事本身。';
+
+  /* **这段提示不进历史。**
+     它写着"工具已经关掉了" —— 真写进 s.messages，下一轮模型会以为
+     直到现在工具还是关的，于是"能查也不查"。只在这一次请求里临时附上，
+     历史里留下的是 user(问题) → assistant(结论)，干净。 */
+  const reqMsgs = [...s.messages, { role: 'user', content: `（${ask}）` }];
+
+  emit(s, { t: 'think', on: true, step: steps });
+  let out;
+  try {
+    out = await s.model.complete({
+      messages: withMemory(reqMsgs, ctxNote),
+      tools: [],                       // 空表 = 适配器不带 tools 字段 = 只能说话
+      goal: { ...s.goal, closing: true },
+      signal: s.abortCtl.signal,
+    });
+  } catch (e) {
+    if (e?.aborted || s.abortCtl?.signal?.aborted) return false;
+    /* 收口这一问也失败了（超时 / 429）。不往上抛：这一轮的数据还在手里，
+       交给下面的兜底说一句话，比抛出去让用户看到"模型超时"好。 */
+    console.warn('[finalize] 收口调用失败：' + (e?.message || e));
+    closeFallback(s, why);
+    emit(s, { t: 'note', message: `收口没成（${e?.message || e}），由系统说一句` });
+    return true;
+  } finally {
+    emit(s, { t: 'think', on: false, step: steps });
+  }
+
+  recordUsage(s, out, reqMsgs, []);
+  let text = cleanSpeech(String(out.content || '').trim());
+  /* 它可能把"我需要调用 xxx"当结论写出来 —— 那是给自己下的指令，不是话。 */
+  if (/^\s*[[{]/.test(text) || /^(调用|请调用|我应该调)/.test(text)) text = '';
+
+  if (text) {
+    putVoice(s, text, { force: true });
+    /* 说了话就进历史。不然下一轮模型看到的是"我问了它一句、它没答"，
+       会以为上一轮彻底失败了（其实它答过，只是那句话只出现在屏幕上）。 */
+    s.messages.push({ role: 'assistant', content: text });
+    emit(s, { t: 'note', message: `这一轮到此为止：${({ cap: '工具次数用尽', slow: '时间到', stuck: '原地打转', silent: '模型空回复' })[why] || why}，我把结论说出来了` });
+  } else {
+    closeFallback(s, why);
+    emit(s, { t: 'note', message: `这一轮到此为止：${({ cap: '工具次数用尽', slow: '时间到', stuck: '原地打转', silent: '模型空回复' })[why] || why}，模型没说结论，由系统说一句` });
+  }
+  return true;
+}
+
 async function runTurn(s, goal) {
   if (s.busy) { emit(s, { t: 'busy' }); return; }
   /* 预算闸放在最前面：**不是**等这一轮跑完再记账。
@@ -1219,10 +1347,40 @@ async function runTurn(s, goal) {
     let repeats = 0;
     let nudges = 0;
     const stepCap = () => (s.forgeStep ? MAX_STEPS_FORGE : MAX_STEPS);
-    for (let step = 0; step < stepCap(); step++) {
+    /* ── 这一轮怎么结束 ──
+     *
+     * **不是"走完 N 步"。** 参考的是几个真跑在生产里的循环：
+     *   · Anthropic：`while stop_reason == "tool_use"` —— 退出条件是"模型给出
+     *     最终回答"，其它任何停止理由都由应用处理；服务端循环撞上限会回
+     *     `pause_turn`，含义是"没做完，接着来"，**不是**结束。
+     *   · OpenAI Agents SDK：输出分类成 final / handoff / tool_calls，只有 final
+     *     才结束；`max_turns` 是安全网，撞上**抛异常**并带上已有结果。
+     *   · LangGraph：`recursion_limit` 撞上抛 `GraphRecursionError`。
+     *
+     * 它们有一条共同的纪律：**"没有最终输出"是一个必须显式处理的状态**，
+     * 不能当成正常返回。
+     *
+     * 我们以前正是 `for (step < 5)` —— 把安全网当成了正常终点：第 5 步用完
+     * 就跳出循环，**从来没有再问过模型"那你说结论"**。用户问"系统里装了什么"，
+     * 它查了五次，屏幕上一句话都没有（复现脚本 `.tmp/repro-silent.mjs loop`，
+     * 最后竟是"我记得这件事"顶上去的）。这就是"它去查了，然后就没有然后"。
+     *
+     * 现在只有两条路能结束：
+     *   ① 模型不再要工具 —— 它给出了回答（正常终局，`stop` 保持空串）；
+     *   ② 预算用完 / 墙钟到点 / 原地打转 —— `stop` 记下原因，
+     *      出去之后**必须收口**（`finalize()`：关掉工具，再问一次要结论）。
+     */
+    let step = 0;
+    let stop = '';
+    const tTurn = Date.now();
+    for (;;) {
       /* 上一轮工具刚跑完就被按了停：这里也要接住，别再多问模型一次 */
       if (s.abortCtl.signal.aborted) { aborted = true; throw ABORT_TURN; }
-      emit(s, { t: 'think', on: true, step });
+      if (step >= stepCap()) { stop = 'cap'; break; }
+      if (Date.now() - tTurn > TURN_MS) { stop = 'slow'; break; }
+      const at = step;
+      step = at + 1;
+      emit(s, { t: 'think', on: true, step: at });
       let out;
       const reqMsgs = withMemory(s.messages, ctxNote);
       const schemas = s.tools.schemas(coldTools(allow));
@@ -1239,7 +1397,7 @@ async function runTurn(s, goal) {
           /* 强制取证是为了防止它凭空编读数。但**记忆里已经有答案**时，
              强制调工具反而有害：实测它会去挑一个"看起来相关"的工具（k8s_get），
              拿到与该问题无关的结果，然后什么也不说 —— 记忆就白存了。 */
-          toolChoice: step === 0 && goal.kind === 'ask' && !memHits.length ? 'required' : 'auto',
+          toolChoice: at === 0 && goal.kind === 'ask' && !memHits.length ? 'required' : 'auto',
           goal: { ...goal, pendingTo: s.lastAdjustTo },
           signal: s.abortCtl.signal,
         });
@@ -1251,7 +1409,7 @@ async function runTurn(s, goal) {
         /* 必须放 finally：模型超时或 402 时 await 会抛，写在后面的
            think:off 就永远发不出去 —— 前端会一直停在"低相干度"，
            整个场看起来在抖，像是卡住了，而不是"出错了"。 */
-        emit(s, { t: 'think', on: false, step });
+        emit(s, { t: 'think', on: false, step: at });
       }
       recordUsage(s, out, reqMsgs, schemas);
 
@@ -1260,7 +1418,7 @@ async function runTurn(s, goal) {
          一句话不说，屏幕上就是一片安静的粒子，看起来像"它没听懂"，
          其实是模型这一口气没接上。给它一句提示再问一遍，成功率明显高于
          把这一轮判死。只重试 step 0，免得在本该停下的地方原地打转。 */
-      if (step === 0 && !(out.tool_calls || []).length && !String(out.content || '').trim()) {
+      if (at === 0 && !(out.tool_calls || []).length && !String(out.content || '').trim()) {
         emit(s, { t: 'note', message: '模型空回复，重试一次' });
         /* 那一次空回复**也要记账**：它同样发了整份上下文，同样计费。
            上面那次已经记过了，这里只记重试这一次。 */
@@ -1384,6 +1542,9 @@ async function runTurn(s, goal) {
           s.messages.push({ role: 'user', content: `（还没做完。${s.pendingNext}）` });
           continue;
         }
+        /* 没调工具、也没说出能上屏的话（空回复，或整段被清洗掉）——
+           这同样不是"它说完了"，是"这一口气没接上"。 */
+        if (!voice && !s.spoke) stop = 'silent';
         break;
       }
 
@@ -1397,7 +1558,11 @@ async function runTurn(s, goal) {
            （"同一个工具、同一组参数、新版本"），按一次就掐会把它自己的正常重试
            判成卡住。上限仍是 8 步，不会因此转圈。 */
         if (repeats >= 2) {
-          emit(s, { t: 'note', message: '模型重复了同一组调用，已中止这一轮' });
+          /* 原地打转同样是"没说完就断了"：以前这里只发一条 note 就 break，
+             用户看到的是思考栏里同一行动作闪了三遍然后安静下来。
+             现在记下原因，出去收口（让模型用已经拿到的东西说一句）。 */
+          stop = 'stuck';
+          emit(s, { t: 'note', message: '模型重复了同一组调用，这一轮就此收口' });
           break;
         }
       } else {
@@ -1753,6 +1918,15 @@ async function runTurn(s, goal) {
       }
     }
 
+    /* ── 收口 ──
+       走到这里，如果 `stop` 有值，说明这一轮**不是模型说完的**：
+       预算用尽 / 墙钟到点 / 原地打转 / 空回复。那就再问它一次结论。
+
+       这一步是整件事的重点。没有它，用户看到的就是"它去查了，然后没有然后" ——
+       而屏幕上的最后一句可能是毫不相干的兜底（实测：问"系统里装了什么"，
+       它最后说"我记得这件事"）。 */
+    if (stop) await finalize(s, stop, ctxNote, step);
+
     /* 手势回合里把话补上：问题已经问出去了，但那一行字不能空着 */
     if (s.drew && !s.spoke && s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust') {
       s.spoke = true;
@@ -1897,9 +2071,15 @@ async function runTurn(s, goal) {
       emit(s, { t: 'note', message: '模型没铺这一屏，由系统按回忆结果铺了一张卡' });
     }
 
-    /* 记忆兜底：模型什么都没说、什么都没铺，但这轮明明从记忆里取到了东西。
-       沉默是最坏的答案 —— 用户会以为它不记得。这里把取到的那几条摆出来。 */
-    if (!s.spoke && !s.drew && memHits.length && s.goal?.kind === 'ask') {
+    /* 记忆兜底：模型什么都没说、什么都没铺，但这轮从记忆里取到了东西。
+       沉默是最坏的答案 —— 用户会以为它不记得。这里把取到的那几条摆出来。
+
+       但要**多加一个前提**：这一轮它压根没动手。一旦它调过工具（`s.acts` 非空），
+       说明问的是别的事、只是没查成 —— 这时候摆一段旧记忆就是答非所问，
+       比空白更糟：用户会以为它答了，只是答歪了。
+       （实测原话：问"系统里装了什么"，屏幕上最后一句是"我记得这件事"。
+       那条兜底以前只看"它没说话"，不看"它有没有在查别的东西"。） */
+    if (!s.spoke && !s.drew && !(s.acts || []).length && memHits.length && s.goal?.kind === 'ask') {
       s.drew = true;
       s.spoke = true;
       speak(s, '我记得这件事');
@@ -1950,6 +2130,20 @@ async function runTurn(s, goal) {
     }
 
     if (!s.drew && (freshStatus || freshApps) && s.goal?.kind === 'ask') await salvage(s);
+
+    /* ── 不变量：这一轮不许"什么都没有" ──
+     *
+     * 上面那一长串兜底都是"按遇到的事铺一屏"，每一条都有自己的前提
+     * （本轮读过状态 / 列过文件 / 命中记忆…）。**只要前提全不成立，
+     * 它们就一起不触发** —— 而用户那边看到的是同一件事：它去查了，然后没然后。
+     *
+     * 所以最后留一道闸：到这儿还没说过话、也没铺过东西，就由系统说一句实话。
+     * 这句话不装作答上了（见 closeFallback），它只说明"查到了什么、卡在哪"。
+     * 有它兜着，"静默退出"这条路才算真的堵死。 */
+    if (!s.spoke && !s.drew) {
+      closeFallback(s, stop || 'silent');
+      console.warn(`[turn] 静默收口：${s.sid} 第 ${s.turn} 轮没有产出（stop=${stop || 'none'}，工具 ${(s.acts || []).length} 次）`);
+    }
   } catch (e) {
     if (e !== ABORT_TURN) {
       /* 模型挂了（超时 / 429 / 连不上）时，**先把已经拿到的数据铺出来**。

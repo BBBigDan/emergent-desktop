@@ -25,12 +25,37 @@ const PLAN_LINE = /^\s*(第\s*\d+\s*步|步骤\s*\d|接下来(我|要|会|还)|�
  *  一行以 `{`/`[` 开头且紧跟着 `"键":` 的，在自然语言里没有正经用途。 */
 const JSON_LINE = /^\s*[[{]\s*"[A-Za-z_]+"\s*:/;
 
+/** 模型用"XML 文本"表达的工具调用（DeepSeek 的 `<｜DSML｜ invoke …>`、
+ *  Qwen 的 `<tool_call>`、Anthropic 的 `<antml:invoke>`，都是同一类东西）。
+ *
+ *  **它只在一种情况下出现：工具表被撤掉、而模型仍然想调工具。**
+ *  也就是"收口"那一次（见 server.mjs 的 `finalize`）—— 它想把 reading 说出来、
+ *  想铺一屏，但手上没有 tools 可用，于是把调用写成了文本。
+ *
+ *  整段上屏就是一片尖括号（实测原样上屏过），而**答案其实藏在
+ *  `name="reading"` 那个参数里**。所以这里先抽它，抽不到就把标签全去掉、
+ *  取最长的文本节点；都不行返回空，由上层走"系统说实话"那条路。
+ */
+const MARKUP = /<[｜|]?\s*(DSML|tool_call|function_call|invoke|parameter|antml)[^>]{0,120}>/i;
+
+export function demarkup(t) {
+  const s = String(t || '');
+  if (!MARKUP.test(s)) return s;
+  /* ① 它把想说的话写在 reading 参数里了（最常见的一种） */
+  const m = s.match(/parameter\s+name\s*=\s*["']reading["'][^>]*>([\s\S]*?)<\//);
+  if (m) return m[1].trim();
+  /* ② 退一步：去掉所有标签，取最长的那个文本节点 */
+  const nodes = s.split(/<[^>]{1,200}>/).map((x) => x.trim()).filter((x) => x.length > 8);
+  if (nodes.length) return nodes.sort((a, b) => b.length - a.length)[0];
+  return '';
+}
+
 /**
  * @param {string} t
  * @returns {string}
  */
 export function cleanSpeech(t) {
-  let s = String(t || '');
+  let s = demarkup(String(t || ''));
   /* 代码块整段去掉。**含没闭合的** —— 7B 经常忘了收尾，
      只匹配成对的会把后半截全留下（那半截正是 JSON 参数）。 */
   s = s.replace(/```[\s\S]*?(```|$)/g, '');
