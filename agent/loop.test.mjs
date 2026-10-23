@@ -77,11 +77,19 @@ async function runCase(mode) {
 
   const base = `http://127.0.0.1:${sport}`;
   let up = false;
-  for (let i = 0; i < 60; i++) {
+  /* 45 秒。CI 的 2 核冷启动比本机慢一倍多（实测本机 12s、runner 上更久），
+     18 秒那版在 GitHub 上四个用例全部"server 起不来"—— 而其实只是慢。
+     `exitCode` 一旦非空就别再等了：那才是真失败，等下去只是把错误拖长。 */
+  for (let i = 0; i < 150; i++) {
+    if (srv.exitCode !== null) break;
     try { const r = await fetch(`${base}/api/health`); if (r.ok) { up = true; break; } } catch { /* 还没起来 */ }
     await wait(300);
   }
-  if (!up) { kill(); return { up: false, log: srvLog }; }
+  if (!up) {
+    kill();
+    /* 失败时必须能看见根因：进程是**死了**还是**只是慢**，以及它最后说了什么。 */
+    return { up: false, exit: srv.exitCode, log: srvLog.slice(-1200) };
+  }
 
   const evs = [];
   const sid = `loop-${mode}-${Date.now()}`;
@@ -147,7 +155,9 @@ const CASES = [
 console.log('每一轮都必须有结局');
 for (const c of CASES) {
   const r = await runCase(c.mode);
-  ok(r.up, `${c.mode}：server 起来了`, String(r.log || '').slice(-200));
+  ok(r.up, `${c.mode}：server 起来了`,
+    `exit=${r.exit === undefined ? '(还在跑)' : r.exit}
+${String(r.log || '').slice(-700)}`);
   if (!r.up) continue;
 
   ok(r.idle, `${c.mode}：这一轮正常收尾（收到 idle），没有卡住`);
