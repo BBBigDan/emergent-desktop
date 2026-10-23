@@ -103,7 +103,20 @@ export function createMockModel() {
   return {
     name: 'mock:v1',
 
-    async complete({ messages, goal }) {
+    /* 桩也要"会思考"：真模型返回 reasoning_content，这里就得有一份，
+       否则 `reasonLines` → `trace('reason')` 那条路在本地根本走不到，
+       而它恰恰是这次改动的核心（线上才知道对不对就太晚了）。
+       内容故意写得像真思考：带一句废话、一句自我纠正、一句结论。 */
+    async complete(args) {
+      const out = await this._decide(args);
+      if (out.thinking === undefined) {
+        out.thinking = '用户问的是这台机器的情况。我得先看一眼真实读数，不能凭印象说。'
+          + '如果拿不到就照实说拿不到，别编一个百分比。';
+      }
+      return out;
+    },
+
+    async _decide({ messages, goal }) {
       /* 压缩上下文 / 新会话的 episode 这两条调用**不带 goal** ——
          它们不是"一轮对话"，是对话的整理。桩也要能回答，否则本地跑不通这两条路。 */
       if (!goal) {

@@ -683,6 +683,14 @@ body.agent-open .stat-zone { pointer-events: none; }
 .ag-trace .tr[data-k="say"] .tr-m { color: rgba(127, 227, 207, 0.7); }
 .ag-trace .tr[data-k="think"] .tr-m { color: rgba(147, 184, 216, 0.4); }
 .ag-trace .tr[data-k="think"] .tr-t { color: rgba(147, 184, 216, 0.55); }
+/* 它的思考：**不是动作**，所以不能跟「调」一个笔调（暖橙＝在动手）。
+   冷、稍暗、字距略松 —— 读起来像"它自己的话"，而不是它对系统下的指令。
+   但也不能太暗：这一段是"它卡住时"唯一能看的线索，弱到读不出就白做了。 */
+.ag-trace .tr[data-k="reason"] { padding: 2.5px 0; }
+.ag-trace .tr[data-k="reason"] .tr-m { color: rgba(150, 196, 240, 0.46); }
+.ag-trace .tr[data-k="reason"] .tr-t {
+  color: rgba(184, 202, 224, 0.72); font-size: 11.5px; letter-spacing: 0.01em;
+}
 .ag-trace .tr[data-k="note"] .tr-m { color: rgba(147, 184, 216, 0.28); }
 .ag-trace .tr[data-k="note"] .tr-t { color: rgba(170, 200, 228, 0.6); font-size: 11.5px; }
 

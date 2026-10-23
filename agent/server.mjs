@@ -36,7 +36,7 @@ import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
-import { toolLine, cut } from './trace.mjs';
+import { toolLine, cut, reasonLines } from './trace.mjs';
 import {
   compactPlan, applyCompact, transcriptFor,
   COMPACT_SYS, EPISODE_SYS, SUMMARY_TAG,
@@ -1038,6 +1038,8 @@ async function runTurn(s, goal) {
   s.salvaged = false;       // 这一轮有没有已经兜底铺过（见 salvage）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
+  s.reasonN = 0;            // 这一轮已经上屏了几条"想"（整轮封顶 8 条，见下面）
+  s.reasonSeen = new Set(); // 已经上过屏的那几句（跨步去重）
   s.traced = null;          // 这一轮它有没有把注入的旧事说出来（说了就记下编号）
   s.lastSpoken = '';
   s.pendingNext = '';     // 上一件工具留下的"下一步"（只用来推模型一把）
@@ -1199,6 +1201,33 @@ async function runTurn(s, goal) {
       }
 
       const calls = out.tool_calls || [];
+      /* ── 它的思考，上屏 ──
+       *
+       * 这是"思考过程"那栏里**唯一真正是思考**的东西：其余的都是动作
+       * （调了哪个工具、画了几层）。模型返回 `reasoning_content` 时这里就有货，
+       * 不返回（免费的小模型多半没有）就是空数组，那栏只剩动作 ——
+       * 也就是用户说的"看起来很奇怪"的那个状态。
+       *
+       * 三条约束：
+       *   · 每步最多 3 条。8 步 × 4 条会把 250px 高的那栏刷成瀑布，
+       *     用户根本来不及读；真正要看的永远是"它一开始怎么想的"。
+       *   · 整轮最多 8 条。第 4 步之后的想法多是"再确认一下"，说了也没信息量。
+       *   · 一条一行、不带结局符号 —— 它不是"一件事做完了"，是"它此刻在想"。
+       */
+      if (s.reasonN == null) s.reasonN = 0;
+      if (!s.reasonSeen) s.reasonSeen = new Set();
+      /* 每步 2 条、整轮 8 条。
+         **跨步要去重**：一个"其实每步都想同一件事"的模型（桩就是）会把同一句
+         想三遍，屏幕上连着三行一样的话，看起来像卡住了 —— 而它其实在正常跑。 */
+      const budget = Math.min(2, 8 - s.reasonN);
+      const lines = budget > 0 ? reasonLines(out.thinking, budget) : [];
+      for (const ln of lines) {
+        if (s.reasonSeen.has(ln)) continue;
+        s.reasonSeen.add(ln);
+        s.reasonN += 1;
+        trace(s, 'reason', { text: ln });
+      }
+
       /* 便宜模型会把示例里的记号一起抄出来（"content: ..."、"→ scene_set(...)"），
          也会写一整段带换行和清单的计划。 */
       let rawSpeech = String(out.content || '')

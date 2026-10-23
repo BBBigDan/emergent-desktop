@@ -131,3 +131,91 @@ export function gateLine(label) {
 
 export const VERBS = Object.keys(T);
 export { OP_ZH, ACT_ZH };
+
+/* ───────────────────── 它的思考：一段自由文本 → 几条能上屏的短句 ───────────────────── */
+
+/** 一个字符里有多少"像中文"的份量（汉字 1、全角标点 0.5、字母数字 0） */
+function zhWeight(s) {
+  const ch = Array.from(s);
+  if (!ch.length) return 0;
+  let w = 0;
+  for (const c of ch) {
+    if (/[\u4e00-\u9fa5]/.test(c)) w += 1;
+    else if (/[\u3000-\u303f\uff00-\uffef“”‘’—…]/.test(c)) w += 0.5;
+    else if (/\s/.test(c)) w += 0;
+    else w += 0;
+  }
+  return w / ch.length;
+}
+
+/** 按长度收口，但**不把英文单词劈成两半**。
+ *
+ *  踩到的样子：`总盘容量未知，但可以用 olares overvi…` —— "overview" 被切成
+ *  "overvi"，读起来像个拼错的函数名。中文没有这个问题（一个字就是一个词），
+ *  所以只在"断点两侧都是字母数字"时往回退，退到空格/标点为止。
+ *  最多退到 60%，再退就丢太多信息了，宁可劈开。
+ */
+function fitSent(s, n) {
+  const ch = Array.from(s);
+  if (ch.length <= n) return s;
+  let k = n - 1;
+  while (k > Math.floor(n * 0.6) && /[A-Za-z0-9]/.test(ch[k - 1] || '') && /[A-Za-z0-9]/.test(ch[k] || '')) k--;
+  return `${ch.slice(0, k).join('').replace(/[\s,;:，、；：]+$/u, '')}…`;
+}
+
+/**
+ * 把模型的 `reasoning_content` 切成几条**能直接排在屏幕上的短句**。
+ *
+ * 为什么要切、要筛，而不是原样往屏幕上撒：
+ *
+ *   · 一段思考 300~1000 字，那一栏只有 250px 高（约 10 行）。原样放进去就是
+ *     一堵墙，用户不会读；而"它在想什么"恰恰只需要开头那几句。
+ *   · **思考不一定是中文。** 实测 DeepSeek-V4.1-Flash 在没被要求时会用英文想
+ *     （"Need to report. Maybe also scene_show?…"）。英文思考排在中文界面里
+ *     比不显示更糟 —— 用户会以为界面坏了。所以按中文占比筛，筛不出就不显示。
+ *   · 有的模型会把 `<think>` 原样吐在 reasoning_content 里（GLM-Z1），要剥掉。
+ *
+ * 三条弃用规则：纯英文句、太短的碎片（"好的。"）、同一句重复。
+ *
+ * @param {string} thinking 模型返回的 reasoning_content
+ * @param {number} max 最多几条（屏幕上放得下的量，不是"能切出几条"）
+ * @returns {string[]}
+ */
+export function reasonLines(thinking, max = 4) {
+  /* 0 就是 0。调用方算出来的额度（`Math.min(3, 8 - 已用)`）可能正好是 0，
+     而循环是"先 push 再判满"—— 不挡这一下，额度用光之后还会再冒一条。 */
+  if (!(max > 0)) return [];
+  let t = String(thinking || '')
+    .replace(/<\/?think>/gi, '\n')
+    .replace(/<\/?\|?think\|?>/gi, '\n')
+    .replace(/```[\s\S]*?```/g, ' ')     // 它在想里贴代码，那不是"想"
+    /* 只抹 markdown 的强调和反引号：**不能连下划线一起抹** ——
+       思考里提到 sys_status 时会被抹成 sysstatus，屏幕上就是一个不存在的函数名 */
+    .replace(/\*\*|`/g, '')
+    /* 第一人称的英文思考经常带 markdown 列表符号，一并抹掉 */
+    .replace(/^\s*[-•]\s*/gm, '');
+
+  /* 中文句末 + 分号 + 换行，外加**英文句号后跟空格**。
+     英文句号不切的话，"I need to call X. 这个工具会…" 会被当成**一句**
+     （它含中文，能过中文占比筛），然后被 cut 掉后半截 —— 屏幕上就剩一句英文。 */
+  const raw = t
+    .split(/(?<=[。！？!?；;])|(?<=[.!?])\s+|\n+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const out = [];
+  const seen = new Set();
+  for (const s0 of raw) {
+    /* 尾部标点去掉：屏幕上每行都以"。"结尾会显得像文稿，不像在说给自己听 */
+    const s = s0.replace(/[。！？；，,、\s]+$/u, '').trim();
+    if (s.length < 6 || s.length > 120) continue;
+    /* 纯英文句：中文占比不足三成就是英文思考，不显示 */
+    if (zhWeight(s) < 0.3) continue;
+    const k = s.slice(0, 12);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(fitSent(s, 28));
+    if (out.length >= max) break;
+  }
+  return out;
+}

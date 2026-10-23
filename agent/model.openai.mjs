@@ -21,9 +21,22 @@
 import { normUsage, estTokens } from './usage.mjs';
 
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
-/* 默认落在一张 ¥0 的模型上：余额为 0 的账户用收费模型会触发账户级停服，
-   连免费模型一起 402。要换更强的模型，自己设 MODEL。 */
-const DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct';
+/* 默认模型：一个**会思考**的模型。
+ *
+ * 为什么换掉 Qwen2.5-7B-Instruct（它便宜、免费、够老实）：
+ * 它没有 reasoning 能力，返回里永远没有 `reasoning_content` ——
+ * 于是屏幕上那栏"思考过程"只有工具动作，没有"想"。用户的原话是
+ * "感觉很奇怪"。这不是那栏做错了，是模型这一层根本没有思考可显示。
+ *
+ * 免费名单里**确实有**能思考的（实测 2026-10-23）：
+ *   · Qwen/Qwen3-8B            思考 332 字，调工具正常，一轮 8.5s
+ *   · THUDM/GLM-Z1-9B-0414     思考 239 字，调工具正常，一轮 2.7s / 回灌 12s
+ *   · deepseek-ai/DeepSeek-R1-0528-Qwen3-8B  **不支持 function call**（400），出局
+ *   · Qwen/Qwen3.5-4B          把工具调用写成 `<tool_call>` 文本，出局
+ * 它们都慢 3~10 倍，且一轮里思考上千字。所以默认落在这个上面；
+ * 想省钱或跑离线验证时，`MODEL=Qwen/Qwen3-8B` 一行就切回去（适配器不用改）。
+ */
+const DEFAULT_MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash';
 
 /** 只保留 OpenAI 认识的字段。`intent` 这类私有字段漏出去就是 400。 */
 function cleanMessages(messages) {
@@ -170,6 +183,16 @@ export function createOpenAIModel(o = {}) {
           }
           /* 4xx（除 429）是请求本身的问题，重试只会重复同一个错误 */
           const retryable = r.status >= 500;
+          /* 有一种 4xx 不是"请求写错了"，是**这个模型压根不支持工具**：
+             实测 deepseek-ai/DeepSeek-R1-0528-Qwen3-8B 直接回
+             "Function call is not supported for this model."。
+             不点破的话，看到的是"模型接口 400"，会去查提示词。 */
+          if (/function call is not supported|does not support (tools|function)/i.test(detail)) {
+            const e = new Error(`「${model}」不支持工具调用（function call），agent 用不了它 —— 换一个会调工具的模型`);
+            e.status = r.status;
+            e.fatal = true;
+            throw e;
+          }
           const err = new Error(`模型接口 ${r.status}：${detail || '(无返回内容)'}`);
           err.status = r.status;
           if (!retryable) throw err;
@@ -180,6 +203,13 @@ export function createOpenAIModel(o = {}) {
 
         const msg = j?.choices?.[0]?.message || {};
         const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+        /* 思考。不是所有模型都有：没有这个字段就是空串，上层据此**不显示**
+           任何"想"的行 —— 而不是显示一个空格子假装它想过。
+           字段名在硅基流动上是 `reasoning_content`；有的网关用 `reasoning`，
+           一起认（认错一个就是"换了个服务商，思考突然没了"）。 */
+        const thinking = typeof msg.reasoning_content === 'string' ? msg.reasoning_content
+          : typeof msg.reasoning === 'string' ? msg.reasoning
+          : '';
         /* usage 是**唯一**能信的数：它由服务端算，和我们这边的字数推算无关。
            没有它（自建服务、某些网关、被代理改写过的响应）就按字数估，
            但必须带 `est: true` —— 估算值和账单长得一样是这个功能最坏的失败方式。 */
@@ -191,6 +221,8 @@ export function createOpenAIModel(o = {}) {
         };
         return {
           content,
+          /* 空串 = 这个模型不会思考（或这一轮没想）。上层两种都不显示，不区分。 */
+          thinking,
           tool_calls: Array.isArray(msg.tool_calls) ? msg.tool_calls : [],
           /* 长度被截断时上面的 tool_calls 可能是半截 JSON —— 上层要能看出来 */
           truncated: j?.choices?.[0]?.finish_reason === 'length',

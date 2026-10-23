@@ -220,11 +220,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     tipEl.classList.remove('in');
   }
 
-  function openTrace() {
+  function openTrace({ toTop = false } = {}) {
     if (!trace || trace.isOpen() || !open) return;
     clearTimeout(traceTimer);
     traceTimer = 0;
-    trace.open();
+    trace.open({ toTop });
     hideTip();
   }
 
@@ -259,9 +259,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       closeTrace();
       tframe?.setHint(hasTraceRows());
     } else {
-      /* 用户点开了 = 他想看。清掉 pin，下一轮就恢复"跟着思考自己弹出来"。 */
+      /* 用户点开了 = 他想看。清掉 pin，下一轮就恢复"跟着思考自己弹出来"。
+         `toTop`：从头看 —— 他要看的是"它怎么想的"，不是"它最后调了什么"。 */
       tracePinned = false;
-      openTrace();
+      openTrace({ toTop: true });
     }
     return true;
   }
@@ -1222,6 +1223,11 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
           if (!tracePinned && busy) openTrace();
         } else if (m.k === 'end') {
           trace?.end(m);
+        } else if (m.k === 'reason') {
+          /* 它的思考。**不要**在这里开面板：思考比第一个工具调用来得早，
+             而开面板的时机是"这一轮开始了"，不是"它想了" —— 否则用户
+             刚问完、屏幕还没反应过来，一块玻璃就压上来了。 */
+          trace?.reason(m.text);
         } else {
           trace?.note(m);
           if (!tracePinned && busy) openTrace();

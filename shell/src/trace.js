@@ -17,6 +17,7 @@
 
 const MARK = {
   step: '调',
+  reason: '想',
   think: '想',
   scene: '画',
   gate: '挡',
@@ -72,6 +73,17 @@ export function createTrace(o = {}) {
   const rows = new Map();
   /* 正在打字的那一行：新行一到就把它补完（否则十行会排成一条长队） */
   let typing = null;
+  /* 思考行的队列：服务端一次推几条，这里按 120ms 一条放出来 ——
+     这样屏幕上看起来是"一句一句在想"，而不是"啪一下贴满"。 */
+  const reasonQ = [];
+  let reasonT = 0;
+
+  function drainReason() {
+    const s = reasonQ.shift();
+    if (!s) { reasonT = 0; return; }
+    makeRow('reason', s, '', 'reason', true);
+    reasonT = reasonQ.length ? setTimeout(drainReason, 120) : 0;
+  }
 
   /* 取整再排版：performance.now() 的差会带出 806.7000000001 这种尾巴，
      面板头上一行小字最忌讳这个 —— 它看起来像没算完。 */
@@ -124,7 +136,7 @@ export function createTrace(o = {}) {
     h = setTimeout(tick, per);
   }
 
-  function makeRow(kind, textText, detailText, tone) {
+  function makeRow(kind, textText, detailText, tone, instant) {
     const row = el('div', 'tr');
     row.dataset.k = tone || kind;
     const m = el('i', 'tr-m', MARK[thinkKind(kind)] || MARK.note);
@@ -132,7 +144,11 @@ export function createTrace(o = {}) {
     const d = el('em', 'tr-d');
     const s = el('i', 'tr-s');
     row.append(m, t, d, s);
-    typeInto(t, textText);
+    /* 思考行**不逐字**：它本来就是"想"的残片，一条一条冒出来已经有节奏了；
+       再逐字打一遍，六条就得打三秒 —— 而这一段正是"它卡住时"要看的，
+       越晚出来越没用。其余行照旧逐字。 */
+    if (instant) t.textContent = textText;
+    else typeInto(t, textText);
     if (detailText) d.textContent = detailText;
     /* 插入动画：从左边 4px 处滑进来，120ms。**只动一次**，
        反复动的话十行会一直晃 —— 那是"输出中"，不是"在抖"。 */
@@ -158,7 +174,7 @@ export function createTrace(o = {}) {
     timer = 0;
   }
 
-  function show() {
+  function show(opts = {}) {
     if (open) return;
     open = true;
     root.hidden = false;
@@ -168,7 +184,10 @@ export function createTrace(o = {}) {
     doneAt = 0;
     startTimer();
     paintMeta();
-    list.scrollTop = list.scrollHeight;
+    /* 用户点开时**从头看**：思考永远在最上面，而工具行是往下追加的 ——
+       滚到底的话，一屏装不下十行，他点开看到的正好是"最后调了什么"，
+       而他想看的是"它一开始怎么想的"。运行中自动弹出才跟随最新。 */
+    list.scrollTop = opts.toTop ? 0 : list.scrollHeight;
     o.onToggle?.(true);
   }
 
@@ -215,7 +234,7 @@ export function createTrace(o = {}) {
 
     open: show,
     close: hide,
-    toggle() { (open ? hide : show)(); },
+    toggle() { (open ? hide : show({ toTop: true }))(); },
     isOpen: () => open,
 
     /** 一轮开始：清空、重置计时。面板不在这里开（由 deskagent 决定时机） */
@@ -227,6 +246,10 @@ export function createTrace(o = {}) {
       startedAt = performance.now();
       doneAt = 0;
       typing = null;
+      /* 上一轮没放完的思考行必须一起清掉：否则它们会在新的一轮里
+         冒在第一条工具行**前面**（队列里的东西不属于这一轮）。 */
+      reasonQ.length = 0;
+      if (reasonT) { clearTimeout(reasonT); reasonT = 0; }
       root.classList.remove('done');
       paintMeta();
     },
@@ -272,21 +295,25 @@ export function createTrace(o = {}) {
 
     /** 「在想」这件事也要留痕：不然工具之间那几秒的空档看起来像卡住了 */
     think(on, step) {
-      if (on) {
-        thinking = step ?? 0;
-        pulse.classList.add('on');
-        const row = makeRow('think', step ? `想第 ${step + 1} 步` : '想一想', '', 'think');
-        rows.set(`think:${step}`, row);
-      } else {
-        pulse.classList.remove('on');
-        const row = rows.get(`think:${step}`);
-        if (row) {
-          row.dataset.s = 'ok';
-          /* 这一行不写状态符号：它不是"一件事做完了"，是"这一段在等"。
-             右边冒一个孤零零的点，读起来像加载失败。 */
-          row.querySelector('.tr-s').textContent = '';
-        }
-      }
+      /* 这里**只动那颗脉动点，不再写一行字**。
+         以前每次模型调用都写一行"想第 N 步" —— 那时它是唯一的"它还在动"的证据。
+         现在真的思考会以 `reason` 行进来（服务端从 reasoning_content 切好），
+         再补一句"想第 2 步"就是同一个意思说两遍；而模型不会思考时，
+         这一行更是空壳 —— 用户说的"看起来很奇怪"正是这种空壳。
+         留下脉动点就够了：它表示的"还在跑"不会重复。 */
+      if (on) pulse.classList.add('on');
+      else pulse.classList.remove('on');
+      if (on) thinking = step ?? 0;
+    },
+
+    /** 它的思考（服务端已经切成一句一行）。逐条冒，不逐字打。 */
+    reason(text) {
+      const s = String(text || '').trim();
+      if (!s) return;
+      /* 排个队：服务端一次会把这一轮的 2~3 条一起推下来，
+         同帧全插进去就没有"在想"的节奏了（六条同时闪现，像刷新）。 */
+      reasonQ.push(s);
+      if (!reasonT) drainReason();
     },
 
     /** 场景落地也记一行：用户看到"画了一屏"，就知道右边的图是谁放的 */

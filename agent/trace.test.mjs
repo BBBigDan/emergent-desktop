@@ -8,7 +8,7 @@
  *      而它实际读的是 b.txt。
  */
 
-import { toolLine } from './trace.mjs';
+import { toolLine, reasonLines } from './trace.mjs';
 import { makeTools } from './tools.mjs';
 
 let failed = 0;
@@ -55,6 +55,51 @@ console.log('参数缺失/畸形也不许抛');
   ok(toolLine('不存在的工具', {}).verb === '不存在的工具', '未知工具退回原名（不是空字符串）');
   ok(Array.from(toolLine('fs_search', { q: '这是一个特别特别特别长的搜索词' }).detail).length <= 24,
     '宾语封顶 24 字（超了会顶掉右边的耗时）');
+}
+
+/* ───────────────── 它的思考：一段自由文本 → 能上屏的短句 ───────────────── */
+
+console.log('\n思考：中文照句切');
+{
+  const L = reasonLines('用户问内存够不够用。需要先调用工具看机器状态。');
+  ok(L.length === 2, `两句：${JSON.stringify(L)}`);
+  ok(L[0] === '用户问内存够不够用', '尾部标点去掉了（不是文稿，是自我对话）');
+  ok(L.every((x) => !x.includes('。')), '每行不以句号结尾');
+}
+
+console.log('\n思考：英文句不显示（线上实测原样）');
+{
+  /* 2026-10-23 真实返回：没要求"思考用中文"时 V4.1-Flash 就这么想 */
+  const en = 'Need to report. Maybe also scene_show? The tool is a device assistant. '
+    + 'I think calling scene_show with reading is appropriate to display';
+  ok(reasonLines(en).length === 0, '纯英文 → 一条都不显示（英文夹在中文界面里比不显示更糟）');
+  ok(reasonLines('好的。').length === 0, '太短的碎片不要');
+  ok(reasonLines('').length === 0 && reasonLines(undefined).length === 0, '空/undefined → 空数组');
+}
+
+console.log('\n思考：中英混排只留中文句');
+{
+  const L = reasonLines('用户想知道装了哪些应用。I need to call olares with op=apps. '
+    + '这个工具会返回应用清单、版本和来源。然后画三个仪表。');
+  ok(L.length === 3, `留下三句中文：${JSON.stringify(L)}`);
+  ok(!L.some((x) => /^[A-Za-z]/.test(x)), '没有一句以英文开头（英文句被切掉并丢弃）');
+  ok(L.some((x) => x.includes('应用清单')), '英句后面的中文还是完整的一句（没被当成同一句截掉）');
+}
+
+console.log('\n思考：有的模型把标签原样吐出来');
+{
+  const L = reasonLines('\n<think>\n好的，用户问机器现在忙不忙。根据之前的指示，我需要先调用 sys_status 工具。');
+  ok(!L.join('').includes('think'), '标签被剥掉');
+  ok(L.some((x) => x.includes('sys_status')), '工具名的下划线**不能**被当成 markdown 抹掉（会变成 sysstatus）');
+}
+
+console.log('\n思考：条数与长度');
+{
+  const long = Array.from({ length: 20 }, (_, i) => `这是第${i}句用来测试上限的思考内容。`).join('');
+  const L = reasonLines(long, 4);
+  ok(L.length === 4, `最多 4 条，实际 ${L.length}`);
+  ok(L.every((x) => Array.from(x).length <= 30), `每行不超过 30 字：${L.map((x) => Array.from(x).length)}`);
+  ok(reasonLines(long, 0).length === 0, 'max=0 → 空（上限是可用量的函数）');
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');

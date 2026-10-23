@@ -237,7 +237,7 @@ k3s 写的 kubeconfig 里 `server` 是 `127.0.0.1:6443`（那是集群内视角�
 
 ```ini
 MODEL_KEY=sk-...                          # 必填（MODEL=mock 时不需要）
-MODEL=Qwen/Qwen2.5-7B-Instruct            # 默认落在 ¥0 那一列；mock = 不联网
+MODEL=deepseek-ai/DeepSeek-V4.1-Flash     # 会思考的模型（reasoning_content 是「想」行的来源）；mock = 不联网
 MODEL_BASE=https://api.siliconflow.cn/v1  # 换厂商只改这一行
 SYS=k8s                                   # k8s 读集群 / host 读本机 / mock 用固定假数据
 # CTX_PAD=3000                            # 调试：故意把上下文撑大，量"多长算太长"。默认 0
@@ -259,13 +259,50 @@ SYS=k8s                                   # k8s 读集群 / host 读本机 / moc
   **于是几分钟后连 ¥0 的 Qwen 也开始 402**。
   名字里带 `Flash` 不代表免费，这是这次最贵的一课。
 - 解锁办法：实名认证 + 充值任意金额（0.01 元即可），之后扣费顺序变成「现金 → 券」。
-- 已把默认 `MODEL` 改成 `Qwen/Qwen2.5-7B-Instruct`（¥0），并在
+- 当时的处置：默认 `MODEL` 改成 `Qwen/Qwen2.5-7B-Instruct`（¥0），并在
   `tools/dev/probe-model.mjs` 里做了硬保护：探到非免费名单的模型会直接拒绝，
   必须显式 `--paid`。
+- **2026-10-23 又换了**（充过值、余额正常）：默认改成
+  `deepseek-ai/DeepSeek-V4.1-Flash`，因为它会思考。硬保护保留 —— 它挡的是
+  "随手试探就把账户打停"，和用哪个模型无关。
 
 能用的时候实测延迟（带工具调用）：`Qwen2.5-7B-Instruct` ~0.9s/步最稳；
 `DeepSeek-V4-Flash` ~1.1s/步且会并行发调用（收费）；`GLM-5.3-Flash` ~3s/步（收费）；
 `Qwen3-8B` 首次调用 90s（冷启动）。
+
+### 换模型这件事：为什么要一个"会思考"的（2026-10-23）
+
+界面左上那块「思考过程」里的 `[想]` 行，唯一的真实来源是模型的 `reasoning_content`。
+**不会思考的模型，那栏里就只有"调了什么、画了什么"** —— 用户的原话是"感觉很奇怪"。
+所以默认从 `Qwen/Qwen2.5-7B-Instruct` 换成了 `deepseek-ai/DeepSeek-V4.1-Flash`。
+
+免费名单里**确实有能思考的**，实测（另写了一个探针，因为这个判据不是"能不能跑"）：
+
+| 模型 | 免费 | 思考 | 工具调用 | 一轮耗时 |
+|---|---|---|---|---|
+| `Qwen/Qwen2.5-7B-Instruct` | ✅ | **无**（没有 reasoning_content） | 稳 | 0.4~1s |
+| `Qwen/Qwen3-8B` | ✅ | 332 字 | 正常（sys_status → scene_show） | 8.5s / 9s |
+| `THUDM/GLM-Z1-9B-0414` | ✅ | 239 字，带 `<think>` 标签 | 正常 | 2.7s / **回灌 12s** |
+| `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B` | ✅ | 有 | **不支持 function call**（400） | — |
+| `Qwen/Qwen3.5-4B` | ✅ | 有 | 把调用写成 `<tool_call>` 文本，废 | — |
+| `XingChenAGI/Xing4.0-29B` | ✅ | 45 字 | 会重复调同一个工具 | 0.8s |
+
+结论：能思考且会调工具的只有 **Qwen3-8B** 和 **GLM-Z1-9B**，都慢 3~10 倍，
+且单轮思考上千字。省钱的切法是 `MODEL=Qwen/Qwen3-8B`，适配器一行都不用改。
+
+**思考的语言要专门要求。** 不写这句，V4.1-Flash 的 `reasoning_content` 全是英文
+（"Need to report. Maybe also scene_show?…"）。三种说法只有一种有效：
+
+| 写法 | 效果 |
+|---|---|
+| `**思考也用中文。**` | ✅ 23 字里 21 个汉字 |
+| `请全程用简体中文思考和回答。` | ❌ 全英文 |
+| `Think in Simplified Chinese.` | ❌ 全英文（反而更坚定） |
+
+`prompt.mjs` 里那行的措辞是试出来的，不要"优化"。
+
+**英文思考宁可不显示。** `trace.mjs` 的 `reasonLines()` 按中文占比筛（< 30% 丢整句），
+因为英文夹在中文界面里比空着更像界面坏了。
 
 ### 免费模型的实测：它们会"看"，但不可靠地"画"
 
