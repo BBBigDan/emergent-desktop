@@ -98,6 +98,11 @@ export function createComfy(o = {}) {
           size: j.size || [512, 512],
           steps: j.steps ?? DEFAULTS.steps,
           model: j.model || '',
+          /* 采样器/CFG 跟着模型走：少步蒸馏模型（LCM / Turbo）用 `lcm` 或 `euler` + 低 CFG，
+             普通 SD1.5 用 `dpmpp_2m` + 7。写死在代码里就只能有一种模型。 */
+          sampler: j.sampler || '',
+          scheduler: j.scheduler || '',
+          cfg: j.cfg == null ? null : Number(j.cfg),
           note: j.note || '',
           _wf: j.workflow,
         });
@@ -209,7 +214,12 @@ export function createComfy(o = {}) {
       prompt,
       negative: a.negative ?? DEFAULTS.negative,
       width: W, height: H, steps, seed,
-      model: a.model || t.model || DEFAULTS.model,
+      /* `COMFY_MODEL` 是**换环境不改代码**的那个口子：同一份模板，
+         指向本机 CPU 版（LCM 权重）和有卡的机器（sd-turbo）时模型名不一样。 */
+      model: a.model || process.env.COMFY_MODEL || t.model || DEFAULTS.model,
+      sampler: a.sampler || t.sampler || '',
+      scheduler: a.scheduler || t.scheduler || '',
+      cfg: a.cfg ?? t.cfg ?? null,
       prefix: 'emergent',
     });
 

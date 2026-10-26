@@ -1,0 +1,138 @@
+# ComfyUI · 纯 CPU 版（自己起的工作负载，**不是市场应用**）
+#
+# 为什么不用市场里的 `comfyuisharev3`：它的 manifest 只有三个 accelerator 档位
+# （`nvidia` 2Gi VRAM / `nvidia-gb10` / `intel-gpu` 2Gi），**没有 CPU 档**，
+# 且每档 `requiredMemory` 20~22Gi —— 比这台机器的整机内存（15.6GB）还大。
+# 两个条件各挡一次，而且它的镜像是 CUDA 构建，改安装包等于长期 fork 一个远端 chart。
+#
+# 所以走和桌面壳层同一条路：ReplicaSet（`appns-validating-webhook` 只拦
+# deployment/statefulsets/daemonsets 的 CREATE，RS 能过且自愈）。
+#
+# 镜像 `yanwk/comfyui-boot:cpu`（openSUSE + python3.13 + ComfyUI，amd64，3.6GB）。
+# 契约来自它的 README / entrypoint.sh：
+#   · 主进程 = `python3 /root/ComfyUI/main.py --listen --port 8188 $CLI_ARGS`
+#   · 所以「CPU」就是 `CLI_ARGS=--cpu`，不用改镜像
+#   · ComfyUI 代码、模型、输出、input 全在 `/root` 下
+#     → 把 `/root` 整个挂到 hostPath：第二次启动不用再拷一遍 bundle，
+#       模型也不用每次重下（这才是它比"挂 models 目录"更省事的地方）
+#
+# 模型：`Lykon/dreamshaper-8-lcm`（SD1.5 + LCM，2.13GB，免登录可下）。
+# 选它不选 `sd-turbo`：sd_turbo.safetensors 是 5.2GB，加载后光权重就 5~6GB，
+# 而这台机器总共 15.6GB、可分配 10.6Gi —— 会把桌面挤到 OOM。LCM 权重 2.1GB，
+# 4~6 步出图，8 核大约 20~60 秒一张。要换成别的模型：只改下面的两个 env。
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: comfyui
+  labels:
+    app: comfyui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comfyui
+  template:
+    metadata:
+      labels:
+        app: comfyui
+    spec:
+      initContainers:
+        # 下模型只做一次：文件已在就跳过（hostPath 持久）。
+        # 用 node 而不是 curl/wget —— 镜像里不一定有它们，而 node 的 fetch 跟着重定向走，
+        # 而且流式写盘（2.1GB 不进内存）。
+        - name: fetch-model
+          image: docker.io/library/node:22-alpine
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              F="/data/ComfyUI/models/checkpoints/$MODEL_FILE"
+              if [ -s "$F" ]; then
+                echo "模型已在：$F（$(du -h "$F" | cut -f1)）"
+                exit 0
+              fi
+              mkdir -p /data/ComfyUI/models/checkpoints
+              echo "下载 $MODEL_FILE ← $MODEL_URL"
+              node -e '
+                const fs = require("fs");
+                const { Readable } = require("stream");
+                const { pipeline } = require("stream/promises");
+                const out = "/data/ComfyUI/models/checkpoints/" + process.env.MODEL_FILE;
+                (async () => {
+                  const r = await fetch(process.env.MODEL_URL);
+                  if (!r.ok) throw new Error("HTTP " + r.status);
+                  const total = Number(r.headers.get("content-length") || 0);
+                  let n = 0, mark = 0;
+                  const rs = Readable.fromWeb(r.body);
+                  rs.on("data", (c) => {
+                    n += c.length;
+                    if (n - mark > 200e6) { mark = n; console.log("  " + (n / 1e6).toFixed(0) + "MB" + (total ? " / " + (total / 1e6).toFixed(0) + "MB" : "")); }
+                  });
+                  await pipeline(rs, fs.createWriteStream(out + ".part"));
+                  fs.renameSync(out + ".part", out);
+                  console.log("下载完成 " + (n / 1e6).toFixed(0) + "MB");
+                })().catch((e) => { console.error("下载失败：" + e.message); process.exit(1); });
+              '
+          env:
+            - name: MODEL_URL
+              value: "__MODEL_URL__"
+            - name: MODEL_FILE
+              value: "__MODEL_FILE__"
+          volumeMounts:
+            - name: root
+              mountPath: /data
+      containers:
+        - name: comfyui
+          image: yanwk/comfyui-boot:cpu
+          env:
+            # 这一行就是"别去找显卡"。entrypoint 会拼成
+            # `python3 main.py --listen --port 8188 --cpu`
+            - name: CLI_ARGS
+              value: "--cpu"
+          ports:
+            - name: http
+              containerPort: 8188
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # CPU 上限 6（8 核里留 2 核给桌面和集群）：不设的话 torch 会吃满，
+              # 出图那 40 秒里整个桌面都在卡。
+              cpu: "6000m"
+              # 内存上限 6Gi：LCM 权重 2.1GB + 激活 + 解码，实测峰值 3~4Gi。
+              # 超过就被 OOMKill（pod 自己重来），而不是把节点上的桌面一起拖死。
+              memory: 6Gi
+          readinessProbe:
+            # 用 HTTP 而不是 exec：ComfyUI 绑 0.0.0.0（entrypoint 里有 --listen），
+            # kubelet 从节点探得到。起来要 20~40 秒（torch import 慢），别设太紧。
+            httpGet:
+              path: /system_stats
+              port: 8188
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: root
+              mountPath: /root
+      volumes:
+        - name: root
+          hostPath:
+            path: __COMFY_DIR__/root
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfyui
+  labels:
+    app: comfyui
+spec:
+  selector:
+    app: comfyui
+  ports:
+    - name: http
+      port: 8188
+      targetPort: 8188
+      protocol: TCP

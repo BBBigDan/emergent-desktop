@@ -152,6 +152,21 @@ if [ -f "$REPO/agent/.env" ]; then
     || say "提示：agent/.env 里没有 OLARES_ID / OLARES_PASSWORD，CLI 身份被撤销后要人工处理"
 fi
 
+# ── 2.5 别把 ComfyUI 的地址冲掉 ──────────────────────────
+# 上面那句 `create secret ... | apply` 是**整份替换** data：`.env` 里没有的键会消失。
+# 而 `COMFY_URL` 是 `deploy/comfy.sh` 单独写进 Secret 的（不在 .env 里），
+# 于是「装了 ComfyUI → 又跑了一次 install.sh」= 画图静默坏掉，表现是
+# "明明昨天还能画"。这里把已经在跑的 comfyui 服务补回去。
+if ! grep -q '^COMFY_URL=' "$REPO/agent/.env" 2>/dev/null; then
+  if "${SSH[@]}" "kubectl -n $NS get svc comfyui >/dev/null 2>&1"; then
+    say "保留 COMFY_URL（ComfyUI 在这个命名空间里跑着，地址写在 Secret 里）"
+    # JSON 在本地拼好再发：远端展开 `$B` 这类写法在多层引号里必错（踩过，见 comfy.sh）
+    CU_B64=$(printf %s 'http://comfyui:8188' | base64 | tr -d '\n')
+    "${SSH[@]}" "kubectl -n $NS patch secret emergent-desktop-env --type=merge \
+      -p '{\"data\":{\"COMFY_URL\":\"$CU_B64\"}}' >/dev/null 2>&1 && echo ok" >/dev/null || true
+  fi
+fi
+
 # ── 3. 工作负载 ─────────────────────────────────────────
 # Home 的真实路径带随机后缀，猜不得：猜错的表现是"跑起来了、数据写到另一个目录"，
 # 而界面上看不出来 —— 只有用户去 Files 里翻的时候才发现东西不见了。

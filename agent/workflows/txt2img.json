@@ -1,10 +1,13 @@
 {
   "label": "文生图 · 方图 512",
-  "doc": "最便宜的一档。SD-Turbo 这类少步模型 4~8 步就够；CPU 上也能跑（20~40 秒）。",
+  "doc": "最便宜的一档。少步蒸馏模型（LCM / Turbo）4~8 步就够；这台是纯 CPU，一张 20~60 秒。",
   "note": "提示词写画面本身：主体 + 环境 + 光线 + 画风。别写「请帮我画」。",
   "size": [512, 512],
   "steps": 6,
-  "model": "sd-turbo.safetensors",
+  "sampler": "lcm",
+  "scheduler": "normal",
+  "cfg": 1.5,
+  "model": "dreamshaper8_lcm.safetensors",
   "workflow": {
     "4": {
       "class_type": "CheckpointLoaderSimple",
