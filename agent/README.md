@@ -973,9 +973,70 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 | 层 | 用什么 | 验什么 |
 |---|---|---|
 | 协议桩 `tools/dev/stub-comfy.mjs` | 照真契约实现 `/system_stats` `/prompt` `/history` `/view` `/queue` `/object_info` `/interrupt`，返回**真 PNG**，可注入 `FAIL=oom\|badgraph\|queue` | 排队、轮询、超时、错误映射、图片字节 —— 和显卡无关的那 90% |
-| CPU 上的真 ComfyUI | 市场里的 `comfyuisharev3`，SD-Turbo 4~8 步 512×512 | 真图、真延迟（8 核 EPYC 约 **20~40 秒/张**；SD1.5 20 步要 3~5 分钟，别用） |
+| 本机 CPU 真跑 | `./deploy/comfy.sh`（自己起的 ReplicaSet，见下） | 真图、真延迟：**约 78 秒/步**（这台 8 vCPU 的 matmul 只有 ~12 GFLOPS），4 步 512×512 一张 5~6 分钟 |
 | 远端有卡的机器 | 任何 ComfyUI，改 `COMFY_URL` 就行 | 出片质量 |
 | 录放 | 真跑一次，把 `/history` JSON + 输出 PNG 存成夹具 | 防"字段名猜错"（`outputs[节点].images[].filename` 这类结构最容易被猜错） |
+
+### 市场里那个 ComfyUI 装不上，所以自己起一个（`deploy/comfy-cpu.yaml` + `deploy/comfy.sh`）
+
+`olares-cli market get comfyuisharev3 -o json`（1.1.38）里 `accelerator` 只有三档，
+**全是 GPU**：`nvidia`（2Gi VRAM）、`nvidia-gb10`、`intel-gpu`（2Gi）——全文没有 `cpu`；
+而且每档 `requiredMemory` 20~22Gi，**比这台机器整机内存（15.6GB，allocatable 10.6Gi）还大**。
+两道门各自都能挡住它。改安装包也不是好选择：chart 在 `market.olares` 远端源，升级即覆盖；
+镜像 `beclab/comfyui:*-launcher` 是 CUDA 构建，launcher 里怎么起 python 是写死的。
+
+所以走和桌面壳层同一条路：ReplicaSet（`appns-validating-webhook` 只拦 deployment/sts/ds 的 CREATE）
++ Service，`/root` 整个挂 hostPath（第二次启动不用重拷 bundle、模型不用重下）。
+
+```bash
+./deploy/comfy.sh              # 起（幂等）：apply → 等 ready → 写 Secret → 重启 agent → 从 agent 侧验一次
+./deploy/comfy.sh --status     # 只看（pod / 模型 / 服务 / agent 看到的 COMFY_URL）
+./deploy/comfy.sh --logs       # 跟日志（下模型、启动、采样进度都在这里）
+./deploy/comfy.sh --down       # 停（模型留在盘上）
+./deploy/comfy.sh --purge      # 连模型一起删（2.1GB）
+```
+
+镜像 `yanwk/comfyui-boot:cpu`（3.6GB，amd64）。它的 entrypoint 是
+`python3 /root/ComfyUI/main.py --listen --port 8188 $CLI_ARGS`，
+所以「CPU」只是 `CLI_ARGS=--cpu` 一行 env，不碰镜像。
+
+### 参数由设备决定，不是由模板决定（`profileOf`）
+
+模板只提供**形状**（一张图的节点连线、方图还是竖图）；档位（步数、最大边、等多久）
+由 `profileOf(/system_stats)` 推出来 —— 这是这次加的"适配器"：
+
+| 输入（ComfyUI 自己报的） | 推出的档位 |
+|---|---|
+| `devices[0].type` 含 cuda/rocm/mps/xpu 且 `vram_total > 0` | `gpu`：6 步；显存 ≥8GB 允许 768 边，否则 512 |
+| 没有卡 | `cpu`：4 步、512 边；`system.ram_total < 6GB` 再降到 3 步、384 边 |
+| 预计时间 | `secPerStep × steps + 40s`（载权重/编码/解码）。CPU 的 88 秒/步是**这台机器实测**，换机器用 `COMFY_SEC_PER_STEP` 覆盖 |
+
+`status` 直接把结论交出去（`recommend: {template, steps, width, height, etaSec}` 和一句
+`advice`），工具描述也改成**"steps 和尺寸不要自己猜"**：模型没有理由去记住"78 秒/步"
+这种数字，它只要照着说给用户听。同理 `gen` 在不传 steps/尺寸时按设备档取；
+被设备档缩小的尺寸会在 `adjusted` 里说明，不许悄悄改（"我要 768 出来怎么是 512"）。
+
+**这台机器实测的数字**（别按显卡的直觉估）：
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 权重 | `Lykon/dreamshaper-8-lcm` 2.13GB | SD1.5 + LCM，免登录。不用 `sd-turbo`：`sd_turbo.safetensors` 5.2GB，光权重就吃掉 10.6Gi 可分配内存的一半 |
+| 启动 | ~4 分钟到 `/system_stats` 可用 | torch import + 把 bundle 拷进 `/root`（只有第一次拷） |
+| 采样 | **~88 秒/步** | 8 步 11 分 37 秒、6 步 10 分 42 秒（都实测）；4 步 512 ≈ 5~6 分钟 |
+| 等待上限 | **不写死** | 设备档 ×2.5（纯 CPU ≈ 16 分钟），`COMFY_TIMEOUT_MS` 可强制覆盖。超时**不杀作业**，只是先回一句"还没出来" |
+| 资源 | 6 核 / 7Gi | 不设 CPU 上限，torch 吃满 8 核，出图那几分钟整个桌面在卡；内存超限是 pod 自己被 OOMKill，不会拖死桌面 |
+| 线程 | `OMP_NUM_THREADS=6` | torch 默认按**节点**核数（8）开线程，多出来的 2 个只会互相抢 |
+| 精度 | `--force-fp32` | 微基准里 fp16 比 fp32 慢 55 倍（0.38s vs 20.6s / 10 次 768³），但换到整图只从 108 → 88 秒/步 —— **说明瓶颈是整机争抢，不是精度模拟**。保留 fp32，别指望那 55 倍 |
+
+`comfy.sh` 里三件容易漏的事，都有注释钉着：`kubectl apply` 的 `-n $NS`（漏了 pod 落在
+`default`，模型照样下完但 agent 找不到服务名）；Secret patch 的 JSON 要在**本地**拼好
+（远端展开 `$B` 会被引号吃掉，写进去字面量 `$B`，kubectl 报 `illegal base64 data`）；
+ReplicaSet **不会**因为 template 变了换 pod —— 靠 `emergent/tmpl-hash` 注解比对，
+不一致才删（和桌面那边同一个坑）。
+
+`install.sh` 里也补了一处：它写 Secret 是**整份替换**，`.env` 里没有的键会消失，
+而 `COMFY_URL` 是 `comfy.sh` 单独写进去的 —— 「装了 ComfyUI 又跑了一次 install.sh」
+会让画图静默坏掉（表现是"昨天还能画"）。现在发现 `comfyui` 服务在就把它补回去。
 
 五条错误各有各的说法（自测逐个钉住）：`comfy_offline`（连不上，顺带提示"先用桩顶上"）、
 `comfy_bad_graph`（指到具体节点）、`comfy_queue_full`、`comfy_oom`（说清"调到 512、步数降到 4~8"）、

@@ -20,7 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import url from 'node:url';
 
-import { createComfy, fillWorkflow } from './comfy.mjs';
+import { createComfy, fillWorkflow, profileOf } from './comfy.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -151,6 +151,49 @@ console.log('\n五种坏情况，五种说法');
 
 /* 真机 CPU 上出图要几十秒，那一轮的心跳靠 turnstop 那边 —— 这里只确保
    onProgress 会被叫到（否则"在显影"这件事没有任何依据）。 */
+/* ─────────────────── ⑥ 设备适配器（换个环境就换一套参数） ─────────────────── */
+console.log('\n设备适配器（profileOf）');
+{
+  const gpu = profileOf({ devices: [{ name: 'cuda:0 RTX 4090', type: 'cuda', vram_total: 24 * 1024 ** 3 }], system: { ram_total: 32 * 1024 ** 3 } });
+  ok(gpu.kind === 'gpu', `有卡 → gpu（${gpu.device}）`);
+  ok(gpu.steps === 6 && gpu.side === 768, `24GB 显存 → 6 步、允许 768 边（${gpu.steps} 步 / ${gpu.side}）`);
+  ok(gpu.etaSec > 0 && gpu.etaSec < 60, `预计 ${gpu.etaSec} 秒（有卡就该是秒级）`);
+
+  const small = profileOf({ devices: [{ name: 'cuda:0', type: 'cuda', vram_total: 4 * 1024 ** 3 }], system: { ram_total: 32 * 1024 ** 3 } });
+  ok(small.side === 512, `4GB 显存 → 只给 512 边（${small.side}）`);
+
+  /* 线上这台机器的真实数字：devices[0].type 就是 cpu，ram_total 是 cgroup 的 6GB */
+  const cpu = profileOf({ devices: [{ name: 'cpu', type: 'cpu', vram_total: 6 * 1024 ** 3 }], system: { ram_total: 6 * 1024 ** 3 } });
+  ok(cpu.kind === 'cpu', '没卡 → cpu 档');
+  ok(cpu.steps === 4 && cpu.side === 512, `6GB 内存 → 4 步 / 512（${cpu.steps} 步 / ${cpu.side}）`);
+  ok(cpu.etaSec >= 300, `预计 ${cpu.etaSec} 秒 —— 分钟级，必须如实说`);
+  ok(/分钟/.test(cpu.note), `note 是人话：${cpu.note}`);
+
+  const tiny = profileOf({ devices: [{ type: 'cpu' }], system: { ram_total: 4 * 1024 ** 3 } });
+  ok(tiny.side === 384 && tiny.steps === 3, `内存 4GB → 降到 384 / 3 步（${tiny.side} / ${tiny.steps}）`);
+
+  /* 换一台 CPU 机器（更快或更慢）不该改代码 */
+  process.env.COMFY_SEC_PER_STEP = '20';
+  const fast = profileOf({ devices: [{ type: 'cpu' }], system: { ram_total: 8 * 1024 ** 3 } });
+  ok(fast.secPerStep === 20 && fast.etaSec < 200, `COMFY_SEC_PER_STEP 能覆盖（${fast.secPerStep} 秒/步 → ${fast.etaSec} 秒）`);
+  delete process.env.COMFY_SEC_PER_STEP;
+
+  ok(profileOf({}).kind === 'cpu', '空的 stats 也不抛（按 cpu 兜底）');
+}
+
+/* 端到端：gen 不给 steps/尺寸时**按设备档**取，而不是模板里写死的数 */
+console.log('\ngen 跟着设备档走');
+{
+  const s = await stub({ GPU: '0' });       // 桩报 cpu + 6GB 内存
+  const c = createComfy({ base: s.base, poll: 80, timeout: 20000 });
+  const r = await c.gen({ template: 'txt2img_portrait', prompt: 'hardware profile' });
+  ok(r.ok, '画出来了');
+  ok(r.steps === 4, `没给 steps → 用设备档的 4 步（实际 ${r.steps}）`);
+  ok(Math.max(r.width, r.height) <= 512, `竖图模板 512×768 被设备档收到 ${r.width}×${r.height}`);
+  ok(r.device?.kind === 'cpu', `结果里带设备档（${r.device?.kind}）`);
+  await s.stop();
+}
+
 console.log('\n进度回调');
 {
   const s = await stub({ DELAY_MS: '700' });

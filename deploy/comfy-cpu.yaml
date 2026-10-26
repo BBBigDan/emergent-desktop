@@ -35,6 +35,11 @@ spec:
     metadata:
       labels:
         app: comfyui
+      annotations:
+        # 模板指纹。ReplicaSet **不会**因为 template 变了就替换已有 pod
+        # （它只保证"数量对"），所以 comfy.sh 拿这个值比一次，不一致才删 pod。
+        # 没有它的话，改了 env/镜像之后"看起来部署成功、跑的还是旧的"。
+        emergent/tmpl-hash: "__TMPL_HASH__"
     spec:
       initContainers:
         # 下模型只做一次：文件已在就跳过（hostPath 持久）。
@@ -88,7 +93,18 @@ spec:
             # 这一行就是"别去找显卡"。entrypoint 会拼成
             # `python3 main.py --listen --port 8188 --cpu`
             - name: CLI_ARGS
-              value: "--cpu"
+              # **`--force-fp32` 是这台机器上最关键的一行。**
+              # 实测（pod 内 torch，10 次 768³ 矩阵乘）：fp32 0.38s / fp16 20.6s / bf16 16.4s
+              # —— 纯 CPU 上 fp16 是**软件模拟**，比 fp32 慢 55 倍。而 SD1.5 的权重是 fp16，
+              # ComfyUI 默认就按权重精度算，于是每步 80~110 秒、一张 6 步要 13 分钟。
+              # 强制 fp32 之后同一张图降到几十秒级（代价：权重在内存里翻倍，所以内存上限给 7Gi）。
+              value: "--cpu --force-fp32"
+            # 线程数对上 cgroup 配额。torch 默认按**节点**核数（8）开线程，
+            # 而这里限了 6 —— 多出来的 2 个线程只会互相抢占，实测更慢。
+            - name: OMP_NUM_THREADS
+              value: "6"
+            - name: MKL_NUM_THREADS
+              value: "6"
           ports:
             - name: http
               containerPort: 8188
@@ -100,9 +116,10 @@ spec:
               # CPU 上限 6（8 核里留 2 核给桌面和集群）：不设的话 torch 会吃满，
               # 出图那 40 秒里整个桌面都在卡。
               cpu: "6000m"
-              # 内存上限 6Gi：LCM 权重 2.1GB + 激活 + 解码，实测峰值 3~4Gi。
-              # 超过就被 OOMKill（pod 自己重来），而不是把节点上的桌面一起拖死。
-              memory: 6Gi
+              # 超过上限是被 OOMKill（pod 自己重来），而不是把节点上的桌面一起拖死。
+              # fp32 的权重是 fp16 的两倍（SD1.5 约 3.3GB → 6GB 量级），7Gi 才够；
+              # 再加就顶到节点的 10.6Gi allocatable 了，桌面会被挤。
+              memory: 7Gi
           readinessProbe:
             # 用 HTTP 而不是 exec：ComfyUI 绑 0.0.0.0（entrypoint 里有 --listen），
             # kubelet 从节点探得到。起来要 20~40 秒（torch import 慢），别设太紧。

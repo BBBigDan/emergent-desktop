@@ -326,11 +326,13 @@ export function makeTools(o = {}) {
    */
   add('comfy', {
     level: 'safe',
-    describe: '用 ComfyUI 画图。op=status 看它连不连得上、**有没有显卡**（没卡会慢到分钟级）、'
-      + '有哪些模型；op=templates 看有哪几种画法（方图/竖图）；op=gen 真的画一张，'
+    describe: '用 ComfyUI 画图。op=status 看它连不连得上、这台机器什么档（有没有显卡）、'
+      + '有哪些模型，并且**直接给出这台机器的推荐参数**（recommend 里的 steps / 尺寸 / 预计秒数）；'
+      + 'op=templates 看有哪几种画法（方图/竖图）；op=gen 真的画一张，'
       + '要 prompt（画面本身：主体+环境+光线+画风，别写"请帮我画"）。'
+      + '**steps 和尺寸不要自己猜**：不给就按这台机器的档位来（同一份代码在有卡和无卡的机器上答案不同）。'
       + '画完图会出现在屏幕上，用户看得见 —— 你不用再铺一遍。'
-      + '它是慢工具：先调 status，再决定要不要画、要不要先跟用户说一声。',
+      + '它是慢工具：先调 status，用 recommend.etaSec 告诉用户大概要等多久（纯 CPU 是分钟级）。',
     schema: {
       type: 'object',
       properties: {

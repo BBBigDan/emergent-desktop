@@ -24,6 +24,10 @@ MODEL_FILE="${MODEL_FILE:-dreamshaper8_lcm.safetensors}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/Lykon/dreamshaper-8-lcm/resolve/main/DreamShaper8_LCM.safetensors}"
 # agent 侧只认这一个变量；服务名就在同一个命名空间里，不用走外部域名
 COMFY_URL_INNER="${COMFY_URL_INNER:-http://comfyui:8188}"
+# 等待上限**不再由这里给**：`comfy.mjs` 按 `/system_stats` 推设备档
+# （有卡秒级；这个盒子实测 88 秒/步），再取 2.5 倍余量。
+# 在这里写死一个数，就等于又造一套"只对这台机器有效"的常数。
+# 真要覆盖，用 COMFY_TIMEOUT_MS（agent 的 env）。
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$HOST")
 say() { printf '\033[36m→\033[0m %s\n' "$*"; }
@@ -75,9 +79,9 @@ if [ "$ACTION" = down ] || [ "$ACTION" = purge ]; then
     "${SSH[@]}" "rm -rf '$COMFY_DIR' && echo removed"
   fi
   # 留着 COMFY_URL 的话，agent 会一直说"连不上"—— 这是实话，但不该由一次 --down 制造。
-  say "把 Secret 里的 COMFY_URL 清掉（agent 会退回默认地址并如实说没接）"
+  say "把 Secret 里的 COMFY_URL / COMFY_TIMEOUT_MS 清掉（agent 会如实说没接）"
   "${SSH[@]}" "kubectl -n $NS patch secret emergent-desktop-env --type=merge \
-    -p '{\"data\":{\"COMFY_URL\":\"\"}}' >/dev/null 2>&1 || true; echo ok"
+    -p '{\"data\":{\"COMFY_URL\":\"\",\"COMFY_TIMEOUT_MS\":\"\"}}' >/dev/null 2>&1 || true; echo ok"
   exit 0
 fi
 
@@ -110,10 +114,26 @@ say "准备目录 $COMFY_DIR/root"
 # pod 照样起来、模型照样下，但 agent 在 user-space-* 里找不到 `comfyui` 这个服务名 ——
 # 表现是"明明起来了，画图还是连不上"。（第一次就踩了这一下）
 say "apply（ReplicaSet + Service，命名空间 $NS）"
-sed -e "s|__COMFY_DIR__|$COMFY_DIR|g" \
+# 模板指纹：ReplicaSet **不会**因为 template 变了就替换已有 pod（它只保证数量对），
+# 这跟桌面那边是同一个坑。改了 env / 镜像之后必须显式删 pod，否则
+# "部署成功、跑的还是旧的"，而日志里全是旧的输出。
+TMPL=$(sed -e "s|__COMFY_DIR__|$COMFY_DIR|g" \
     -e "s|__MODEL_URL__|$MODEL_URL|g" \
     -e "s|__MODEL_FILE__|$MODEL_FILE|g" \
-    "$HERE/comfy-cpu.yaml" | "${SSH[@]}" "kubectl -n $NS apply -f - 2>&1 | tail -4"
+    -e "s|__TMPL_HASH__||g" "$HERE/comfy-cpu.yaml" | sha256sum | cut -c1-12)
+OLD=$(sed -e "s|__COMFY_DIR__|$COMFY_DIR|g" \
+    -e "s|__MODEL_URL__|$MODEL_URL|g" \
+    -e "s|__MODEL_FILE__|$MODEL_FILE|g" \
+    -e "s|__TMPL_HASH__|$TMPL|g" "$HERE/comfy-cpu.yaml" | "${SSH[@]}" "kubectl -n $NS apply -f - 2>&1 | tail -4")
+echo "$OLD"
+# 老 pod 可能**没有**这个注解（第一次加的时候、或者别人手 apply 的），
+# 所以判据是"pod 在，且注解不等于这次算出来的" —— 空注解也算不一致。
+CUR=$("${SSH[@]}" "kubectl -n $NS get pod -l app=comfyui \
+  -o jsonpath='{range .items[*]}{.metadata.name}{\"|\"}{.metadata.annotations.emergent/tmpl-hash}{\"\\n\"}{end}' 2>/dev/null | head -1" || true)
+if [ -n "$CUR" ] && [ "$CUR" != "|$TMPL" ]; then
+  say "模板变了（${CUR#*|} → $TMPL），重建 pod"
+  "${SSH[@]}" "kubectl -n $NS delete pod -l app=comfyui --ignore-not-found --wait=false >/dev/null 2>&1 || true"
+fi
 
 # 首次要下 2.1GB，别催它；但也不能默默等 —— 把 init 容器的进度漏一行出来。
 say "等就绪（首次要下 $MODEL_FILE，2GB 级；最多等 12 分钟）"
@@ -141,12 +161,14 @@ say "探测 /system_stats（从 comfyui pod 自己打）"
 
 # 写 COMFY_URL：agent 的 env 来自 Secret（install.sh 从 agent/.env 灌整份）。
 # 用 merge patch 只加这一个键，别的键（MODEL_KEY 等）原样不动。
-say "把 COMFY_URL=$COMFY_URL_INNER 写进 Secret emergent-desktop-env"
+say "把 COMFY_URL=$COMFY_URL_INNER 写进 Secret emergent-desktop-env（等待上限交给设备档）"
 # **JSON 在本地拼好再发**。以前是在远端 shell 里展开 `$B` —— 三层引号一错，
 # 写进去的成了字面量 `$B`，kubectl 报 `illegal base64 data at input byte 0`，
 # 而我们那句 `|| echo` 又把失败说成"没有这个 Secret"，看起来像另一种毛病。
 B64=$(printf %s "$COMFY_URL_INNER" | base64 | tr -d '\n')
-PATCH_JSON="{\"data\":{\"COMFY_URL\":\"$B64\"}}"
+# 顺手把老的 COMFY_TIMEOUT_MS 清空：env 优先级高于设备档，
+# 之前手写进去的 900000 会把适配器整个盖掉。
+PATCH_JSON="{\"data\":{\"COMFY_URL\":\"$B64\",\"COMFY_TIMEOUT_MS\":\"\"}}"
 "${SSH[@]}" "kubectl -n $NS patch secret emergent-desktop-env --type=merge -p '$PATCH_JSON' >/dev/null 2>&1 \
   && echo ok || { echo '写 Secret 失败（这个 Secret 存在吗？先跑 ./deploy/install.sh）'; exit 1; }" \
   || die "Secret 没写进去，agent 拿不到 COMFY_URL"
@@ -169,17 +191,25 @@ say "重建 agent pod（让它读到新的 COMFY_URL）"
 say "从 agent 那边探一次（这才是它看到的网络）"
 # **不能取 items[0]**：刚删过 pod，列表里还有正在 Terminating 的那个，
 # items[0] 经常是它 —— 于是 exec 报 `pods "xxx" not found`，看起来像"agent 起不来"。
-# 按 ready 状态挑，才拿得到真正在跑的那个。
-"${SSH[@]}" "P=\$(kubectl -n $NS get pod -l app=emergent-desktop \
-    -o jsonpath='{range .items[*]}{.metadata.name}{\"|\"}{.status.containerStatuses[*].ready}{\"\\n\"}{end}' \
-    2>/dev/null | grep '|true true true' | cut -d'|' -f1 | head -1)
+# 按 ready 状态挑，并且**等它一会儿**：pod 刚 Ready 的那几秒，容器名还没在
+# API 里挂上，exec 会报 `unable to upgrade connection: container not found`。
+"${SSH[@]}" "for T in 1 2 3 4 5; do
+    P=\$(kubectl -n $NS get pod -l app=emergent-desktop \
+      -o jsonpath='{range .items[*]}{.metadata.name}{\"|\"}{.status.containerStatuses[*].ready}{\"\\n\"}{end}' \
+      2>/dev/null | grep '|true true true' | cut -d'|' -f1 | head -1)
+    [ -n \"\$P\" ] && break
+    sleep 6
+  done
   if [ -n \"\$P\" ]; then
-    kubectl -n $NS exec \$P -c agent -- node -e \"
-      fetch('$COMFY_URL_INNER/system_stats').then(r=>r.json()).then(j=>{
-        const d=(j.devices||[])[0]||{};
-        console.log('ok  comfyui', j.system?.comfyui_version||'', '| 设备:', d.name||'?', d.type||'', '| 显存:', d.vram_total||0);
-      }).catch(e=>{console.log('连不上：'+e.message); process.exit(1)})
-    \"
+    for T in 1 2 3; do
+      OUT=\$(kubectl -n $NS exec \$P -c agent -- node -e \"
+        fetch('$COMFY_URL_INNER/system_stats').then(r=>r.json()).then(j=>{
+          const d=(j.devices||[])[0]||{};
+          console.log('ok  comfyui', j.system?.comfyui_version||'', '| 设备:', d.name||'?', d.type||'', '| 显存:', d.vram_total||0);
+        }).catch(e=>{console.log('连不上：'+e.message); process.exit(1)})
+      \" 2>&1) && { echo \"\$OUT\"; break; }
+      echo \"\$OUT\" | tail -2; sleep 5
+    done
   else
     echo '（没找到 ready 的 agent pod，跳过这一步）'
   fi"
@@ -187,7 +217,10 @@ say "从 agent 那边探一次（这才是它看到的网络）"
 cat <<EOF
 
 起好了。agent 现在把图交给它：$COMFY_URL_INNER
-  出图：桌面上直接说「画一张……」（4~6 步、512×512，8 核大约 20~60 秒）
+  出图：桌面上直接说「画一张……」
+        参数按这台机器自动定（comfy 的 status 里那套 recommend）：纯 CPU 是 4 步 512、
+        实测约 88 秒/步，一张 5~6 分钟；有卡的机器上同一份代码会变成 6 步 768、十几秒。
+        等图上屏别催，心跳里能看到它在算。
   看状态：./deploy/comfy.sh --status
   跟日志：./deploy/comfy.sh --logs
   停掉（模型留在盘上）：./deploy/comfy.sh --down

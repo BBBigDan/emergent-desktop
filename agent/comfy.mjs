@@ -58,6 +58,64 @@ export function fillWorkflow(wf, v) {
   return JSON.parse(text);
 }
 
+/**
+ * **设备 → 参数（"适配器"）**：模板只提供"形状"，档位由这台机器决定。
+ *
+ * 同一份模板要跑在有卡的机器、纯 CPU 的机器、内存被 cgroup 掐住的 pod 上。
+ * 把 steps / 尺寸写死在模板里 = 只对开发那台机器有效：
+ * 在 4090 上按 CPU 档（4 步 512）画是浪费；在纯 CPU 上按 GPU 档（8 步 768）画
+ * 是十几分钟起步（实测）。
+ *
+ * 判据只用一个真数据源：ComfyUI 自己的 `/system_stats`
+ * （`devices[].type` / `vram_total` / `system.ram_total`，后者在 cgroup 里就是 cgroup 限额）。
+ * 换算系数 `COMFY_SEC_PER_STEP` 可以覆盖 —— 换机器时不必改代码。
+ *
+ * @param {any} stats /system_stats 的返回
+ */
+export function profileOf(stats) {
+  const dev = (stats?.devices || [])[0] || {};
+  const type = String(dev.type || '').toLowerCase();
+  const vram = Number(dev.vram_total || 0);
+  const ram = Number(stats?.system?.ram_total || 0);
+  const secEnv = Number(process.env.COMFY_SEC_PER_STEP || 0);
+  const gb = (n) => +((n / 1024 ** 3).toFixed(1));
+
+  if (/cuda|rocm|mps|xpu|gpu/.test(type) && vram > 0) {
+    const secPerStep = secEnv || 2;          // 一张 512、6 步 ≈ 12~20 秒
+    const steps = 6;
+    return {
+      kind: 'gpu',
+      device: String(dev.name || type).slice(0, 48),
+      vramGB: gb(vram),
+      ramGB: ram ? gb(ram) : null,
+      side: vram >= 8 * 1024 ** 3 ? 768 : 512,   // 显存够就允许竖图/大图
+      steps,
+      secPerStep,
+      etaSec: Math.round(secPerStep * steps + 6),
+      note: '',
+    };
+  }
+
+  /* 没卡。`--force-fp32` 与否不影响这个判断：都是 CPU 上算，
+     差别只是"哪一档更慢"，档位按 CPU 给。 */
+  const tight = ram > 0 && ram < 6 * 1024 ** 3;   // cgroup 只有 6GB 以内：别上 512
+  const secPerStep = secEnv || 88;                // 实测 88 秒/步（512×512、SD1.5 LCM、8 vCPU、fp32）
+  const steps = tight ? 3 : 4;
+  return {
+    kind: 'cpu',
+    device: String(dev.name || type || 'cpu').slice(0, 48),
+    vramGB: null,
+    ramGB: ram ? gb(ram) : null,
+    side: tight ? 384 : 512,
+    steps,
+    secPerStep,
+    etaSec: Math.round(secPerStep * steps + 40),   // +40s ≈ 载权重 / 文本编码 / VAE 解码
+    note: tight
+      ? `纯 CPU、内存只有 ${gb(ram)}GB：最多 ${tight ? 384 : 512} 边、${steps} 步，一张约 ${Math.round((secPerStep * steps + 40) / 60)} 分钟。`
+      : `纯 CPU：约 ${secPerStep} 秒/步，一张大概 ${Math.round((secPerStep * steps + 40) / 60)} 分钟。画之前先跟用户说一声。`,
+  };
+}
+
 /** 错误码 → 给模型看的一句话（模型再翻成人话给用户）。 */
 const ERR_ZH = {
   comfy_offline: '连不上 ComfyUI',
@@ -77,8 +135,23 @@ const ERR_ZH = {
  */
 export function createComfy(o = {}) {
   const baseOf = () => String(o.base ?? process.env.COMFY_URL ?? 'http://127.0.0.1:8188').replace(/\/+$/, '');
-  const WAIT = Number(o.timeout || process.env.COMFY_TIMEOUT_MS || 180_000);
+  /* 等一张图的上限。**默认值不再是常数 180 秒**：同样 6 步，有卡的机器 15 秒，
+     纯 CPU 的机器 10 分钟 —— 写死一个数总有一边是错的。env / 调用方仍然最高优先。 */
+  const WAIT_OVERRIDE = Number(o.timeout || process.env.COMFY_TIMEOUT_MS || 0);
+  const waitOf = (prof) => WAIT_OVERRIDE || Math.max(120_000, (prof?.etaSec || 120) * 2.5 * 1000);
   const POLL = Number(o.poll || 700);
+
+  /* 设备档案缓存 30 秒：一张图的生成里会问好几次，没必要每次都打 /system_stats。 */
+  let profCache = null;
+  let profAt = 0;
+  async function profile({ fresh = false } = {}) {
+    if (!fresh && profCache && Date.now() - profAt < 30_000) return profCache;
+    const st = await getJSON('/system_stats', { timeout: 5000 });
+    if (!st.ok) return profCache;          // 连不上就用旧的（null 也行：下面都有兜底）
+    profCache = profileOf(st.data);
+    profAt = Date.now();
+    return profCache;
+  }
 
   /* 模板：目录里一个文件一个模板，id = 文件名。启动时读一次，改模板要重启 —— 
      "重启才生效"对**服务端自己的文件**是可以的（它跟着镜像走）。 */
@@ -160,19 +233,40 @@ export function createComfy(o = {}) {
       };
     }
     const q = await getJSON('/queue', { timeout: 5000 });
-    const dev = st.data?.devices || [];
-    const gpu = dev.find((d) => /cuda|rocm|mps|xpu/i.test(String(d.type || '')) || d.vram_total);
     const models = await getJSON('/object_info/CheckpointLoaderSimple', { timeout: 6000 });
     const list = models.data?.input?.required?.ckpt_name?.[0];
+    const tpls = await templates();
+    /* **设备档：这一屏里"该怎么画"的唯一出处。**
+       模型不用记"78 秒/步"这种数字，它只要照 recommend 里的 steps / 尺寸来；
+       换一台有卡的机器，同一段对话里的建议就自动变成 6 步 512 或 768。 */
+    const prof = profileOf(st.data);
+    profCache = prof;
+    profAt = Date.now();
+    const side = prof.side;
+    const fit = (sz) => {
+      const m = Math.max(...sz);
+      const k = side ? Math.min(1, side / m) : 1;
+      return [Math.max(64, Math.round(sz[0] * k / 8) * 8), Math.max(64, Math.round(sz[1] * k / 8) * 8)];
+    };
+    const first = tpls[0];
+    const [rw, rh] = fit(first?.size || [512, 512]);
+    const recommend = { template: first?.id || '', steps: prof.steps, width: rw, height: rh, etaSec: prof.etaSec };
     return {
       ok: true,
       online: true,
       version: st.data?.system?.comfyui_version || '',
-      gpu: gpu ? { name: String(gpu.name || '').slice(0, 60), vramGB: gpu.vram_total ? +(gpu.vram_total / 1024 ** 3).toFixed(1) : null } : null,
-      cpuOnly: !gpu,
+      /* 保留老字段（gpu / cpuOnly）：工具描述、报错话术、自测都在用 */
+      gpu: prof.kind === 'gpu' ? { name: prof.device, vramGB: prof.vramGB } : null,
+      cpuOnly: prof.kind !== 'gpu',
+      device: prof,
+      recommend,
+      /* 这台机器上"用哪套参数"的一句话 —— 模型照着说给用户听 */
+      advice: prof.note
+        || `有卡（${prof.device}，${prof.vramGB}GB 显存）：${rw}×${rh}、${prof.steps} 步，约 ${prof.etaSec} 秒。`,
       queue: q.ok ? { running: (q.data?.queue_running || []).length, pending: (q.data?.queue_pending || []).length } : null,
       models: Array.isArray(list) ? list.slice(0, 12) : [],
-      templates: (await templates()).map((t) => ({ id: t.id, label: t.label, size: t.size })),
+      /* 模板报的是**生效值**（设备档裁过的）。模板文件里那套数只是兜底。 */
+      templates: tpls.map((t) => ({ id: t.id, label: t.label, size: fit(t.size), steps: prof.steps })),
     };
   }
 
@@ -199,14 +293,31 @@ export function createComfy(o = {}) {
     if (!prompt) return { error: '要给 prompt（想画什么）', code: 'comfy_bad_args' };
     if (prompt.length > 1200) return { error: `prompt 太长（${prompt.length} 字，最多 1200）`, code: 'comfy_bad_args' };
 
+    /* 设备档案：模型不需要知道这台机器几核几张卡，但**参数要跟着它变**。 */
+    const prof = await profile();
+    let scaledDown = null;      // 被设备档缩过尺寸时记一笔，回给模型/用户
+
     /* 尺寸夹在模板允许的档里：模型给 3000×3000 时不 clamp 而是**说明**，
-       否则它会以为"我给了 3000，出来怎么是 512"。 */
-    const W = Math.round(Number(a.width || t.size?.[0] || 512));
-    const H = Math.round(Number(a.height || t.size?.[1] || 512));
+       否则它会以为"我给了 3000，出来怎么是 512"。
+       然后按设备再收一次：纯 CPU 上 768×768 是十几分钟，缩到设备档（保持比例、8 的倍数）。 */
+    let W = Math.round(Number(a.width || t.size?.[0] || 512));
+    let H = Math.round(Number(a.height || t.size?.[1] || 512));
     if (!(W >= 64 && W <= 1024 && H >= 64 && H <= 1024)) {
       return { error: `尺寸要在 64~1024 之间（收到 ${W}×${H}）`, code: 'comfy_bad_args' };
     }
-    const steps = Math.round(Number(a.steps || t.steps || DEFAULTS.steps));
+    const side = Number(prof?.side || 0);
+    if (side && Math.max(W, H) > side) {
+      const k = side / Math.max(W, H);
+      W = Math.max(64, Math.round(W * k / 8) * 8);
+      H = Math.max(64, Math.round(H * k / 8) * 8);
+      /* 只有"用户/模板明确要了大尺寸、被这台机器缩了"才需要解释；
+         本来就是模板默认尺寸的话，缩了也不用说。 */
+      if (a.width || a.height) scaledDown = { from: [Math.round(Number(a.width)), Math.round(Number(a.height))], to: [W, H], why: prof.note || prof.kind };
+    }
+
+    /* 步数：调用方说了算 > 设备推荐 > 模板 > 默认。
+       模板里的 steps 现在只是"不知道设备时的兜底"，不再是硬编码答案。 */
+    const steps = Math.round(Number(a.steps || prof?.steps || t.steps || DEFAULTS.steps));
     if (!(steps >= 1 && steps <= 30)) return { error: `步数要在 1~30 之间（收到 ${steps}）`, code: 'comfy_bad_args' };
     const seed = Number(a.seed) > 0 ? Math.round(Number(a.seed)) : Math.floor(Math.random() * 2 ** 31);
 
@@ -242,6 +353,7 @@ export function createComfy(o = {}) {
     for (;;) {
       await new Promise((r) => setTimeout(r, POLL));
       const elapsed = Date.now() - t0;
+      const WAIT = waitOf(prof);
       if (elapsed > WAIT) {
         /* 超时**不打断它** —— 图可能还在跑，用户下一句还能看到结果。
            这里只回一句"还没出来"，并给 prompt_id 好让人去 ComfyUI 里看。 */
@@ -284,6 +396,9 @@ export function createComfy(o = {}) {
         width: W,
         height: H,
         steps,
+        device: prof ? { kind: prof.kind, name: prof.device, etaSec: prof.etaSec } : null,
+        /* 被设备档缩过尺寸要说出来 —— 否则"我要 768 出来怎么是 512" 只能靠猜 */
+        adjusted: scaledDown,
         image: { filename: img.filename, subfolder: img.subfolder || '', type: img.type || 'output' },
       };
     }
