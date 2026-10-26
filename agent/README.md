@@ -1009,7 +1009,8 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 |---|---|
 | `devices[0].type` 含 cuda/rocm/mps/xpu 且 `vram_total > 0` | `gpu`：6 步；显存 ≥8GB 允许 768 边，否则 512 |
 | 没有卡 | `cpu`：4 步、512 边；`system.ram_total < 6GB` 再降到 3 步、384 边 |
-| 预计时间 | `secPerStep × steps + 40s`（载权重/编码/解码）。CPU 的 88 秒/步是**这台机器实测**，换机器用 `COMFY_SEC_PER_STEP` 覆盖 |
+| 预计时间 | `secPerStep × steps + 40s`（载权重/编码/解码）。CPU 的 105 秒/步是**这台机器四次实测的中位数**（82 / 100 / 106 / 137），换机器用 `COMFY_SEC_PER_STEP` 覆盖 |
+| 说给用户的数 | `etaMin: [下界, 上界]`（etaSec 的 0.85~1.35 倍）。**不给单点** —— 共享 CPU 上单点数必然有一半时间不准 |
 
 `status` 直接把结论交出去（`recommend: {template, steps, width, height, etaSec}` 和一句
 `advice`），工具描述也改成**"steps 和尺寸不要自己猜"**：模型没有理由去记住"78 秒/步"
@@ -1022,7 +1023,7 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 |---|---|---|
 | 权重 | `Lykon/dreamshaper-8-lcm` 2.13GB | SD1.5 + LCM，免登录。不用 `sd-turbo`：`sd_turbo.safetensors` 5.2GB，光权重就吃掉 10.6Gi 可分配内存的一半 |
 | 启动 | ~4 分钟到 `/system_stats` 可用 | torch import + 把 bundle 拷进 `/root`（只有第一次拷） |
-| 采样 | **~88 秒/步** | 8 步 11 分 37 秒、6 步 10 分 42 秒（都实测）；4 步 512 ≈ 5~6 分钟 |
+| 采样 | **82~137 秒/步**（中位 105） | 四次真跑（扣掉 40s 固定开销）：8 步 697s=82、6 步 642s=100、4 步 463s=106、4 步 588s=137。差别来自整机争抢（load 30 时慢 60%）—— 所以对外说 **7~10 分钟**，不说 7 分钟 |
 | 等待上限 | **不写死** | 设备档 ×2.5（纯 CPU ≈ 16 分钟），`COMFY_TIMEOUT_MS` 可强制覆盖。超时**不杀作业**，只是先回一句"还没出来" |
 | 资源 | 6 核 / 7Gi | 不设 CPU 上限，torch 吃满 8 核，出图那几分钟整个桌面在卡；内存超限是 pod 自己被 OOMKill，不会拖死桌面 |
 | 线程 | `OMP_NUM_THREADS=6` | torch 默认按**节点**核数（8）开线程，多出来的 2 个只会互相抢 |

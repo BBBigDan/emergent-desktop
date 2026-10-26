@@ -332,7 +332,8 @@ export function makeTools(o = {}) {
       + '要 prompt（画面本身：主体+环境+光线+画风，别写"请帮我画"）。'
       + '**steps 和尺寸不要自己猜**：不给就按这台机器的档位来（同一份代码在有卡和无卡的机器上答案不同）。'
       + '画完图会出现在屏幕上，用户看得见 —— 你不用再铺一遍。'
-      + '它是慢工具：先调 status，用 recommend.etaSec 告诉用户大概要等多久（纯 CPU 是分钟级）。',
+      + '它是慢工具：先调 status，用 recommend.etaMin 告诉用户**要等几分钟**（纯 CPU 是分钟级；'
+      + '照 recommend 说，别自己估 —— 这台机器实测就落在那个区间里）。',
     schema: {
       type: 'object',
       properties: {

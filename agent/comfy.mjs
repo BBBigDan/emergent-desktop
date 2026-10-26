@@ -92,6 +92,8 @@ export function profileOf(stats) {
       steps,
       secPerStep,
       etaSec: Math.round(secPerStep * steps + 6),
+      etaMin: [Math.max(1, Math.round((secPerStep * steps + 6) * 0.8 / 60)),
+        Math.max(2, Math.round((secPerStep * steps + 6) * 1.6 / 60))],
       note: '',
     };
   }
@@ -99,8 +101,18 @@ export function profileOf(stats) {
   /* 没卡。`--force-fp32` 与否不影响这个判断：都是 CPU 上算，
      差别只是"哪一档更慢"，档位按 CPU 给。 */
   const tight = ram > 0 && ram < 6 * 1024 ** 3;   // cgroup 只有 6GB 以内：别上 512
-  const secPerStep = secEnv || 88;                // 实测 88 秒/步（512×512、SD1.5 LCM、8 vCPU、fp32）
+  /* 每步多少秒：**取实测的中位数，不取最好那一次**。
+     这台机器四次真实测量的"扣掉 40 秒固定开销"的每步耗时是 82 / 100 / 106 / 137 秒
+     （同样 512×512、SD1.5 LCM、8 vCPU、fp32），差别来自整机争抢 —— load 30 的时候
+     比空闲时慢 60%。原来写 88（最好那一次的整图平均），于是 `advice` 说"7 分钟"、
+     实际 8~10 分钟，用户听到的就是一句会打脸的估计。 */
+  const secPerStep = secEnv || 105;
   const steps = tight ? 3 : 4;
+  const etaSec = Math.round(secPerStep * steps + 40);   // +40s ≈ 载权重 / 文本编码 / VAE 解码
+  /* **给区间，不给单点。** 单点数在这种共享 CPU 上必然有一半时间不准；
+     区间还顺带把"机器忙时更慢"这件事说出来了。 */
+  const loMin = Math.max(1, Math.round((etaSec * 0.85) / 60));
+  const hiMin = Math.max(loMin + 1, Math.round((etaSec * 1.35) / 60));
   return {
     kind: 'cpu',
     device: String(dev.name || type || 'cpu').slice(0, 48),
@@ -109,10 +121,11 @@ export function profileOf(stats) {
     side: tight ? 384 : 512,
     steps,
     secPerStep,
-    etaSec: Math.round(secPerStep * steps + 40),   // +40s ≈ 载权重 / 文本编码 / VAE 解码
+    etaSec,
+    etaMin: [loMin, hiMin],
     note: tight
-      ? `纯 CPU、内存只有 ${gb(ram)}GB：最多 ${tight ? 384 : 512} 边、${steps} 步，一张约 ${Math.round((secPerStep * steps + 40) / 60)} 分钟。`
-      : `纯 CPU：约 ${secPerStep} 秒/步，一张大概 ${Math.round((secPerStep * steps + 40) / 60)} 分钟。画之前先跟用户说一声。`,
+      ? `纯 CPU、内存只有 ${gb(ram)}GB：最多 ${tight ? 384 : 512} 边、${steps} 步，一张 ${loMin}~${hiMin} 分钟。`
+      : `纯 CPU：约 ${secPerStep} 秒/步，一张 ${loMin}~${hiMin} 分钟（机器忙时靠上）。画之前先跟用户说一声要等这么久。`,
   };
 }
 
@@ -250,7 +263,12 @@ export function createComfy(o = {}) {
     };
     const first = tpls[0];
     const [rw, rh] = fit(first?.size || [512, 512]);
-    const recommend = { template: first?.id || '', steps: prof.steps, width: rw, height: rh, etaSec: prof.etaSec };
+    /* `etaSec` 是"大概多久"（用来设等待上限、也用来算钱），`etaMin` 是**说给用户听的区间** ——
+       共享 CPU 上单点数必然有一半时间不准，说了"7 分钟"却等 10 分钟，用户会认为它在瞎报。 */
+    const recommend = {
+      template: first?.id || '', steps: prof.steps, width: rw, height: rh,
+      etaSec: prof.etaSec, etaMin: prof.etaMin || null,
+    };
     return {
       ok: true,
       online: true,

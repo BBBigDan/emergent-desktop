@@ -158,6 +158,7 @@ console.log('\n设备适配器（profileOf）');
   ok(gpu.kind === 'gpu', `有卡 → gpu（${gpu.device}）`);
   ok(gpu.steps === 6 && gpu.side === 768, `24GB 显存 → 6 步、允许 768 边（${gpu.steps} 步 / ${gpu.side}）`);
   ok(gpu.etaSec > 0 && gpu.etaSec < 60, `预计 ${gpu.etaSec} 秒（有卡就该是秒级）`);
+  ok(Array.isArray(gpu.etaMin), `有卡也给区间（口径统一）：${JSON.stringify(gpu.etaMin)} 分钟`);
 
   const small = profileOf({ devices: [{ name: 'cuda:0', type: 'cuda', vram_total: 4 * 1024 ** 3 }], system: { ram_total: 32 * 1024 ** 3 } });
   ok(small.side === 512, `4GB 显存 → 只给 512 边（${small.side}）`);
@@ -168,6 +169,12 @@ console.log('\n设备适配器（profileOf）');
   ok(cpu.steps === 4 && cpu.side === 512, `6GB 内存 → 4 步 / 512（${cpu.steps} 步 / ${cpu.side}）`);
   ok(cpu.etaSec >= 300, `预计 ${cpu.etaSec} 秒 —— 分钟级，必须如实说`);
   ok(/分钟/.test(cpu.note), `note 是人话：${cpu.note}`);
+  /* 实测 4 步是 463 / 588 秒 —— 报"7 分钟"必然被打脸（这就是 secPerStep 从 88 改 105 的来由）。
+     所以给区间，且下界不许比实测更乐观。 */
+  ok(Array.isArray(cpu.etaMin) && cpu.etaMin[0] < cpu.etaMin[1],
+    `给区间不给单点：${JSON.stringify(cpu.etaMin)} 分钟`);
+  ok(cpu.etaMin[0] >= 6, `下界 ${cpu.etaMin[0]} 分钟 —— 不许比实测（7.7 / 9.8 分钟）更乐观`);
+  ok(/\d+~\d+ 分钟/.test(cpu.note), `note 里是区间：${cpu.note}`);
 
   const tiny = profileOf({ devices: [{ type: 'cpu' }], system: { ram_total: 4 * 1024 ** 3 } });
   ok(tiny.side === 384 && tiny.steps === 3, `内存 4GB → 降到 384 / 3 步（${tiny.side} / ${tiny.steps}）`);
