@@ -27,6 +27,7 @@ import { createAgentBar } from './agentbar.js';
 import { createTrace } from './trace.js';
 import { createModelPicker } from './modelpick.js';
 import { createSettings } from './settings.js';
+import { createImagePanel } from './imagepanel.js';
 import { createTraceFrame } from './traceframe.js';
 import { FONT } from './draw.js';
 import { FieldA11y } from './aria.js';
@@ -150,6 +151,21 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     onClose: () => { closePicker(); },
   });
   layer.appendChild(picker.el);
+
+  /* ── 生成的图（ComfyUI） ──
+   *
+   * 它是**第四块玻璃**，和其他三块共用同一圈粒子框。三条继承下来的规矩：
+   *   · 开之前先让别的让位（框只有一个）；
+   *   · 框在 setOpen(true) 之前挪到它的真实盒子上；
+   *   · 收起只有一条出口（closeImage），玻璃和框一起收。
+   * 它和另外三块不同的一点：**内容不由模型决定**，由服务端的 `image` 事件决定 ——
+   * 场景层是模型能画的东西，图不是。
+   */
+  const imgPanel = createImagePanel({
+    onResize: () => { if (imgPanel.isOpen()) frameToImage(); },
+    onClose: () => { closeImage(); },
+  });
+  layer.appendChild(imgPanel.el);
   let pickerData = null;      // 服务端给的那张表（含 current / busy）
   let pickerLoading = 0;
   let pickerWasTyping = false;
@@ -298,6 +314,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
   function openTrace({ toTop = false } = {}) {
     if (!trace || trace.isOpen() || !open) return;
+    /* **图在屏幕上时，过程不抢那块地方。**
+       这条是实测出来的：图刚落屏，下一步的 think 让「思考过程」自己弹出来，
+       而它开之前要收别的玻璃 —— 于是刚画好的图当场被收掉，用户只看到一句
+       "画好了"和一片空场（第一遍就是这么跑的）。
+       过程仍然在记（trace 的 rows 一直在长），点一下小脸就能看。 */
+    if (imgPanel.isOpen()) return;
     clearTimeout(traceTimer);
     traceTimer = 0;
     /* 框只有一个：谁要开，另一块玻璃就让位 */
@@ -334,12 +356,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   addEventListener('pointerdown', (e) => {
     /* 两块玻璃都问一遍。**设置里还有点输入框**，所以这里的 closest 要带上
        `.ag-set` —— 少了它，点一下面板里的空白处整个面板就关了。 */
-    if (!picker.isOpen() && !settings.isOpen()) return;
+    if (!picker.isOpen() && !settings.isOpen() && !imgPanel.isOpen()) return;
     const inside = e.target instanceof Element
-      && e.target.closest('.ag-mp, .ag-model, .ag-set, .ag-set-btn');
+      && e.target.closest('.ag-mp, .ag-model, .ag-set, .ag-set-btn, .ag-img');
     if (inside) return;
     if (settings.isOpen()) closeSettings({ focus: false });
     if (picker.isOpen()) closePicker();
+    if (imgPanel.isOpen()) closeImage({ focus: false });
   });
 
   /** 点小脸：开着就收，收着就开（再看一遍刚才的经过） */
@@ -352,8 +375,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
       tframe?.setHint(hasTraceRows());
     } else {
       /* 用户点开了 = 他想看。清掉 pin，下一轮就恢复"跟着思考自己弹出来"。
-         `toTop`：从头看 —— 他要看的是"它怎么想的"，不是"它最后调了什么"。 */
+         `toTop`：从头看 —— 他要看的是"它怎么想的"，不是"它最后调了什么"。
+         图在这里**让位**：点脸是明确的"我要看过程"，那就轮到我收。 */
       tracePinned = false;
+      if (imgPanel.isOpen()) closeImage({ focus: false });
       openTrace({ toTop: true });
     }
     return true;
@@ -428,8 +453,52 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     return true;
   }
 
+  function frameToImage() {
+    const r = imgPanel.rect();
+    if (!r || !r.w || !r.h) return false;
+    const m = 10;   // 图比玻璃更需要呼吸：框贴太近会压在图的边缘上
+    tframe?.layout({
+      x: Math.round(r.x - m), y: Math.round(r.y - m),
+      w: Math.round(r.w + 2 * m), h: Math.round(r.h + 2 * m),
+      anchor: null,
+    });
+    return true;
+  }
+
+  /* 图的开合。和别的一样：框先挪、再亮；收起走同一个出口。 */
+  let imgWasTyping = false;
+  function openImage(d) {
+    if (!open || !d?.url) return;
+    if (picker.isOpen()) closePicker({ focus: false });
+    if (settings.isOpen()) closeSettings({ focus: false });
+    if (trace?.isOpen()) closeTrace();
+    imgWasTyping = document.activeElement === typeEl;
+    /* 图片能占的地方 = 内容区里**答案栏右边那一溜**。
+       这样图和字各站一边：字从左边起、图靠右，谁也不压谁（第一版直接居中，
+       图把答案的后半句吃掉了）。窄屏留给图的地方不够时退回整块内容区。 */
+    const a = contentArea();
+    const ag = typeof ansGeom === 'function' && ans ? ansGeom() : null;
+    const left0 = ag ? Math.round(ag.cx + ag.maxWidth / 2 + 28) : Math.round(a.x + a.w * 0.56);
+    const right0 = a.x + a.w - 8;
+    const bounds = (right0 - left0 > 240)
+      ? { x: left0, y: a.y, w: right0 - left0, h: a.h }
+      : { x: a.x, y: a.y, w: a.w, h: a.h };
+    imgPanel.openAt({ ...d, bounds });
+    if (frameToImage()) { tframe?.setHint(false); tframe?.setOpen(true); }
+  }
+
+  function closeImage({ focus = true } = {}) {
+    const was = imgPanel.close();
+    if (!was) return false;
+    tframe?.setOpen(false);
+    tframe?.setHint(hasTraceRows() && !trace?.isOpen());
+    if (focus && imgWasTyping) typeEl.focus();
+    return true;
+  }
+
   function openPicker({ force = false } = {}) {
     if (!open) return;
+    if (imgPanel.isOpen()) closeImage({ focus: false });
     /* 设置面板让位：框只有一个，两块玻璃叠着谁也读不清 */
     if (settings.isOpen()) closeSettings({ focus: false });
     /* 先收那一栏：它和新面板抢同一块地方，而且它的框会从玻璃边缘漏出来。
@@ -473,8 +542,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
    */
   function openSettings() {
     if (!open || settings.isOpen()) return;
-    /* 让位：思考过程那栏和换模型表都收掉 —— 框只有一个 */
+    /* 让位：思考过程那栏、换模型表、还有那张图 —— 框只有一个 */
     if (picker.isOpen()) closePicker();
+    if (imgPanel.isOpen()) closeImage({ focus: false });
     if (trace?.isOpen()) { tracePinned = true; closeTrace(); }
     /* 位置**不跟那个按钮走**，而是和另外两块玻璃同一列（内容区左边界）。
        跟着按钮走的话它会贴在屏幕最右边 —— 而这块屏的全部内容都在左边这一列，
@@ -1350,6 +1420,9 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
            面板留在屏幕上就成了一块没有框的玻璃。 */
         if (picker.isOpen()) closePicker();
         if (settings.isOpen()) closeSettings({ focus: false });
+        /* 新问题 = 上一张图作废（和 dropScene 同一个意思）。留着它，
+           屏幕上会有一张"上一题的结果"压着这一题的过程。 */
+        if (imgPanel.isOpen()) closeImage({ focus: false });
         setBusy(true);
         /* 新问题 = 上一屏作废（进"在想"时屏幕上只该有问 + 环）。
            放在 turn 而不是只放 submit：手势回合也要走这里，而 adjust 不清。 */
@@ -1584,6 +1657,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'draw':
         runDraw(m.spec);
+        break;
+
+      case 'image':
+        /* 工具画出来的图（ComfyUI）。它不走 scene —— 场景层是模型能画的东西，
+           图是产物。这里只负责"摆上去 + 圈一圈粒子"，其它什么都不改。 */
+        openImage({ url: m.url, width: m.width, height: m.height, seed: m.seed, ms: m.ms });
+        insp('image', `${m.width}×${m.height}${m.seed ? ' · seed ' + m.seed : ''}`);
         break;
 
       case 'error':
@@ -1881,6 +1961,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
        否则在面板上拖一下，会把背后的仪表拖走（踩过）。 */
     if (settings.hit(x, y)) return null;
     if (picker.hit(x, y)) return null;
+    if (imgPanel.hit(x, y)) return null;
     if (trace?.hit(x, y)) return null;
     return scene.hit(x, y) || faceHit(x, y);
   }
@@ -1959,7 +2040,7 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     if (gt.g?.moved) return;
     /* 面板上不换光标：它自己那层的 cursor 更准确（滚动的区域就是滚动的样子） */
     if (settings.hit(e.clientX, e.clientY) || picker.hit(e.clientX, e.clientY)
-      || trace?.hit(e.clientX, e.clientY)) {
+      || imgPanel.hit(e.clientX, e.clientY) || trace?.hit(e.clientX, e.clientY)) {
       document.body.style.cursor = 'default';
       return;
     }

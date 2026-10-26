@@ -1,0 +1,306 @@
+/**
+ * ComfyUI —— 只认一个 HTTP 地址，其余什么都不假设。
+ *
+ * 为什么不让模型写 workflow：
+ *   一张真图是 2~5KB 的节点 id + 连线，7B 一定写错（实测它在 20 行的 JSON 里
+ *   都会漏参数），而且"任意图"等于"任意节点执行" —— 那是安全口子。
+ *   所以**图归服务端所有**（`agent/workflows/*.json`），模型只填几个槽：
+ *   模板名、提示词、尺寸档、步数、种子。这和 `scene.schema.mjs` 的白名单一个思路：
+ *   能表达的范围由代码决定，不由模型的表达欲决定。
+ *
+ * 为什么这一层能脱离显卡开发：
+ *   排队、轮询、超时、错误映射、图片怎么回到屏幕上 —— 这些都和 GPU 无关。
+ *   `tools/dev/stub-comfy.mjs` 把真契约实现了一遍，于是这些能在 CI 里钉死。
+ *   真出图另说：本机 CPU 跑 SD-Turbo（4 步 512）20~40 秒一张，够验收。
+ */
+
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import url from 'node:url';
+
+const HERE = path.dirname(url.fileURLToPath(import.meta.url));
+const WORKFLOW_DIR = path.join(HERE, 'workflows');
+
+const DEFAULTS = {
+  prompt: '',
+  negative: 'blurry, low quality, watermark, text',
+  steps: 8,
+  seed: 0,           // 0 = 随机
+  model: '',
+};
+
+/* 一条消息里能出现的所有槽。模板里写成 `"__PROMPT__"`（带引号），
+   填值的时候整段替换成 **JSON 编码后的值** —— 提示词里的引号、换行、
+   反斜杠都由 JSON.stringify 负责，不当字符串拼。 */
+const SLOT_RE = /"__(PROMPT|NEGATIVE|W|H|STEPS|SEED|CFG|MODEL|SAMPLER|PREFIX|SCHEDULER)__"/g;
+
+/**
+ * 把模板里的占位符填成真值。
+ * 导出的理由是：这是唯一一处"外部字符串进 graph"的地方，值得单独钉住。
+ * @param {object} wf 模板 workflow（API 格式）
+ * @param {object} v  槽值（已经过范围检查）
+ */
+export function fillWorkflow(wf, v) {
+  const map = {
+    PROMPT: JSON.stringify(String(v.prompt ?? '')),
+    NEGATIVE: JSON.stringify(String(v.negative ?? '')),
+    W: String(Math.round(v.width)),
+    H: String(Math.round(v.height)),
+    STEPS: String(Math.round(v.steps)),
+    SEED: String(Math.round(v.seed)),
+    CFG: String(Number(v.cfg ?? 1.5)),
+    MODEL: JSON.stringify(String(v.model || '')),
+    SAMPLER: JSON.stringify(String(v.sampler || 'euler')),
+    SCHEDULER: JSON.stringify(String(v.scheduler || 'normal')),
+    PREFIX: JSON.stringify(String(v.prefix || 'emergent')),
+  };
+  const text = JSON.stringify(wf).replace(SLOT_RE, (_m, k) => map[k]);
+  return JSON.parse(text);
+}
+
+/** 错误码 → 给模型看的一句话（模型再翻成人话给用户）。 */
+const ERR_ZH = {
+  comfy_offline: '连不上 ComfyUI',
+  comfy_bad_graph: '工作流被 ComfyUI 拒了',
+  comfy_queue_full: 'ComfyUI 队列满了',
+  comfy_oom: '显存/内存不够',
+  comfy_failed: '出图失败了',
+  comfy_timeout: '等太久还没出来',
+  comfy_no_image: '跑完了但没有输出图',
+  comfy_bad_args: '参数不对',
+};
+
+/**
+ * @param {object} o
+ * @param {string} [o.base]    覆盖地址（测试用）；默认 COMFY_URL 或 127.0.0.1:8188
+ * @param {number} [o.timeout] 单张图的等待上限
+ */
+export function createComfy(o = {}) {
+  const baseOf = () => String(o.base ?? process.env.COMFY_URL ?? 'http://127.0.0.1:8188').replace(/\/+$/, '');
+  const WAIT = Number(o.timeout || process.env.COMFY_TIMEOUT_MS || 180_000);
+  const POLL = Number(o.poll || 700);
+
+  /* 模板：目录里一个文件一个模板，id = 文件名。启动时读一次，改模板要重启 —— 
+     "重启才生效"对**服务端自己的文件**是可以的（它跟着镜像走）。 */
+  let tplCache = null;
+  async function templates() {
+    if (tplCache) return tplCache;
+    const out = [];
+    try {
+      const files = (await fs.readdir(WORKFLOW_DIR)).filter((f) => f.endsWith('.json'));
+      for (const f of files.sort()) {
+        const j = JSON.parse(await fs.readFile(path.join(WORKFLOW_DIR, f), 'utf8'));
+        out.push({
+          id: f.replace(/\.json$/, ''),
+          label: j.label || f,
+          doc: j.doc || '',
+          /* 默认值也一起给出去：模型不用猜"尺寸档有哪些" */
+          size: j.size || [512, 512],
+          steps: j.steps ?? DEFAULTS.steps,
+          model: j.model || '',
+          note: j.note || '',
+          _wf: j.workflow,
+        });
+      }
+    } catch (e) {
+      console.warn('[comfy] 读模板失败：' + e.message);
+    }
+    tplCache = out;
+    return out;
+  }
+
+  async function getJSON(p, { timeout = 8000 } = {}) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(baseOf() + p, { signal: AbortSignal.timeout(timeout) });
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { /* 下面按非 JSON 处理 */ }
+      return { ok: r.ok, status: r.status, data, text, ms: Date.now() - t0 };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e?.message || e), ms: Date.now() - t0 };
+    }
+  }
+
+  async function postJSON(p, body, { timeout = 15000 } = {}) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(baseOf() + p, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeout),
+      });
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { /* 保持 null */ }
+      return { ok: r.ok, status: r.status, data, text, ms: Date.now() - t0 };
+    } catch (e) {
+      return { ok: false, status: 0, error: String(e?.message || e), ms: Date.now() - t0 };
+    }
+  }
+
+  /**
+   * 它现在能不能干活 —— **有没有卡**是这里的第一个事实，不是猜的。
+   * `devices` 空就是纯 CPU：出图会慢到分钟级，这件事必须先告诉用户，
+   * 而不是让他等三分钟以为是卡住了。
+   */
+  async function status() {
+    const st = await getJSON('/system_stats');
+    if (!st.ok) {
+      return {
+        error: `连不上 ComfyUI（${baseOf()}）：${st.error || `HTTP ${st.status}`}。`
+          + '先确认地址对不对、服务起没起；没起的话这台机器可以用 tools/dev/stub-comfy.mjs 先顶上。',
+        code: 'comfy_offline',
+      };
+    }
+    const q = await getJSON('/queue', { timeout: 5000 });
+    const dev = st.data?.devices || [];
+    const gpu = dev.find((d) => /cuda|rocm|mps|xpu/i.test(String(d.type || '')) || d.vram_total);
+    const models = await getJSON('/object_info/CheckpointLoaderSimple', { timeout: 6000 });
+    const list = models.data?.input?.required?.ckpt_name?.[0];
+    return {
+      ok: true,
+      online: true,
+      version: st.data?.system?.comfyui_version || '',
+      gpu: gpu ? { name: String(gpu.name || '').slice(0, 60), vramGB: gpu.vram_total ? +(gpu.vram_total / 1024 ** 3).toFixed(1) : null } : null,
+      cpuOnly: !gpu,
+      queue: q.ok ? { running: (q.data?.queue_running || []).length, pending: (q.data?.queue_pending || []).length } : null,
+      models: Array.isArray(list) ? list.slice(0, 12) : [],
+      templates: (await templates()).map((t) => ({ id: t.id, label: t.label, size: t.size })),
+    };
+  }
+
+  /**
+   * 生成一张。
+   * @param {object} a
+   * @param {string} a.template  模板 id（不给就用第一个）
+   * @param {string} a.prompt    提示词（会过长度上限）
+   * @param {number} [a.width]
+   * @param {number} [a.height]
+   * @param {number} [a.steps]
+   * @param {number} [a.seed]    0 / 不给 = 随机
+   * @param {(p:{elapsedMs:number,queueAhead?:number})=>void} [a.onProgress]
+   */
+  async function gen(a = {}) {
+    const tpls = await templates();
+    if (!tpls.length) return { error: '服务端没有可用的工作流模板（agent/workflows/*.json）', code: 'comfy_bad_args' };
+    const tpl = String(a.template || tpls[0].id);
+    const t = tpls.find((x) => x.id === tpl);
+    if (!t) {
+      return { error: `没有这个模板：${tpl}。能用的是 ${tpls.map((x) => x.id).join(' / ')}。`, code: 'comfy_bad_args' };
+    }
+    const prompt = String(a.prompt ?? '').trim();
+    if (!prompt) return { error: '要给 prompt（想画什么）', code: 'comfy_bad_args' };
+    if (prompt.length > 1200) return { error: `prompt 太长（${prompt.length} 字，最多 1200）`, code: 'comfy_bad_args' };
+
+    /* 尺寸夹在模板允许的档里：模型给 3000×3000 时不 clamp 而是**说明**，
+       否则它会以为"我给了 3000，出来怎么是 512"。 */
+    const W = Math.round(Number(a.width || t.size?.[0] || 512));
+    const H = Math.round(Number(a.height || t.size?.[1] || 512));
+    if (!(W >= 64 && W <= 1024 && H >= 64 && H <= 1024)) {
+      return { error: `尺寸要在 64~1024 之间（收到 ${W}×${H}）`, code: 'comfy_bad_args' };
+    }
+    const steps = Math.round(Number(a.steps || t.steps || DEFAULTS.steps));
+    if (!(steps >= 1 && steps <= 30)) return { error: `步数要在 1~30 之间（收到 ${steps}）`, code: 'comfy_bad_args' };
+    const seed = Number(a.seed) > 0 ? Math.round(Number(a.seed)) : Math.floor(Math.random() * 2 ** 31);
+
+    const graph = fillWorkflow(t.workflow || t._wf, {
+      prompt,
+      negative: a.negative ?? DEFAULTS.negative,
+      width: W, height: H, steps, seed,
+      model: a.model || t.model || DEFAULTS.model,
+      prefix: 'emergent',
+    });
+
+    const t0 = Date.now();
+    const posted = await postJSON('/prompt', { prompt: graph, client_id: `emergent-${t0}` });
+    if (!posted.ok || posted.data?.error) {
+      /* ComfyUI 的 400 正文带 node_errors，把它翻成一句能改的话 */
+      if (posted.status === 429) return { error: 'ComfyUI 队列满了，等它跑完再说（或者先 /queue 里清掉）', code: 'comfy_queue_full' };
+      const ne = posted.data?.node_errors || {};
+      const first = Object.entries(ne)[0];
+      const detail = first ? `节点 ${first[0]}：${JSON.stringify(first[1]).slice(0, 160)}` : (posted.error || posted.text || '').slice(0, 160);
+      return { error: `工作流被拒了（${posted.status || '连接失败'}）。${detail}`, code: 'comfy_bad_graph' };
+    }
+    const id = posted.data?.prompt_id;
+    if (!id) return { error: 'ComfyUI 没给 prompt_id（响应不是它的形状）', code: 'comfy_bad_graph' };
+
+    /* 轮询 /history。**不用 ws**：进度只影响"看不看得见在动"，
+       而 ws 会带来重连/半包一整套复杂度；心跳和观察窗已经把"在干活"说清楚了。 */
+    let queueAhead;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, POLL));
+      const elapsed = Date.now() - t0;
+      if (elapsed > WAIT) {
+        /* 超时**不打断它** —— 图可能还在跑，用户下一句还能看到结果。
+           这里只回一句"还没出来"，并给 prompt_id 好让人去 ComfyUI 里看。 */
+        return {
+          error: `等了 ${Math.round(WAIT / 1000)} 秒还没出来（prompt_id ${id}）。CPU 上出图会慢到几分钟，可以等会儿再问"画好了吗"。`,
+          code: 'comfy_timeout', promptId: id, ms: elapsed,
+        };
+      }
+      /* 变量名别叫 `h`：它会把上面的高度遮住，于是返回的 height 变成整个 HTTP
+         响应对象 —— 不报错、筛查看不出来，自测里一行断言才发现。 */
+      const hist = await getJSON(`/history/${encodeURIComponent(id)}`, { timeout: 6000 });
+      const rec = hist.data?.[id];
+      if (!rec) {
+        if (a.onProgress) a.onProgress({ elapsedMs: elapsed, queueAhead });
+        continue;
+      }
+      const st = rec.status || {};
+      if (st.status_str === 'error' || st.completed === false) {
+        const msgs = st.messages || [];
+        const errMsg = msgs.map((m) => m?.[1]).find((x) => x?.exception_message) || {};
+        const oom = /out of memory|OutOfMemory/i.test(String(errMsg.exception_type || errMsg.exception_message || ''));
+        return {
+          error: oom
+            ? `出图时内存/显存不够（${String(errMsg.exception_message || '').slice(0, 120)}）。把尺寸调到 512×512、步数降到 4~8 再试。`
+            : `出图失败了：${String(errMsg.exception_type || '')} ${String(errMsg.exception_message || '').slice(0, 160)}`.trim(),
+          code: oom ? 'comfy_oom' : 'comfy_failed',
+          promptId: id,
+        };
+      }
+      const imgs = rec.outputs?.[Object.keys(rec.outputs || {})[0]]?.images || [];
+      const img = imgs.find((x) => x.type === 'output' || x.type === 'temp') || imgs[0];
+      if (!img) return { error: '跑完了，但输出里没有图（SaveImage 可能被删了）', code: 'comfy_no_image', promptId: id };
+      return {
+        ok: true,
+        promptId: id,
+        ms: Date.now() - t0,
+        template: t.id,
+        prompt,
+        seed,
+        width: W,
+        height: H,
+        steps,
+        image: { filename: img.filename, subfolder: img.subfolder || '', type: img.type || 'output' },
+      };
+    }
+  }
+
+  /** 取图字节（给 /api/comfy/img 代理用）。只允许 output/temp，不允许绝对路径。 */
+  async function imageBytes({ filename, subfolder = '', type = 'output' } = {}) {
+    const fn = String(filename || '');
+    if (!/^[\w.\- ]+\.(png|jpg|jpeg|webp)$/i.test(fn)) return { error: '文件名不合法', code: 'comfy_bad_args' };
+    if (String(subfolder).includes('..') || String(subfolder).startsWith('/')) return { error: '子目录不合法', code: 'comfy_bad_args' };
+    if (!['output', 'temp'].includes(String(type))) return { error: '只允许 output / temp 里的图', code: 'comfy_bad_args' };
+    const q = new URLSearchParams({ filename: fn, subfolder: String(subfolder), type: String(type) });
+    try {
+      const r = await fetch(`${baseOf()}/view?${q}`, { signal: AbortSignal.timeout(10_000) });
+      if (!r.ok) return { error: `取图失败（HTTP ${r.status}）`, code: 'comfy_failed' };
+      const buf = Buffer.from(await r.arrayBuffer());
+      return { ok: true, buf, type: r.headers.get('content-type') || 'image/png' };
+    } catch (e) {
+      return { error: `取图失败：${e?.message || e}`, code: 'comfy_offline' };
+    }
+  }
+
+  /** 打断当前这张（用户说"算了"时）。 */
+  async function interrupt() {
+    const r = await postJSON('/interrupt', {}, { timeout: 6000 });
+    return r.ok ? { ok: true } : { error: `打断失败：${r.error || r.status}`, code: 'comfy_failed' };
+  }
+
+  return { status, gen, imageBytes, interrupt, templates, base: baseOf, ERR_ZH };
+}

@@ -1095,3 +1095,51 @@ body.agent-open .stat-zone { pointer-events: none; }
   color: rgba(147, 184, 216, .24); transition: color .2s;
 }
 .ag-set-btn:hover, .ag-set-btn.on { color: rgba(190, 225, 255, .66); }
+
+/* ── 生成的图：原图 + 一圈粒子框（框由 traceframe 画，不在这里） ──
+ *
+ * 没有"卡片边框"：这一层里一块区域要被圈出来，只能是粒子自己围。
+ * 所以这里只给一个很暗的底（图本身要清楚），边界交给粒子。
+ * `pointer-events: auto` 是必须的 —— 祖先 `.ag-layer` 是 none，
+ * 少了它就是"看得见、点不动"且不报错（换模型表就是这么踩的）。 */
+.ag-img {
+  position: fixed; z-index: 8;
+  pointer-events: auto;
+  display: flex; flex-direction: column;
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(4, 8, 13, .72) 0%, rgba(3, 6, 10, .62) 100%);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, .5);
+  opacity: 0; transform: translateY(6px) scale(.996);
+  transition: opacity .22s ease, transform .22s ease;
+  user-select: none; cursor: default;
+}
+.ag-img.in { opacity: 1; transform: none; }
+.ag-img[hidden] { display: none; }
+
+.ag-img-box {
+  display: block; overflow: hidden; border-radius: 10px 10px 0 0;
+  background: rgba(0, 0, 0, .25);
+}
+.ag-img-pic {
+  display: block; width: 100%; height: 100%;
+  object-fit: contain;
+  /* 图本身不加滤镜 —— 它是这一屏里唯一"不是粒子"的东西，要让它清楚 */
+}
+
+.ag-img-cap {
+  display: flex; align-items: center; gap: 8px;
+  height: 26px; padding: 0 6px 0 12px;
+}
+.ag-img-meta {
+  font: 10px/1 ui-monospace, Menlo, monospace; font-style: normal;
+  color: rgba(147, 184, 216, .5);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ag-img-x {
+  margin-left: auto; flex: 0 0 auto;
+  width: 20px; height: 20px;
+  background: none; border: 0; border-radius: 6px;
+  color: rgba(147, 184, 216, .42); font-size: 14px; line-height: 1; cursor: pointer;
+  transition: color .2s, background .2s;
+}
+.ag-img-x:hover { color: rgba(226, 238, 252, .9); background: rgba(120, 170, 230, .1); }

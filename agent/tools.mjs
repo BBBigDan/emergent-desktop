@@ -230,6 +230,9 @@ export function makeTools(o = {}) {
   /* 官方 olares-cli 的封装（见 agent/olares.mjs）。
      由 server 注入：它要在启动时探一次"这个镜像里有没有这个二进制"。 */
   const olares = o.olares || null;
+  /* ComfyUI（见 agent/comfy.mjs）。由 server 注入：它只认一个 HTTP 地址，
+     所以"有没有显卡"不是构造条件 —— 没卡也能连 CPU 上的那个，只是慢。 */
+  const comfy = o.comfy || null;
   const forge = o.forge || null;
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
@@ -305,6 +308,71 @@ export function makeTools(o = {}) {
         return { error: '这台机器上没有 olares-cli（镜像里没装）。改用 sys_status / app_list 回答，并且告诉用户"系统层还没接"。' };
       }
       return await olares.read(op, name);
+    },
+  });
+
+  /* ── 画图（ComfyUI） ──
+   *
+   * 一个工具 + 三个 op，理由和 `olares` 一样：模型记不住十个名字，
+   * 而一次 schema 就是 150 token。
+   *
+   * **它不能写 workflow。** 图归服务端（`agent/workflows/*.json`），模型只填
+   * 模板名和几个槽 —— 让 7B 写 2KB 的节点连线，一定是错的；而且"任意图"等于
+   * "任意节点执行"，那是安全口子。这条和 `scene.schema.mjs` 的白名单同源。
+   *
+   * `gen` 的坑是**它慢**：CPU 上 SD-Turbo 4~8 步 512×512 大约 20~40 秒，
+   * 有卡 2~5 秒。所以 op=status 里必须把 `cpuOnly` 说清楚 —— 先告诉用户
+   * "这台没卡，会慢"，比让他盯着粒子等两分钟好。
+   */
+  add('comfy', {
+    level: 'safe',
+    describe: '用 ComfyUI 画图。op=status 看它连不连得上、**有没有显卡**（没卡会慢到分钟级）、'
+      + '有哪些模型；op=templates 看有哪几种画法（方图/竖图）；op=gen 真的画一张，'
+      + '要 prompt（画面本身：主体+环境+光线+画风，别写"请帮我画"）。'
+      + '画完图会出现在屏幕上，用户看得见 —— 你不用再铺一遍。'
+      + '它是慢工具：先调 status，再决定要不要画、要不要先跟用户说一声。',
+    schema: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', enum: ['status', 'templates', 'gen'], description: 'status=连得上吗/有卡吗 templates=有哪些画法 gen=画一张' },
+        template: { type: 'string', description: 'op=gen 时用哪个模板（默认第一个，通常是 txt2img）' },
+        prompt: { type: 'string', description: 'op=gen 必填：想画什么。英文效果通常更好，1200 字以内' },
+        width: { type: 'number', description: '64~1024。不给就用模板的尺寸档' },
+        height: { type: 'number', description: '64~1024。不给就用模板的尺寸档' },
+        steps: { type: 'number', description: '1~30。少步模型（turbo）4~8 就够，多了只是更慢' },
+        seed: { type: 'number', description: '想复现同一张就填同一个种子；不给就随机' },
+      },
+      required: ['op'],
+      additionalProperties: false,
+    },
+    run: async ({ op, template, prompt, width, height, steps, seed } = {}) => {
+      if (!comfy) {
+        return { error: '这台机器没接 ComfyUI（COMFY_URL 没配）。告诉用户"画图还没接上"，不要假装画了。' };
+      }
+      if (op === 'status') return await comfy.status();
+      if (op === 'templates') {
+        const t = await comfy.templates();
+        return {
+          ok: true,
+          templates: t.map((x) => ({ id: x.id, label: x.label, size: x.size, steps: x.steps, doc: x.doc, note: x.note })),
+        };
+      }
+      if (op === 'gen') {
+        const r = await comfy.gen({ template, prompt, width, height, steps, seed });
+        if (!r.ok) return { error: r.error, code: r.code, promptId: r.promptId };
+        const q = new URLSearchParams({ filename: r.image.filename, subfolder: r.image.subfolder || '', type: r.image.type || 'output' });
+        return {
+          ok: true,
+          /* 图给前端看的地方：走 agent 自己的代理（跨主机、无 CORS、路径白名单） */
+          image: { url: `/api/comfy/img?${q}`, width: r.width, height: r.height },
+          promptId: r.promptId,
+          seed: r.seed,
+          steps: r.steps,
+          ms: r.ms,
+          say: `画好了：${r.width}×${r.height}，${r.steps} 步，用时 ${(r.ms / 1000).toFixed(1)} 秒`,
+        };
+      }
+      return { error: `不认识的 op：${op}（能用的只有 status / templates / gen）` };
     },
   });
 

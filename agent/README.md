@@ -954,6 +954,45 @@ node tools/dev/eval-llm.mjs        # 五道常问题，每题一个干净 sid
 少一个，"帮我停掉 n8n"就会被判成"只是问问"，模型查完状态就停住，用户以为自己说清楚了。
 
 
+## 画图：ComfyUI（`comfy.mjs` + `workflows/*.json`）
+
+一个工具 + 三个 op，和 `olares` 同一个形状（模型记不住十个名字，一份 schema 就是 150 token）：
+
+| op | 做什么 |
+|---|---|
+| `status` | 连得上吗、**有没有显卡**、队列多长、有哪些模型、有哪些模板 |
+| `templates` | 有哪几种画法（方图 / 竖图），每种带尺寸档和步数 |
+| `gen` | 真的画一张：`template` + `prompt` + 可选 `width/height/steps/seed` |
+
+**模型不能写 workflow。** 图归服务端（`agent/workflows/*.json`，`__PROMPT__` 这种占位符），
+模型只填能填的那几个槽。两条理由：① 一张图 2~5KB 的节点 id + 连线，7B 一定写错；
+② "任意图"等于"任意节点执行"，那是安全口子。和 `scene.schema.mjs` 的白名单同源。
+
+**这台机器没有显卡也能开发**，这是这次改动的重点：
+
+| 层 | 用什么 | 验什么 |
+|---|---|---|
+| 协议桩 `tools/dev/stub-comfy.mjs` | 照真契约实现 `/system_stats` `/prompt` `/history` `/view` `/queue` `/object_info` `/interrupt`，返回**真 PNG**，可注入 `FAIL=oom\|badgraph\|queue` | 排队、轮询、超时、错误映射、图片字节 —— 和显卡无关的那 90% |
+| CPU 上的真 ComfyUI | 市场里的 `comfyuisharev3`，SD-Turbo 4~8 步 512×512 | 真图、真延迟（8 核 EPYC 约 **20~40 秒/张**；SD1.5 20 步要 3~5 分钟，别用） |
+| 远端有卡的机器 | 任何 ComfyUI，改 `COMFY_URL` 就行 | 出片质量 |
+| 录放 | 真跑一次，把 `/history` JSON + 输出 PNG 存成夹具 | 防"字段名猜错"（`outputs[节点].images[].filename` 这类结构最容易被猜错） |
+
+五条错误各有各的说法（自测逐个钉住）：`comfy_offline`（连不上，顺带提示"先用桩顶上"）、
+`comfy_bad_graph`（指到具体节点）、`comfy_queue_full`、`comfy_oom`（说清"调到 512、步数降到 4~8"）、
+`comfy_timeout`（**不打断**，把 `prompt_id` 交出来 —— 图可能还在跑，等会儿还能问）。
+
+图片回到屏幕走 **`/api/comfy/img` 代理**，不让前端直连 ComfyUI：它可能在另一台机器上（没卡时尤其）、
+跨源、端口暴露，而且路径要过白名单（只 `output`/`temp`、只 png/jpg）——
+否则这个代理就是"读那台机器上任何文件"的口子。
+
+上屏是**第四块玻璃**（`shell/src/imagepanel.js`）：原图 + 外面一圈同样的粒子流。
+它不进 `scene` —— 场景层是模型能画的东西，图是工具的产物。三条踩过的规矩都在里面：
+`pointer-events:auto`、框在 `setOpen(true)` 之前挪到真实盒子、收起只有一条出口。
+
+> 一个只在真浏览器里才看得见的坑：图刚落屏，下一步的 `think` 会让「思考过程」自己弹出来，
+> 而它开之前要收别的玻璃 —— 于是刚画好的图当场被收掉，用户只看到一句"画好了"和一片空场。
+> 现在 `openTrace()` 遇到图就让位（过程仍在记，点小脸能看）；点小脸是明确要看过程，那时图才收。
+
 ## 「思考过程」：服务端出文字，前端只管画（`trace.mjs`）
 
 一轮里真正发生的事有十几件：翻记忆、取证、跑工具、铺屏、等你确认。它们以前只进

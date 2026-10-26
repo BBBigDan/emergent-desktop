@@ -71,6 +71,9 @@ const T = {
   sys_status: ['看一眼机器'],
   app_list: ['看装了哪些应用'],
   olares: ['看系统', (a) => OP_ZH[a?.op] || a?.op || ''],
+  /* 画图那一行要说出"画什么"，不是在说"调了个工具" —— 用户想看的是画面。
+     提示词截 12 字：再长就把那一行挤掉了，而它也只是个索引。 */
+  comfy: ['画图', (a) => (a?.op === 'gen' ? cut(a?.prompt, 12) || '一张图' : a?.op === 'status' ? '看它有没有卡' : '看有哪些画法')],
   olares_act: ['动系统', (a) => `${ACT_ZH[a?.act] || a?.act || ''}${a?.name ? ` ${a.name}` : ''}`],
   skill_use: ['翻官方说明', (a) => a?.name || ''],
   fs_scan: ['扫磁盘', (a) => (a?.path ? tail(a.path) : '整台机器')],

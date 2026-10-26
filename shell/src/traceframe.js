@@ -262,7 +262,11 @@ export function createTraceFrame({ field, alloc, slots = SLOTS }) {
     for (let i = 0; i < N_RING; i++) {
       const a = (i / N_RING) * TAU + t * 0.5;
       /* 只画三分之二圈：闭合的圈会读成"加载中"，开口的弧才是"这里还有东西" */
-      if (i / N_RING > 0.66 || ringLevel < 0.04) { ringPts.push(HIDDEN); continue; }
+      /* **先判 anchor**：没有锚点（换模型表 / 设置页 / 图）就没有"那张脸"可绕。
+         判断写在取 `anchor.x` 之后的话，rAF 里就是一个 TypeError ——
+         整个 tick 停在那儿，框从此不再更新（表现是"玻璃收了，框还亮在原处"）。
+         这个坑踩过一次（见文件开头），只是当时只补了牵引线那一批，这批漏了。 */
+      if (!anchor || i / N_RING > 0.66 || ringLevel < 0.04) { ringPts.push(HIDDEN); continue; }
       const fade = Math.sin((i / N_RING / 0.66) * Math.PI);
       ringPts.push({
         x: anchor.x + Math.cos(a) * rr,
@@ -340,7 +344,9 @@ export function createTraceFrame({ field, alloc, slots = SLOTS }) {
 
     /** 收起之后还留着经过 → 脸外圈那道细弧；点开或换题就灭 */
     setHint(on) {
-      ringTo = on ? 1 : 0;
+      /* 没有锚点（表 / 设置 / 图）就没有那张脸，这道弧无处可画 ——
+         语义上也该关：它是"点那张脸还能看经过"，而这时候框围的根本不是脸。 */
+      ringTo = on && anchor ? 1 : 0;
     },
 
     dispose() { this.stop(); },

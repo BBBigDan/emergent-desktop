@@ -46,6 +46,7 @@ import { createMeter, estTokens, ymd } from './usage.mjs';
 import { trimHistory, foldToolResults } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
+import { createComfy } from './comfy.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -138,6 +139,11 @@ const APPROVAL_MS = 90_000;
    探一次"装没装、有没有身份"，把结论打到启动日志：
    没有它的时候系统层会退化成 k8s 视角，而那必须让人看得见。 */
 const olares = createOlares();
+
+/* ComfyUI：只认一个 HTTP 地址（`COMFY_URL`，默认 127.0.0.1:8188）。
+   **没卡也能建**：出图慢是运行时的事，不是构造条件 —— 而"连不上"由 op=status
+   如实说出来。开发期这个地址指向 `tools/dev/stub-comfy.mjs` 就行。 */
+const comfy = createComfy();
 
 /* 官方技能包（12 份 SKILL.md，构建时从 olares-cli 里 export 出来）。
    索引在启动时读一次（`await skills.index()`，见 listen 之前），
@@ -367,7 +373,7 @@ async function getSession(sid) {
         ? withCurrentSystem(saved.messages)
         : [{ role: 'system', content: sysPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS, memory, forge, olares, skills }),
+      tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy }),
       model: null,
       /* 这段对话用的是哪个模型。**要落盘**：换过一次之后刷新，
          不能又回到默认那个 —— 用户会以为"换了没生效"（他刚踩过这个）。 */
@@ -1881,6 +1887,30 @@ async function runTurn(s, goal) {
           if (!result.draw.stop) s.drew = true;
           emit(s, { t: 'draw', spec: result.draw });
         }
+        /* 生成的图：这一屏的主角，单独一条事件。
+         *
+         * 三个刻意的决定：
+         *   ① **不进 scene**。场景层是模型能画的东西，图是工具的产物 ——
+         *      混进去等于给"任意 URL 上屏"开一个口子（`scene.schema` 里根本没有
+         *      image 这种 kind，也不该有）。
+         *   ② `s.drew` 置上：兜底屏不能把刚画好的图盖掉。
+         *   ③ 存进 `s.lastImage`：刷新/重连之后要能还原（和 `lastSceneSpec` 同一个理由），
+         *      否则用户去倒杯水回来，屏上是空的。 */
+        if (result && result.ok && result.image?.url) {
+          s.drew = true;
+          s.lastImage = {
+            url: result.image.url,
+            width: result.image.width,
+            height: result.image.height,
+            seed: result.seed,
+            ms: result.ms,
+            turn: s.turn,
+          };
+          emit(s, { t: 'image', ...s.lastImage });
+          /* 它自己也该说一句（"画好了，512×512，6 步"）——
+             不说的话，屏上多了一张图而它一声不吭，用户会以为是别的什么弹出来了。 */
+          if (result.say) putVoice(s, String(result.say));
+        }
 
         /* 一行日志：Pod 里没有别的观察窗，出问题时只能靠它。
            画/渲染树只记层数，不记内容 —— 那些可能有几十 KB。 */
@@ -2011,10 +2041,13 @@ async function runTurn(s, goal) {
         /* 渲染树 / 绘画同样不是"数据"，是给眼睛的指令。
            但**必须**把体积从上下文里切掉：一屏表格 20KB，回灌给 7B 模型
            就是把它的窗口填满，后面几轮全在复读表头。 */
+        /* 图只回一句"画好了，多大"：URL 是给前端用的，进上下文只会被模型
+           原样念出来（屏幕上就是一串 /api/comfy/img?filename=…）。 */
         const forContext = result?.surface ? { ok: true, shown: 'surface' }
           : result?.closeSurface ? { ok: true, closed: true }
-            : result?.draw ? { ok: true, drawn: result.draw.stop ? 0 : (result.draw.layers?.length || 0) }
-              : result;
+            : result?.image ? { ok: true, drawn: 'image', width: result.image.width, height: result.image.height, seed: result.seed }
+              : result?.draw ? { ok: true, drawn: result.draw.stop ? 0 : (result.draw.layers?.length || 0) }
+                : result;
         /* 失败的调用把"多调用"这条因果一起回给模型 —— 这是它唯一能改对的信息。 */
         const ctxObj = forContext && typeof forContext === 'object' ? forContext : { r: forContext };
         const ctxContent = multi && (result?.error || result?.ok === false)
@@ -2440,7 +2473,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：
@@ -2542,6 +2575,9 @@ const server = http.createServer(async (req, res) => {
     if (s.lastSceneSpec) {
       emit(s, { t: 'resume', scene: s.lastSceneSpec, ops: s.postOps || null, line: s.lastLine || '', log: (s.log || []).slice(-LOG_MAX) });
     }
+    /* 上一轮是"画了张图"结束的，刷新之后图要还在 —— 否则用户倒杯水回来，
+       屏上只剩粒子在飘，他会以为刚才那张根本没成功。 */
+    if (s.lastImage?.url) emit(s, { t: 'image', ...s.lastImage });
 
     const ping = setInterval(() => {
       if (!res.writableEnded) res.write(': ping\n\n');
@@ -2711,6 +2747,31 @@ const server = http.createServer(async (req, res) => {
      一个没有模型 key 的进程也会被判成就绪，用户看到"服务正常"但每句话都报错。
      这里判的是"能不能干活"：模型配了没有、数据源是什么、两个可降级的子系统活没活。
      模型没配 → 503 → pod 一直是 NotReady，界面直接显示"未就绪"，不用等第一句话。 */
+  /* 图片代理：ComfyUI 上的图搬到屏幕上必经这里。
+   *
+   * 为什么不让前端直接 `<img src="http://comfy:8188/view?...">`：
+   *   · ComfyUI 可能在另一台机器上（这台没卡时尤其如此），浏览器到它没有通路；
+   *   · 跨源、带 cookie、端口暴露，每一条都是新的边；
+   *   · 路径要过白名单（只 output/temp、只 png/jpg），否则这个代理就是一个
+   *     "读 ComfyUI 机器上任何文件"的口子。
+   * 所以前端只认 `/api/comfy/img?…`，由服务端取字节再吐出去。 */
+  if (p === '/api/comfy/img' && req.method === 'GET') {
+    const q = u.searchParams;
+    const r = await comfy.imageBytes({
+      filename: q.get('filename') || '',
+      subfolder: q.get('subfolder') || '',
+      type: q.get('type') || 'output',
+    });
+    if (!r.ok) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: r.error }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': r.type, 'Content-Length': r.buf.length, 'Cache-Control': 'private, max-age=600' });
+    res.end(r.buf);
+    return;
+  }
+
   if (p === '/api/health' && req.method === 'GET') {
     const hasModel = MODEL_ID === 'mock' || !!process.env.MODEL_KEY;
     const body = {
