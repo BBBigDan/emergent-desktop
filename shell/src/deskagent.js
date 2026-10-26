@@ -1661,8 +1661,14 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
 
       case 'image':
         /* 工具画出来的图（ComfyUI）。它不走 scene —— 场景层是模型能画的东西，
-           图是产物。这里只负责"摆上去 + 圈一圈粒子"，其它什么都不改。 */
-        openImage({ url: m.url, width: m.width, height: m.height, seed: m.seed, ms: m.ms });
+           图是产物。这里只负责"摆上去 + 圈一圈粒子"，其它什么都不改。
+         *
+         * **URL 必须自己补前缀。** 服务端给的是 `/api/comfy/img?…`，
+           而 `<img src="/api/...">` 是**根绝对路径**：页面挂在 `/agent/` 下时
+           它会请求 `/api/...`，被壳层 nginx 反代回官方 olares-app → 404 →
+           屏幕上是一个空的框加一个小裂图（线上第一次就是这样）。
+           这和上面 `API` 那段注释是同一个坑，只是这次踩在 `<img>` 上。 */
+        openImage({ ...m, url: API + String(m.url || '').replace(/^\/?api/, '') });
         insp('image', `${m.width}×${m.height}${m.seed ? ' · seed ' + m.seed : ''}`);
         break;
 
