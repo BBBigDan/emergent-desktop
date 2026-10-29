@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>agentbar · 定时刻度</title>
+<link rel="stylesheet" href="./src/style.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #0a1120; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  /* 这一页只画状态条，别的层都不要 —— 深链参数决定画哪几种状态 */
+  #bg { position: fixed; inset: 0;
+        background: radial-gradient(120% 90% at 50% 0%, #12203a 0%, #0a1120 60%, #070d18 100%); }
+</style>
+</head>
+<body>
+  <div id="bg"></div>
+  <canvas id="scene"></canvas>
+
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js"}}</script>
+  <script type="module">
+    /**
+     * 状态条单测页：`/test-agentbar.html?n=2&unread=1`
+     *
+     * 为什么要单独一页：定时任务的刻度是**粒子**，它的对错（点距、亮度、
+     * 有没有压在"16 条"上、4 根以上会不会溢出）没法靠读代码判断，
+     * 只能把几种状态画出来看。桌面那一页要先过 Olares 登录，本地打不开。
+     *
+     * `n` = 挂着的任务数（0~6，超过 4 要能被截住）
+     * `unread` = 未读数（>0 时刻度变亮）
+     */
+    import { Field } from './src/field.js';
+    import { SlotAllocator } from './src/pui.js';
+    import { createAgentBar } from './src/agentbar.js';
+
+    const q = new URLSearchParams(location.search);
+    const n = Number(q.get('n') ?? 2);
+    const unread = Number(q.get('unread') ?? 0);
+
+    const field = new Field(document.getElementById('scene'));
+    /* 进入"槽位绘制"模式：状态条不是场景里的层，它直接写进预备好的槽位。
+       不调这一句的话，屏幕上是那颗待机球 —— 状态条的每一个点都写进了没人读的缓冲。 */
+    field.slotBegin({ dim: 0.9, dot: 1 });
+    const alloc = new SlotAllocator(field.poolN, 0);
+    const bar = createAgentBar({ field, alloc, slots: 2200 });
+    bar.setModel(q.get('model') || 'Qwen2.5-7B-Instruct');
+    bar.setCtx({ text: '12.4k/32.8k', pct: 38 });
+    bar.setMem(q.get('mem') || '16 条');
+    bar.setSched({ n, unread });
+    bar.layout({ x: 40, y: 38 });
+    bar.start();
+
+    let last = performance.now();
+    (function loop(now) {
+      const dt = Math.min((now - last) / 1000, 1 / 20);
+      last = now;
+      field.step(dt);
+      bar.step(dt);
+      field.render();
+      requestAnimationFrame(loop);
+    })(last);
+
+    window.__bar = bar;
+    window.__field = field;
+  </script>
+</body>
+</html>

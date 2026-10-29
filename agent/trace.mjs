@@ -96,6 +96,8 @@ const T = {
   dialogue: ['让两个人当面说', (a) => (Array.isArray(a?.cast) ? a.cast.map((c) => c?.name).filter(Boolean).join(' 对 ') : '')],
   sub_run: ['换个立场问', (a) => (a?.role === 'advocate' ? '替它说话的人'
     : a?.role === 'character' ? '扮一个人' : '挑毛病的人')],
+  /* 定时那一行要让用户看懂"它给自己排了个班"，而不是"它查了一下" */
+  schedule: ['排了个班', (a) => (a?.op === 'add' ? (a?.when || '') : (a?.op === 'list' ? '看有哪些' : (a?.id || a?.task || '')))],
   scene_show: ['铺一屏'],
   scene_ask: ['把问题问出来'],
   scene_set: ['换一屏'],

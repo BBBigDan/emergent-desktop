@@ -122,9 +122,13 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
   barCtxTrack.appendChild(barCtxFill);
   barCtx.append(barCtxTrack, barCtxNum);
   const barMem = el('span', 'ag-mem');
+  /* 定时任务：粒子那边画的是刻度（见 agentbar 的 drawSched），
+     这里这一格是**透明的悬停区** —— 挂的是"哪几件事、下次什么时候"，
+     那种细账不该常驻，但用户把鼠标放上去时必须有地方能读到。 */
+  const barSched = el('span', 'ag-sched');
   /* 正在跑的工具名。它只在"那一下"出现 —— 常驻的话，用户会以为界面卡在那个工具上 */
   const barTool = el('span', 'ag-tool');
-  barEl.append(barDot, barModel, barCtx, barMem, barTool);
+  barEl.append(barDot, barModel, barCtx, barMem, barSched, barTool);
 
   const gateEl = el('div', 'ag-gate');
   const a11yEl = el('div', 'ag-a11y');
@@ -1210,8 +1214,27 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
     barMem.title = m.recent ? `${m.recent}\n（${m.last || ''}）` : '还没有记住什么';
   }
 
-  /** 连接点：青=通、琥珀=在想、红=断。它是这一行里唯一的状态，所以不用文字 */
-  function setLink(kind) {
+  /* 定时任务：状态条上只有几根刻度（见 agentbar 的 drawSched）。
+     用户不该靠这一行数任务，所以刻度最多 4 根；真正的清单在 tooltip 里 ——
+     什么时候跑、跑的是哪句话，那是他想核对的时候才需要的东西。 */
+  let schedTasks = [];
+  let schedUnread = 0;
+
+  function renderSched(tasks, unread) {
+    if (Array.isArray(tasks)) schedTasks = tasks;
+    if (typeof unread === 'number') schedUnread = unread;
+    const n = schedTasks.length;
+    abar?.setSched({ n, unread: schedUnread });
+    /* DOM 这一格是透明的，只用来承载 tooltip 和读屏文本 */
+    barSched.textContent = n ? `定时 ${n}` : '';
+    if (!n) { barSched.title = ''; return; }
+    const lines = schedTasks.slice(0, 6).map((t) => `${t.when}｜${t.paused ? '暂停中' : `下次 ${t.next}`}\n  ${t.task}`);
+    if (n > 6) lines.push(`…还有 ${n - 6} 个`);
+    if (schedUnread) lines.unshift(`你不在的时候跑了 ${schedUnread} 次`);
+    barSched.title = lines.join('\n');
+  }
+
+  /** 连接点：青=通、琥珀=在想、红=断。它是这一行里唯一的状态，所以不用文字 */  function setLink(kind) {
     barDot.classList.toggle('off', kind === 'off');
     barDot.classList.toggle('on', kind === 'busy');
     abar?.setLink(kind);
@@ -1365,6 +1388,8 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         insp('hello', `${m.model} · sys=${m.sys} · ${m.tools.length} tools`);
         renderTok(m.usage);
         renderMem(m.mem);
+        /* 定时任务和未读一起到：连上就该看得见"有两件事在替你盯" */
+        renderSched(m.tasks || [], m.unread || 0);
         /* 提示语只在用户还没说话时出现 —— 它占的是"那一行"，不是额外一行 */
         if (!askText) echo('');
         break;
@@ -1389,6 +1414,12 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         setTimeout(() => { if (picker.isOpen()) closePicker(); }, 900);
         break;
       }
+
+      /* 定时任务的未读数（服务端在"没人在看"的回合跑完后推上来）。
+         0 表示刚被读掉（连上、或用户说了话）—— 刻度从亮回到暗，不是消失。 */
+      case 'unread':
+        renderSched(undefined, Number(m.n) || 0);
+        break;
 
       /* 别的标签页保存了设置：这块面板开着就重新读一遍（没改动才覆盖，
          见 settings.js 的 refresh）。不处理的话，同一个账号两个窗口会看到两份值。 */
@@ -1433,8 +1464,10 @@ export function createDeskAgent({ field, onOpenChange } = {}) {
         tracePeek = false;
         trace?.begin();
         if (!tracePinned) openTrace();
-        insp(m.kind === 'intent' ? '→ 手势' : '→ 你问',
-          m.kind === 'intent' ? describe(m.intent) : askText);
+        /* 定时回合没有"你问"那一行（用户没在场）。观察窗里要写清是**哪件事**到点了，
+           否则用户看到一段没人引起的输出，会以为它自己乱说话。 */
+        insp(m.kind === 'intent' ? '→ 手势' : (m.kind === 'auto' ? '⏰ 到点' : '→ 你问'),
+          m.kind === 'intent' ? describe(m.intent) : (m.kind === 'auto' ? (m.task || '') : askText));
         break;
 
       case 'think':

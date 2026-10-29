@@ -86,6 +86,17 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
   const tCtx = mk(13, 'st-ctx', COL.dim);
   const tMem = mk(4, 'st-mem', COL.dim);
 
+  /* 定时任务的刻度：最多 4 根短竖线，**有未读才亮**。
+   *
+   * 为什么是刻度而不是"定时 2"这样的字：这一行 13px 是点阵的下限，汉字在这里
+   * 只剩"勉强"（见文件头）。而"有两件事在替你盯"这件事，本身就是**一块进度表的形状** ——
+   * 刻度比字数更接近它，也省掉 30px 宽。
+   * 超过 4 个任务就不再长（用户不该靠这一行数任务），多出来的进 tooltip。 */
+  const SCHED_SLOTS = 64;              // 4 刻度 × 16 点
+  const schedBase = sub.alloc(SCHED_SLOTS);
+  let schedN = 0;
+  let schedUnread = 0;
+
   let model = '';
   let ctxText = '';
   let memText = '';
@@ -93,9 +104,16 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
   /* 水位线的位置跟着模型名的长度走：模型名短（qwen 而不是 Qwen2.5-7B-Instruct）时
      整条往左收一截，右边空出来的地方看得见 —— 固定列宽会白留一大块。 */
   let wx = 0;
+  /* 定时刻度的起点（跟着"16 条"的宽度走） */
+  let sx = 0;
 
   function ctxW() {
     return Math.max(88, Math.min(140, ctxText.length * SIZE * 0.62 + 24));
+  }
+
+  /** "16 条"这种 4 字以内的宽度。刻度要贴着它右边，不能压在字上。 */
+  function memW() {
+    return Math.max(28, Math.round(memText.length * SIZE * 0.62) + 14);
   }
 
   function relayout() {
@@ -105,6 +123,7 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
     tCtx.y = g.y;
     tMem.x = tCtx.x + Math.round(ctxW());
     tMem.y = g.y;
+    sx = tMem.x + memW();
     dirty = true;
   }
 
@@ -165,6 +184,29 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
     }
   }
 
+  /* ── 定时任务的刻度 ──
+   * 每根 5 个点（y 从 -4 到 +4，点径 ~2px 就连成一条短竖线），横向隔 4px，最多 4 根。
+   * 有未读时**一起亮**（那是"有东西在等你"），没有未读时压到 0.35 ——
+   * 不是消失：任务还在替你盯着，这件事本身就值得留着。 */
+  const TICK_PTS = 5;
+  function drawSched() {
+    const lit = hexRgb(schedUnread ? COL.water : COL.dim);
+    const ink = schedUnread ? 1 : 0.35;
+    const n = Math.min(4, schedN);
+    const pts = [];
+    const blank = [];
+    for (let i = 0; i < 4; i++) {
+      const x = sx + i * 4;
+      /* 空位**必须换一批、用 scl=0 写**：slotPut 的亮度是 0.55+0.45×ink，
+         ink=0 也还有 0.55 —— 拿 ink 当"擦掉"用，屏幕上会留下四根一直亮着的假刻度
+         （水位线那边踩过同一个坑，见 drawWater 的注释）。 */
+      const bin = i < n ? pts : blank;
+      for (let k = 0; k < TICK_PTS; k++) bin.push({ x, y: g.y - 4 + k * 2, ink });
+    }
+    if (pts.length) field.slotPut(schedBase, pts, lit, 1);
+    if (blank.length) field.slotPut(schedBase + pts.length, blank, lit, 0);
+  }
+
   /* ── 帧循环不在这里 ──
    * agent 有自己的 rAF（deskagent 的 tick）。同一个屏幕上开两条 rAF，
    * "谁先跑"就变成运气：状态条先写、场景后清，那一下字会闪。
@@ -174,6 +216,7 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
     if (dirty) paint();
     drawDot();
     drawWater();
+    drawSched();
   }
 
   return {
@@ -217,6 +260,12 @@ export function createAgentBar({ field, alloc, slots = 2200 }) {
         memText = v;
         relayout();
       }
+    },
+
+    /** 定时任务：`n` 是挂着的任务数，`unread` 是"你不在的时候它跑过几次" */
+    setSched({ n = 0, unread = 0 } = {}) {
+      schedN = Math.max(0, Math.min(4, Number(n) || 0));
+      schedUnread = Math.max(0, Number(unread) || 0);
     },
 
     /** 换屏之后把字重新写一遍（ParticleText 的缓存挡不住 slotBegin 的清零） */

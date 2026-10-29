@@ -41,6 +41,8 @@ export const TOOL_GROUPS = {
   forge: ['tool_write', 'tool_code', 'tool_try', 'tool_keep', 'skill_save', 'web_get'],
   /* 记忆管理：问"你记得什么 / 忘掉它"时才用；检索 memory_recall 常驻 */
   memAdmin: ['memory_stats', 'memory_forget'],
+  /* 定时：句子里有时间的说法、或者已经有任务时才发（判据在 server 的 coldAllow 之后） */
+  sched: ['schedule'],
 };
 
 /** 这一轮**不发**给模型的工具名。`allow` 里没有的组，整组摘掉。 */
@@ -237,6 +239,11 @@ export function makeTools(o = {}) {
      所以注入的是一个"按需跑"的闭包，而不是一个实例（换模型后子 agent 也跟着换）。 */
   const sub = o.sub || null;
   const forge = o.forge || null;
+  /* 定时任务（见 agent/sched.mjs）。server 注入同一个实例给所有会话 ——
+     任务表是**这台机器**的一张表，不是每段会话各一张。
+     `sid` 用来把任务记在"谁挂的"上面：到点自动开的是**这个会话**的一轮。 */
+  const sched = o.sched || null;
+  const sid = o.sid || '';
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
   const skills = o.skills || null;
@@ -1574,6 +1581,56 @@ export function makeTools(o = {}) {
     run: async ({ name, when, body }) => {
       if (!forge) return { ok: false, error: '这台机器上还没挂用户目录，技能存不了' };
       return forge.saveSkill({ name, when, body });
+    },
+  });
+
+  /* ── 定时任务（roadmap ①） ──
+   *
+   * 一个工具 + op，理由和 `olares` 一样：模型记得住"我能定时"，记不住四个名字。
+   *
+   * 描述里必须写清**定时回合只能查不能改**：那不是建议，是执行层的硬规则
+   * （server 里 danger/confirm 的工具在 auto 回合会被直接拒）。不写的话，
+   * 模型会挂一个"每小时重启一次 n8n"的任务，然后每次到点都撞墙、还以为是工具坏了。
+   */
+  add('schedule', {
+    level: 'safe',
+    describe: '给自己挂/改/查定时任务：到点**自动开一轮**（同一个会话，没人看着也会跑）。'
+      + 'op=add 要 when 和 task：when 写「每 15 分钟」「每 2 小时」「每天 08:00」；'
+      + 'task 写成你到点会照着做的那句话（「看一眼 n8n 有没有又重启」）。'
+      + 'op=list 看现在有哪些；op=cancel / op=pause / op=resume 要 id（任务原话的一段也行）。'
+      + '**定时那一轮只能查不能改**：审批门只在有人在的时候才有意义，'
+      + '所以 task 不要写"重启/删掉/装"这类动作，写成"看一眼、汇报"。'
+      + '用户说"每隔/每天/一直盯着/一有变化就告诉我"时用它。',
+    schema: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', enum: ['add', 'list', 'cancel', 'pause', 'resume'] },
+        when: { type: 'string', description: '多久一次，例如 每 15 分钟 / 每 2 小时 / 每天 08:00' },
+        task: { type: 'string', description: '到点要做的那句话，例如 看一眼 n8n 有没有又重启' },
+        id: { type: 'string', description: '取消或暂停哪个（任务原话的一段也行）' },
+      },
+      required: ['op'],
+      additionalProperties: false,
+    },
+    run: async ({ op, when, task, id }) => {
+      if (!sched) return { ok: false, error: '这台机器上定时任务没开（没挂状态目录）。' };
+      const o = String(op || '').toLowerCase();
+      if (o === 'list') {
+        /* 列**全部**任务，不只自己这段会话的：任务属于这台机器。
+           只看自己那段的话，用户换个浏览器问"我挂了几个任务"，
+           它会答"没有"，而任务正在后台跑。 */
+        const list = sched.forSid();
+        if (!list.length) return { ok: true, tasks: [], message: '现在没有定时任务。' };
+        return {
+          ok: true, tasks: list,
+          message: list.map((t) => `${t.id}｜${t.when}｜下次 ${t.next}｜${t.task}${t.paused ? '（暂停中）' : ''}`).join('\n'),
+        };
+      }
+      if (o === 'add') return sched.add({ sid, task, when });
+      if (o === 'cancel') return sched.cancel(id);
+      if (o === 'pause') return sched.pause(id, true);
+      if (o === 'resume') return sched.pause(id, false);
+      return { ok: false, error: `不认识的 op：${op}。用 add / list / cancel / pause / resume。` };
     },
   });
 

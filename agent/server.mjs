@@ -48,6 +48,8 @@ import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createComfy } from './comfy.mjs';
 import { createSub } from './sub.mjs';
+/* 定时任务（roadmap ①）。只管"什么时候该开一轮"，开轮的事在下面 runTurn。 */
+import { createSched, TICK_MS } from './sched.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -261,14 +263,23 @@ const skills = createSkills();
 
 const sessions = new Map();
 
+/* 定时任务表。和 settings.json 同一个挂载点（`agent/config`，见部署 yaml）——
+   它和"用户在这个界面上的设置"是一类东西：都属于这台机器，不属于某段对话。 */
+const TASKS_FILE = path.resolve(process.env.TASKS_FILE || path.join(HERE, 'config', 'tasks.json'));
+
+/* 任务表实例。全进程一个 —— 它不是"某段对话的"，是这台机器的。
+   `onFire` 在 `runTurn` 定义之后才接上（见下面的 startSched），
+   这里先建出来是因为 `makeTools` 要拿它做工具。 */
+const sched = createSched({ file: TASKS_FILE });
+
 /* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
    反代重启一次，用户看到的就是一片空粒子，刚才那屏和那行结论全没了。
    而这一屏往往是他正在看的东西，不是可以随手丢掉的过程。
    存三样就够：对话（模型的上下文）、最后一屏（眼睛看到的）、最后的读数（兜底要用）。 */
-const SESS_DIR = path.join(HERE, 'sessions');
+const SESS_DIR = path.resolve(process.env.SESSIONS_DIR || path.join(HERE, 'sessions'));
 /* 日账本目录。**和会话分开**：会话是"这段对话说了什么"，
    账本是"这一天一共烧了多少"——重启会话不该让今天的账清零。 */
-const USAGE_DIR = path.join(HERE, 'usage');
+const USAGE_DIR = path.resolve(process.env.USAGE_DIR || path.join(HERE, 'usage'));
 const SID_RE = /^[A-Za-z0-9_-]{8,64}$/;   // sid 会变成文件名，先卡死形状
 
 async function loadSession(sid) {
@@ -307,6 +318,8 @@ async function saveNow(s) {
       /* token 账本也一起存：刷新之后"这个会话花了多少"不能从零开始。
          存的是快照不是 meter 实例 —— 恢复时重建，避免把闭包塞进 JSON。 */
       usage: s.meter ? s.meter.snap() : null,
+      /* 未读：一节夜里的定时结论，用户回来时要能看到"有人替你盯过" */
+      unread: s.unread || 0,
     };
     await fs.writeFile(path.join(SESS_DIR, `${s.sid}.json`), JSON.stringify(data));
   } catch { /* 落盘失败不该影响对话 */ }
@@ -483,6 +496,8 @@ async function getSession(sid) {
         : [{ role: 'system', content: sysPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
       tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy,
+        /* 定时任务：同一个实例给所有会话；`sid` 让工具知道任务记在谁头上。 */
+        sched, sid,
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
         sub: {
@@ -506,6 +521,9 @@ async function getSession(sid) {
       lastStatus: saved?.status || null,
       lastApps: saved?.apps || null,
       resumed: !!saved?.scene,
+      /* 定时任务跑完时用户在不在看。不在看就 +1 —— 回来时状态条上要有个记号，
+         否则"它替我盯了一晚上"这件事用户永远不知道（结论在记录里，但没人会去翻）。 */
+      unread: Number(saved?.unread || 0),
     };
     liveModelId = s.modelId;
     s.model = makeModel(s.modelId);
@@ -1312,6 +1330,10 @@ async function newSession(s, { reason = '' } = {}) {
   try {
     const ns = await getSession(sid);
     await saveNow(ns);
+    /* 定时任务跟着搬过去：不搬的话，它们会一直说给**归档掉的那段会话**听 ——
+       用户开着新对话等一晚上，什么都没收到，而任务其实准时跑过。 */
+    const moved = await sched.rekey(old, sid).catch(() => 0);
+    if (moved) emit(ns, { t: 'note', message: `${moved} 个定时任务跟过来了` });
   } catch (e) {
     console.warn('[ctx] 新会话落盘失败：' + e.message);
   }
@@ -1358,6 +1380,25 @@ function coldAllow(goal) {
 }
 
 /* ───────────────────── 收口：这一轮必须有结局 ───────────────────── */
+
+/**
+ * 定时回合的工具表：**只留 safe**。
+ *
+ * 为什么在"发工具表"这一层还要再裁一次（执行层另有一道闸）：模型看到
+ * 一个能调的工具就会去调。留一个它点不动的按钮，等于让它在"想改但改不了"
+ * 和"换个办法绕"之间浪费步数 —— 而定时回合没人能打断它。
+ *
+ * 代价：定时任务永远不能改系统。这是**故意的**（见 roadmap ①：预授权白名单
+ * 是另一个更重的问题，没解决之前不许写入）。
+ */
+function autoDrop(s, drop) {
+  if (!s.auto) return drop;
+  const d = new Set(drop);
+  for (const n of Object.keys(s.tools.all || {})) {
+    if (s.tools.level(n) !== 'safe') d.add(n);
+  }
+  return d;
+}
 
 /**
  * 最后一句话，**不经过模型**。
@@ -1507,6 +1548,9 @@ async function runTurn(s, goal) {
     }
   }
   s.spoke = false;          // 这一轮还没说过话（见下面 scene 工具回带的 say）
+  /* 定时回合：**没人在跟前**。工具表和执行层都要按这个裁（见 autoDrop / 执行闸）。 */
+  s.auto = goal.kind === 'auto';
+  s.autoTask = goal.task || null;
   s.narrated = false;       // 观察窗里还没提示过"旁白被咽掉"
   s.sets = 0;
   s.lastSpecSig = null;
@@ -1571,6 +1615,12 @@ async function runTurn(s, goal) {
   /* 冷门组按场景发：这一轮用户没提造工具，那六个工具和它 1500 token 的规程就都不发。
      判据在代码里（coldAllow），不靠模型自觉 —— 它连 needs.net 都填不对。 */
   const allow = coldAllow(goal);
+  /* 定时这一组只在"有可能用到"时发：这句话里有时间的说法，或者已经有任务了
+     （已有时模型要能 list/cancel），或者这一轮本身就是定时开的。
+     判据放代码里而不是让模型自己记得 —— 它连 needs.net 都填不对。 */
+  if (goal.kind === 'auto' || sched.list().length || WATCH_WORDS.test(String(goal.text || ''))) {
+    allow.add('sched');
+  }
   const guideNote = allow.has('forge') ? FORGE_GUIDE : '';
   /* 身份段在**每次请求**里都出现（它是"你是谁"，不是"这轮用得上什么"）；
      漂移段只在真的抽到东西时才出现。两段都走 ctxNote，不写进历史 ——
@@ -1585,6 +1635,20 @@ async function runTurn(s, goal) {
     s.messages.push({ role: 'user', content: goal.text });
     hear(s, goal.text);
     emit(s, { t: 'turn', round: s.turn, kind: 'ask' });
+  } else if (goal.kind === 'auto') {
+    /* 定时任务开的一轮。
+     *
+     * 它必须**看起来像一句话**：模型靠上下文理解"为什么现在轮到我说话"，
+     * 旁路塞进去它会以为自己被凭空叫醒，于是先说一句"你好，请问有什么可以帮你"。
+     * 前缀写清楚来源，模型才知道该汇报而不是聊天。
+     *
+     * 用户没在场，所以**不进 hear()**（说话记录里那条是用户说的，不是它自己）。 */
+    s.messages.push({
+      role: 'user',
+      content: `[定时] ${goal.text}（到点了，你自己看一眼，然后直接说结论。用户在不在不一定。）`,
+      auto: true,
+    });
+    emit(s, { t: 'turn', round: s.turn, kind: 'auto', task: goal.text });
   } else {
     const it = goal.intent || {};
     if (it.kind === 'adjust') s.lastAdjustTo = it.to;
@@ -1684,7 +1748,7 @@ async function runTurn(s, goal) {
       emit(s, { t: 'think', on: true, step: at });
       let out;
       const reqMsgs = withMemory(s.messages, ctxNote);
-      const schemas = s.tools.schemas(coldTools(allow));
+      const schemas = s.tools.schemas(autoDrop(s, coldTools(allow)));
       try {
         out = await s.model.complete({
           messages: reqMsgs,
@@ -1947,6 +2011,19 @@ async function runTurn(s, goal) {
                 + (name.startsWith('tool_')
                   ? ' 把脚本压到 40 行以内、一条消息只发一个调用，再调一次 tool_write。'
                   : ` 重新发一次 ${name}，只发这一个调用，参数写完整。`),
+            };
+          } else if (s.auto && s.tools.level(name) !== 'safe') {
+            /* 定时回合的硬边界：**没人能点同意**。
+             *
+             * 工具表里已经把这些摘掉了（见 runTurn 里 schemas 的 drop），
+             * 但这道闸仍然要留在执行层 —— 模型会凭记忆调一个"不在表里"的工具，
+             * 而审批门在没人应答时等 90 秒后按拒绝，用户第二天看到的是
+             * "它卡了半个晚上"。所以这里立刻拒绝，并把原因说成它听得懂的话，
+             * 免得它换个工具再试一遍。 */
+            result = {
+              error: '这一轮是定时任务，没人在跟前点同意，所以只能查不能改。'
+                + `这件事要改系统（${name}），得等用户在的时候说一声。`
+                + '先把查到的情况说清楚，提一句"要动手得你在的时候"。',
             };
           } else if (s.goal?.kind === 'intent' && s.goal.intent?.kind === 'adjust' && s.tools.level(name) === 'danger') {
             /* 「拖一下」只是意图，决不能在同一个回合里直接变成执行。
@@ -2542,11 +2619,11 @@ async function runTurn(s, goal) {
     /* 回合结束后台抽记忆。只抽问答回合：
        手势回合里的话大多是"把内存拖到 34%"，那是一次操作，不是一件值得记住的事。
        抽取失败只丢这一轮，不影响对话（memory.mjs 里自己 catch）。 */
-    if (!aborted && goal.kind === 'ask') {
+    if (!aborted && (goal.kind === 'ask' || goal.kind === 'auto')) {
       memory.afterTurn({
         sid: s.sid,
         turn: s.turn,
-        user: goal.text,
+        user: goal.text || goal.task || '',
         reply: s.lastSpoken || '',
         actions: s.acts || [],
       }).catch(() => {});
@@ -2571,6 +2648,12 @@ async function runTurn(s, goal) {
        放在 idle 之前，和 usage 同一个理由（idle 之后到来会闪一下）。 */
     emit(s, { t: 'mem', ...(await memBrief(true)) });
     emit(s, { t: 'idle' });
+    /* 定时回合 + 没人在看 = 未读。放在 idle 之后：这个记号是给"回来的人"的，
+       不是给"正在看的人"的（他已经在屏幕上看见结论了）。 */
+    if (s.auto && !(s.reses?.size)) {
+      s.unread = (s.unread || 0) + 1;
+      emit(s, { t: 'unread', n: s.unread });
+    }
     scheduleSave(s);         // 一轮结束才落盘：中途存的是半句话，恢复出来更糟
   }
 }
@@ -2600,7 +2683,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|schedule|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：
@@ -2612,6 +2695,83 @@ const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|
      因为训练数据里的助手都这么开头。以"如下 / 以下"收尾、
      或"情况 / 状态 / 信息"打头再接"如下"的，一律不算说话。 */
 const META_TALK = /^\[?手势|用户(想|希望|需要|要求|的意思)|我们(先|需要|应该|可以)|(如下|以下|有|包括)[：:]?$|(情况|状态|信息|数据|结果|应用|监控)[^。]{0,8}(如下|以下)|请稍等|稍等|我明白了|让我(先|来)|重新铺/;
+
+/* "这句话在要求一件事按时发生吗"。
+ *
+ * 为什么用这么宽的一坨词：漏判的代价是**它明明能定时却说做不到**（用户立刻损失），
+ * 误判的代价只是多 90 token 的工具描述。所以宁可宽。
+ *
+ * 关键是要收 `每 5 分钟` 这种**带数字**的写法 —— 第一版只写了 `每分钟`，
+ * 于是用户最常用的那句话刚好漏掉（"每 5 分钟看一眼 n8n"），
+ * 它会答"我只能现在查一次"。
+ */
+const WATCH_WORDS = /(每天|每日|每隔|定时|每小时|每分钟|每\s*[\d一二两三四五六七八九十]+\s*(分钟|分|小时|点|天)|一直盯着|盯着|看住|一有变化|有变化就|提醒我|叫我)/;
+
+/* ───────────────────── 定时任务：到点开一轮 ─────────────────────
+ *
+ * 这里只做三件事：看谁到点了、给它开一轮、跑完把结果记回任务表。
+ * 时间算术全在 `sched.mjs` 里（那一层能脱离服务测住）。
+ *
+ * 两条刻意的取舍：
+ *   · **会话忙就跳过，不排队。** 排队会让"每 5 分钟"的任务在一次长任务之后
+ *     连喷四次；跳过等于"这一班错过了"，下一班照常。
+ *   · **一轮跑不起来就记失败，连错 5 次自动暂停。** 定时任务最坏的形态是
+ *     每 30 秒失败一次、永远不停：日志满了、账单也满了，而用户什么都不知道。
+ */
+const SCHED_MAX_FAIL = 5;
+
+async function runAutoTurn(s, t) {
+  try {
+    await runTurn(s, { kind: 'auto', text: t.task, task: t });
+    t.failN = 0;
+    const r = sched.settle(t, { text: s.lastSpoken || '', ok: true });
+    if (r?.slowed) {
+      const word = r.factor >= 8 ? '先放宽到最长' : '放宽了';
+      emit(s, {
+        t: 'note',
+        message: `「${t.task}」连着几次结论都一样，我把间隔${word}（现在是 ${r.factor} 倍）。有变化就恢复。`,
+      });
+    }
+    if (r && !(s.reses?.size)) trace(s, 'note', { text: '下一班', detail: r.next, tone: 'sched' });
+  } catch (e) {
+    sched.settle(t, { ok: false });
+    t.failN = (t.failN || 0) + 1;
+    console.warn(`[sched] 任务「${t.task}」这一轮没跑起来（${t.failN}/${SCHED_MAX_FAIL}）：${e?.message || e}`);
+    if (t.failN >= SCHED_MAX_FAIL) {
+      t.paused = true;
+      emit(s, { t: 'note', message: `「${t.task}」连着 ${SCHED_MAX_FAIL} 次没跑起来，先暂停了 —— 你说一声我再开。` });
+      sched._save();
+    }
+  }
+}
+
+let schedTimer = null;
+function startSched() {
+  if (schedTimer) return;
+  /* 默认 30 秒一拍（见 sched.mjs 的 TICK_MS）。自测里用 SCHED_TICK_MS 拨快 ——
+     否则一个"到点会跑吗"的用例要等半分钟，写着写着就没人跑了。 */
+  const every = Math.max(200, Number(process.env.SCHED_TICK_MS) || TICK_MS);
+  schedTimer = setInterval(async () => {
+    const due = sched.due();
+    for (const t of due) {
+      let s;
+      try { s = await getSession(t.sid); } catch (e) {
+        /* 会话都建不起来（模型没配好 / 目录没挂）→ 算一次失败，别每 30 秒重来一次日志 */
+        sched.settle(t, { ok: false });
+        t.failN = (t.failN || 0) + 1;
+        if (t.failN >= SCHED_MAX_FAIL) { t.paused = true; sched._save(); }
+        console.warn('[sched] 打不开会话：' + (e?.message || e));
+        continue;
+      }
+      /* 忙就等下一班（见上面注释）。这里**不能** begin —— begin 会把 nextAt 推走，
+         等于把这一次彻底丢掉，而"忙"只是一时的。 */
+      if (s.busy) continue;
+      if (!sched.begin(t)) continue;
+      runAutoTurn(s, t).catch((e) => console.warn('[sched] ' + (e?.message || e)));
+    }
+  }, every);
+  schedTimer.unref?.();
+}
 
 /* ───────────────────────── HTTP ───────────────────────── */
 
@@ -2694,7 +2854,12 @@ const server = http.createServer(async (req, res) => {
       /* 记忆条数 —— 状态区那一格。它和 usage 并排出现，因为它们都是
          "这个会话现在怎么样"，而不是"它刚说了什么"。 */
       mem: await memBrief(),
+      /* 定时任务：**连上就要给**。用户不点开任何东西，也该看得见"有两件事在替你盯"。
+         `unread` 是"你不在的时候它跑过几次" —— 给完就清零（人已经在看了）。 */
+      unread: s.unread || 0,
+      tasks: sched.forSid(),
     });
+    if (s.unread) { s.unread = 0; scheduleSave(s); }
     /* 重连/刷新：把上一屏原样还回去。它必须是"已经在那儿"的状态，
        不是重新长一遍 —— 用户没有发起任何事，不该看到一场动画。
        判据不是"是不是刚从磁盘读出来的"：服务还活着、会话还在内存里时刷新，
@@ -2723,6 +2888,9 @@ const server = http.createServer(async (req, res) => {
 
     if (body.t === 'ask' && body.text) {
       const text = String(body.text).slice(0, 2000);
+      /* 人说话了 = 未读作废。不管他说的是不是和定时任务有关 ——
+         他已经回来了，那个记号的意义（"它替你跑过、你不知道"）就没了。 */
+      if (s.unread) { s.unread = 0; emit(s, { t: 'unread', n: 0 }); }
       /* 两条"整理"指令走旁路，不占模型一轮。
          为什么用指令而不是按钮：它们说的是"这段对话怎么处理"，
          和"问一件事"不是同一个层级；写进输入行还能被 ↑ 记录翻到。 */
@@ -2763,6 +2931,11 @@ const server = http.createServer(async (req, res) => {
       runTurn(s, { kind: 'intent', intent: body.intent });
     } else if (body.t === 'approve') {
       settleApproval(s, !!body.ok);
+    } else if (body.t === 'read') {
+      /* 前端把未读消掉（点开了记录 / 状态条上那个刻度） */
+      s.unread = 0;
+      emit(s, { t: 'unread', n: 0 });
+      scheduleSave(s);
     } else if (body.t === 'abort') {
       /* 打断也要回执：客户端点了停却什么都没发生，是最难受的一种失败 */
       const ok = abortTurn(s);
@@ -3116,6 +3289,16 @@ try {
 } catch (e) {
   console.warn('[skills] 索引失败：' + e.message);
 }
+
+/* 任务表要在开门之前读好：第一次连上就要能报"有几件事在替你盯"。
+   读不出来（文件坏/目录没挂）不致命 —— sched 内部按空表处理并留一条 warn。 */
+try {
+  const n = await sched.init();
+  if (n) console.log(`[sched] ${n} 个定时任务：${sched.forSid().map((t) => `${t.when} ${t.task}`).join(' / ')}`);
+} catch (e) {
+  console.warn('[sched] 任务表读不出来：' + e.message);
+}
+startSched();
 
 /* 绑哪个地址。默认是 Node 的老行为（不带 host = `::`/0.0.0.0 双栈），
    pod 里要的就是这个 —— 只绑 127.0.0.1 的话 k8s 的探针和 Service 都进不来。

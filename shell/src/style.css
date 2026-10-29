@@ -394,6 +394,8 @@ body.launching .rail-zone { display: none; }
 @keyframes ag-sweep { from { background-position: 200% 0; } to { background-position: 0 0; } }
 .ag-bar .ag-ctx-num { font-weight: 400; color: rgba(163, 198, 228, .72); }
 .ag-bar .ag-mem { pointer-events: auto; cursor: default; }
+/* 定时：粒子那边画的是刻度，这一格是透明的悬停区（清单在 tooltip 里） */
+.ag-bar .ag-sched { pointer-events: auto; cursor: default; }
 .ag-bar .ag-tool { color: rgba(255, 178, 87, .62); overflow: hidden; text-overflow: ellipsis; }
 
 /* ── 换模型的那张表（modelpick.js） ──
