@@ -233,6 +233,9 @@ export function makeTools(o = {}) {
   /* ComfyUI（见 agent/comfy.mjs）。由 server 注入：它只认一个 HTTP 地址，
      所以"有没有显卡"不是构造条件 —— 没卡也能连 CPU 上的那个，只是慢。 */
   const comfy = o.comfy || null;
+  /* 子 agent（见 agent/sub.mjs）。由 server 注入 —— 它要拿这个会话**当前**的模型，
+     所以注入的是一个"按需跑"的闭包，而不是一个实例（换模型后子 agent 也跟着换）。 */
+  const sub = o.sub || null;
   const forge = o.forge || null;
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
@@ -376,6 +379,59 @@ export function makeTools(o = {}) {
         };
       }
       return { error: `不认识的 op：${op}（能用的只有 status / templates / gen）` };
+    },
+  });
+
+  /* ── 子 agent：**换一个上下文，把立场锁住** ──
+   *
+   * 用户的原话（2026-10-29）：「有互相冲突的内容或者角色时，模型没有办法在一次回复中
+   * 换对立角度思考，必然会因为梯度下降而陷入无意义的不出错回复。」
+   *
+   * 所以这个工具的用途**不是并行**，是"我自己说不了两边，就换个上下文让它说一边"。
+   * 描述里那段"什么时候必须用"写得比代码还长，是因为**判据不进提示词就等于没有** ——
+   * 7B 不会自己意识到"这题需要站队"，它只会给你一段"各有优劣"。
+   */
+  add('sub_run', {
+    level: 'safe',
+    describe: '换一个上下文、只站一边，去审同一件事。**不是并行，是为了不许和稀泥**。'
+      + '你在同一次回复里"既说好又说不好"，结果一定是"这取决于你的需求"——那句等于没答。'
+      + '**下面这几种情况必须用它，不许自己硬答**：'
+      + '① 用户在问该不该/要不要/哪个更好/A 还是 B/值不值得（要的是判断，不是罗列）；'
+      + '② 同一件事有两个互相冲突的目标（省钱 vs 稳定、快 vs 全、安全 vs 方便）；'
+      + '③ 需要站在某个角色上说话（评审自己刚写的东西、红队、模拟用户来投诉）；'
+      + '④ 你刚写完一段代码或给出一段长结论，要自查（role=critic）。'
+      + '**不该用**：查事实（"装了哪些应用"）、单点操作、指令已经明确到不用判断的执行 —— '
+      + '它看不到你的对话，你也不该为一件确定的事多花一次调用。'
+      + '`task` 要给**完整的材料**（它只能看到这一段，看不到你刚才说了什么）。'
+      + '拿到结果之后：**必须选一个立场表态，不许把两边综合成折中**；'
+      + '你采纳了谁、放弃了什么代价，要明说。它说 fence=true 时，那段回复是废话，别用。',
+    schema: {
+      type: 'object',
+      properties: {
+        role: { type: 'string', enum: ['critic', 'advocate'], description: 'critic=只找问题（default） advocate=替这件事说话' },
+        task: { type: 'string', description: '要审/要辩的**全部材料**：方案原文、代码、两个选项的实际情况。它看不到对话' },
+        subject: { type: 'string', description: '一句话说清这是什么（进它的系统提示，不占结论）' },
+      },
+      required: ['task'],
+      additionalProperties: false,
+    },
+    run: async ({ role, task, subject }) => {
+      if (!sub) return { error: '这个部署里没有子 agent（agent/sub.mjs 没接上）' };
+      const r = await sub.run({ role: role || 'critic', task, subject: subject || '' });
+      if (!r.ok) {
+        /* 失败要能分辨：空回复 ≠ 没人反对。混起来主 agent 会以为方案过关了。 */
+        return { error: r.error, code: r.code };
+      }
+      return {
+        ok: true,
+        role: r.roleZh || r.role,
+        conclusion: r.conclusion,
+        reasons: r.reasons,
+        counter: r.counter,
+        /* 它自己都中和了的话，标出来 —— 这种结果按"没答"处理，不要拿它当依据 */
+        fence: r.fence || undefined,
+        ms: r.ms,
+      };
     },
   });
 

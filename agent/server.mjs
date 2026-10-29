@@ -47,6 +47,7 @@ import { trimHistory, foldToolResults } from './history.mjs';
 import { createPersona, traceRefs } from './persona.mjs';
 import { createOlares } from './olares.mjs';
 import { createComfy } from './comfy.mjs';
+import { createSub } from './sub.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -144,6 +145,93 @@ const olares = createOlares();
    **没卡也能建**：出图慢是运行时的事，不是构造条件 —— 而"连不上"由 op=status
    如实说出来。开发期这个地址指向 `tools/dev/stub-comfy.mjs` 就行。 */
 const comfy = createComfy();
+
+/**
+ * 子 agent：**换一个上下文，把立场锁住**（见 `agent/sub.mjs` 文件头）。
+ *
+ * 每次调用现造一个实例，而不是全局一个 —— 因为 `complete` 必须跟着**这个会话当前的模型**
+ * 走：换了模型之后子 agent 也该换（否则主对话在 8B 上、审它的却是另一个 7B，结论没法比）。
+ *
+ * 用量要记进这个会话的账本：一次判断 = 多一次调用，不记的话"今天花了多少"是假的。
+ */
+async function runSubFor(s, a = {}) {
+  if (!s?.model) return { ok: false, code: 'sub_unavailable', error: '这个会话还没有模型' };
+  const sub = createSub({
+    complete: (req) => s.model.complete(req),
+    onUsage: (u) => {
+      try {
+        /* `parts` 要给全（sys/tools/hist）：账本用它算"上下文里谁占得多"。
+           子 agent 没有工具表，所以 tools 是 0 —— 这不是缺数据，是事实。 */
+        s.meter?.add?.(u, { ms: 0, msgs: 2, parts: { sys: 0, tools: 0, hist: 0 } });
+      } catch { /* 记账失败不该让判断失败 */ }
+    },
+    timeout: Number(a.timeout || 120_000),
+  });
+  return sub.run(a);
+}
+
+/* ── 自动过一遍反方：**唯一一个不靠模型自觉的接点** ──
+ *
+ * 为什么单挑"写完代码"这一处：`tool_write` / `tool_code` 的产物是**以后会被人信任**的东西
+ * （它能进工具表、能被执行），而写它的那个上下文刚刚才决定这么写，天然不会自我否定。
+ * 实测过的形状：模型写完脚本、`tool_try` 跑一次"能跑"，就当它对了 —— 边界条件、
+ * 失败分支、参数校验一概没有。这里补一次审，成本是一次调用（无工具、一轮），值。
+ *
+ * 三个约束：
+ *   · 一轮最多两次（`s.subN`）：写三个工具就审三次，那还不如不写；
+ *   · 超时短（60 秒）：它是旁支，不该把主回合拖住；
+ *   · 审的结果**只作为参考回给模型**，不阻断、不改代码 —— 要不要改由它自己决定。
+ */
+const SUB_REVIEW_TOOLS = /^(tool_write|tool_code)$/;
+const SUB_REVIEW_MAX = 2;
+
+async function autoReviewCode(s, name, args, result) {
+  if (!SUB_REVIEW_TOOLS.test(name)) return null;
+  if (!result || result.error || result.ok === false) return null;   // 本来就没成功，不审
+  if ((s.subN || 0) >= SUB_REVIEW_MAX) return null;
+  if (process.env.SUB_REVIEW === '0') return null;
+  const code = String(args?.code || args?.script || args?.src || '');
+  if (code.length < 40) return null;      // 太短的东西没有可审的（一句话的胶水）
+
+  s.subN = (s.subN || 0) + 1;
+  const t0 = Date.now();
+  const r = await runSubFor(s, {
+    role: 'critic',
+    subject: `一段即将被装进工具表的 JavaScript（工具名 ${args?.name || name}）`,
+    timeout: 60_000,
+    task: [
+      '下面是一段会被当作工具执行的 JavaScript（Node ESM，零依赖）。找出**会在真实运行中坏掉**的地方。',
+      '重点看：边界条件（空数组/0/undefined/超长输入）、失败分支（接口 500、超时、字段缺失）、',
+      '有没有把不该信的东西当真的（文件内容、接口返回）、有没有可能吞掉用户可见的失败。',
+      '不要评价风格，不要说"建议补充注释"。',
+      '',
+      '```js',
+      code.slice(0, 6000),
+      '```',
+    ].join('\n'),
+  });
+  if (!r.ok) {
+    console.log(`[sub] 自审失败 ${r.code}：${r.error}`);
+    return null;
+  }
+  if (r.fence) {
+    /* 它自己也中和了 —— 这条结果按"没答"处理，不要拿它当依据（也说明 brief 需要再收紧）。 */
+    console.log('[sub] 自审给了一段和稀泥的话，已丢弃');
+    return null;
+  }
+  trace(s, 'step', {
+    text: '让另一个人挑了毛病',
+    detail: r.conclusion ? `${r.conclusion.slice(0, 60)}` : undefined,
+    tool: 'sub_run',
+  });
+  console.log(`[sub] 自审 ${Date.now() - t0}ms：${r.conclusion.slice(0, 60)}`);
+  return {
+    verdict: r.conclusion,
+    issues: r.reasons,
+    /* 对方最强的那一点：让模型看到"最坏会怎么坏"，比一串小毛病有用 */
+    worst: r.counter || undefined,
+  };
+}
 
 /* 官方技能包（12 份 SKILL.md，构建时从 olares-cli 里 export 出来）。
    索引在启动时读一次（`await skills.index()`，见 listen 之前），
@@ -373,7 +461,10 @@ async function getSession(sid) {
         ? withCurrentSystem(saved.messages)
         : [{ role: 'system', content: sysPrompt() }],
       reses: new Set(),      // 这段会话的所有下行连接（可能有多个：刷新、多标签页）
-      tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy }),
+      tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy,
+        /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
+           （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
+        sub: { run: (a) => runSubFor(s, a) } }),
       model: null,
       /* 这段对话用的是哪个模型。**要落盘**：换过一次之后刷新，
          不能又回到默认那个 —— 用户会以为"换了没生效"（他刚踩过这个）。 */
@@ -1398,6 +1489,7 @@ async function runTurn(s, goal) {
   s.salvaged = false;       // 这一轮有没有已经兜底铺过（见 salvage）
   s.painted = false;        // 这一轮有没有先铺过"渐进首屏"
   s.acts = [];              // 这一轮调过哪些工具（只给记忆抽取用，不进上下文）
+  s.subN = 0;               // 这一轮自动审过几次代码（上限 SUB_REVIEW_MAX，见 autoReviewCode）
   s.actN = 0;               // 这一轮真正调了多少次（acts 有 12 条上限，长任务会截断）
   s.reasonN = 0;            // 这一轮已经上屏了几条"想"（整轮封顶 8 条，见下面）
   s.reasonSeen = new Set(); // 已经上过屏的那几句（跨步去重）
@@ -2038,6 +2130,16 @@ async function runTurn(s, goal) {
           }
         }
 
+        /* ── 写完代码自动过一遍反方 ──
+           放在这里（而不是工具内部）是因为它要**改 `result`**：审出来的问题必须跟着
+           这次工具调用的结果一起回给模型，否则它看完成功就往下走了。
+           放在 forContext 之前：这段结果没有 surface/draw，forContext 就是 result 本身，
+           所以 review 会原样进上下文 —— 这正是我们要的。 */
+        if (result && !result.error) {
+          const rv = await autoReviewCode(s, name, args, result).catch(() => null);
+          if (rv) result = { ...result, review: rv };
+        }
+
         /* 渲染树 / 绘画同样不是"数据"，是给眼睛的指令。
            但**必须**把体积从上下文里切掉：一屏表格 20KB，回灌给 7B 模型
            就是把它的窗口填满，后面几轮全在复读表头。 */
@@ -2473,7 +2575,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：

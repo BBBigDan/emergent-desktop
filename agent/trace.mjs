@@ -90,6 +90,9 @@ const T = {
   memory_recall: ['翻记忆', (a) => cut(a?.q || a?.query, 16)],
   memory_stats: ['数一数记忆'],
   memory_forget: ['忘掉几条', (a) => cut(a?.q || a?.query, 16)],
+  /* 子 agent 那一行要说清"谁在说"：用户需要一眼看出这不是它的结论，是另一个立场。
+     `critic` = 挑毛病的人，`advocate` = 替这件事说话的人。 */
+  sub_run: ['换个立场问', (a) => (a?.role === 'advocate' ? '替它说话的人' : '挑毛病的人')],
   scene_show: ['铺一屏'],
   scene_ask: ['把问题问出来'],
   scene_set: ['换一屏'],
