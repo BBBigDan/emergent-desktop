@@ -398,8 +398,12 @@ export function makeTools(o = {}) {
       + '**下面这几种情况必须用它，不许自己硬答**：'
       + '① 用户在问该不该/要不要/哪个更好/A 还是 B/值不值得（要的是判断，不是罗列）；'
       + '② 同一件事有两个互相冲突的目标（省钱 vs 稳定、快 vs 全、安全 vs 方便）；'
-      + '③ 需要站在某个角色上说话（评审自己刚写的东西、红队、模拟用户来投诉）；'
-      + '④ 你刚写完一段代码或给出一段长结论，要自查（role=critic）。'
+      + '③ 需要站在某个立场上说话（评审自己刚写的东西、红队、模拟用户来投诉）；'
+      + '④ 你刚写完一段代码或给出一段长结论，要自查（role=critic）；'
+      + '⑤ **写有对立人物的东西**（小说对话、交锋、谈判）：每个角色各开一次 role=character，'
+      + '先拿到各自的欲望/恐惧/说话方式，再动笔。一起写出来的两个人会变成**同一个声音**'
+      + '（实测：两个人都靠"我有具体的苦"当筹码、都用短句顶回去），因为你在同一段上下文里'
+      + '替两边都想了。'
       + '**不该用**：查事实（"装了哪些应用"）、单点操作、指令已经明确到不用判断的执行 —— '
       + '它看不到你的对话，你也不该为一件确定的事多花一次调用。'
       + '`task` 要给**完整的材料**（它只能看到这一段，看不到你刚才说了什么）。'
@@ -408,8 +412,16 @@ export function makeTools(o = {}) {
     schema: {
       type: 'object',
       properties: {
-        role: { type: 'string', enum: ['critic', 'advocate'], description: 'critic=只找问题（default） advocate=替这件事说话' },
-        task: { type: 'string', description: '要审/要辩的**全部材料**：方案原文、代码、两个选项的实际情况。它看不到对话' },
+        role: {
+          type: 'string',
+          enum: ['critic', 'advocate', 'character'],
+          description: 'critic=只找问题（default） advocate=替这件事说话 character=扮演一个人（写对话时每个角色各开一次）',
+        },
+        task: {
+          type: 'string',
+          description: 'role=character 时填**这个人的处境和欲望**（他是谁、要什么、怕什么、这场的对手是谁）；'
+            + '其它角色填要审/要辩的全部材料。它看不到对话，材料要完整',
+        },
         subject: { type: 'string', description: '一句话说清这是什么（进它的系统提示，不占结论）' },
       },
       required: ['task'],
@@ -428,6 +440,8 @@ export function makeTools(o = {}) {
         conclusion: r.conclusion,
         reasons: r.reasons,
         counter: r.counter,
+        /* 人物独有：怎么说话。写戏的人拿不到这个，两个角色就会长成一张嘴。 */
+        voice: r.voice || undefined,
         /* 它自己都中和了的话，标出来 —— 这种结果按"没答"处理，不要拿它当依据 */
         fence: r.fence || undefined,
         ms: r.ms,

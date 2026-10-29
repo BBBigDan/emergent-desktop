@@ -20,7 +20,10 @@ const ok = (c, name, extra = '') => {
 };
 
 const tmp = path.join(os.tmpdir(), `persona-test-${process.pid}`);
-await fs.rm(tmp, { recursive: true, force: true });
+/* Windows 上删目录会撞上"还有写没落完"（ENOTEMPTY rmdir）：前面几项测试用
+   `void` 丢掉了 Promise，文件流可能还没关。这不是断言失败 —— 但它会让整套自测
+   在 CI 上随机变成红的，比不测还坏（下一次就没人信它了）。所以补重试。 */
+await fs.rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
 process.env.PERSONA_DIR = tmp;
 
 /* ── 一、正交判据 ─────────────────────────────────────── */
@@ -202,6 +205,9 @@ const st = pf.stats();
 ok(st.ratio > 0 && st.ratio <= 1, '泄漏率是"注入了的轮数 / 问过的轮数"');
 ok(st.recent.length >= 1 && st.recent[0].id, '面板能摊开最近注入');
 
-await fs.rm(tmp, { recursive: true, force: true });
+/* Windows 上删目录会撞上"还有写没落完"（ENOTEMPTY rmdir）：前面几项测试用
+   `void` 丢掉了 Promise，文件流可能还没关。这不是断言失败 —— 但它会让整套自测
+   在 CI 上随机变成红的，比不测还坏（下一次就没人信它了）。所以补重试。 */
+await fs.rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 });
 console.log(`\n通过 ${pass} · 未通过 ${fail}`);
 process.exit(fail ? 1 : 0);

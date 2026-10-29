@@ -70,6 +70,33 @@ console.log('\n立场不许被中和');
   ok(!looksLikeFence('结论：不该常驻，因为 6 核是这台机器一半算力'), '明确的结论不算和稀泥');
 }
 
+/* ─────────────────────── ②′ 扮一个人（写戏用） ─────────────────────── */
+console.log('\n扮一个人：声音要分开');
+{
+  const c = roleBrief('character', { subject: '老陈，欠了三个月车贷的货车司机' });
+  ok(/只扮演一个人/.test(c), '只扮一个人');
+  ok(/你不知道对方在想什么/.test(c), '**切断它替对方体谅的路径**（这是戏死掉的头号原因）');
+  ok(/不许承认他有道理/.test(c), '不许承认对方有道理');
+  ok(/不会说/.test(c), '要求指出"有一类话这人不会说"（声音的边界比形容词有用）');
+  ok(/你是：老陈/.test(c), `subject 当"你是"用，不是"审的对象"（${c.split('\n').find((l) => l.includes('老陈'))}）`);
+  ok(/声音：/.test(c), '格式里要它交代说话方式');
+
+  const v = parseVerdict([
+    '结论：我没拔。',
+    '理由：1) 车是我唯一的生计；2) 收车我就没活干；3) 登记证在我手里',
+    '反对：他知道我上个月只还了两千',
+    '声音：短句、报数字、不抬头',
+  ].join('\n'));
+  ok(/我没拔/.test(v.conclusion), `台词抓到了：${v.conclusion}`);
+  ok(v.reasons.length === 3, `要什么/怕什么/筹码三条（${v.reasons.length}）`);
+  ok(/只还了两千/.test(v.counter), '对手能戳中的地方也抓到了');
+  ok(/短句/.test(v.voice), `说话方式单独一个字段：${v.voice}`);
+
+  /* 老角色不受影响：critic 的格式里不该出现"声音"这一行 */
+  ok(!/声音：/.test(roleBrief('critic')), 'critic 的格式没被改脏');
+  ok(Object.keys(ROLES).length === 3, `三个角色（${Object.keys(ROLES).join('/')}）`);
+}
+
 /* ─────────────────────── ③ 运行与失败 ─────────────────────── */
 console.log('\n运行：一次调用、无工具、失败要能分辨');
 const stub = (content, extra = {}) => async (req) => {
