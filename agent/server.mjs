@@ -170,6 +170,27 @@ async function runSubFor(s, a = {}) {
   return sub.run(a);
 }
 
+/**
+ * 对戏的出口。和 `runSubFor` 分开写，因为它的调用次数完全不是一个量级：
+ * 默认 4 轮就是 2 张卡 + 8 次说话 = 10 次调用。所以：
+ *   · `turns` 卡在 1~10（内部还有一道 clamp）；
+ *   · 总超时按**次数**放宽，否则第 7 句就会被一个 120 秒的闸掐掉 ——
+ *     而那时候屏幕上已经有一半台词了，比一行都没有更难解释。
+ */
+async function runDialogueFor(s, a = {}) {
+  if (!s?.model) return { ok: false, code: 'sub_unavailable', error: '这个会话还没有模型' };
+  const turns = Math.max(1, Math.min(10, Math.round(Number(a.turns) || 4)));
+  const calls = 2 + turns * 2;
+  const sub = createSub({
+    complete: (req) => s.model.complete(req),
+    onUsage: (u) => {
+      try { s.meter?.add?.(u, { ms: 0, msgs: 2, parts: { sys: 0, tools: 0, hist: 0 } }); } catch { /* 记账失败不该让戏写不出来 */ }
+    },
+    timeout: Math.max(120_000, calls * 20_000),
+  });
+  return sub.dialogue({ cast: a.cast, scene: a.scene, turns });
+}
+
 /* ── 自动过一遍反方：**唯一一个不靠模型自觉的接点** ──
  *
  * 为什么单挑"写完代码"这一处：`tool_write` / `tool_code` 的产物是**以后会被人信任**的东西
@@ -464,7 +485,11 @@ async function getSession(sid) {
       tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy,
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
-        sub: { run: (a) => runSubFor(s, a) } }),
+        sub: {
+          run: (a) => runSubFor(s, a),
+          /* 对戏：卡片全在服务端生成和消耗，主模型只拿到台词（见 tools.mjs 的 dialogue） */
+          dialogue: (a) => runDialogueFor(s, a),
+        } }),
       model: null,
       /* 这段对话用的是哪个模型。**要落盘**：换过一次之后刷新，
          不能又回到默认那个 —— 用户会以为"换了没生效"（他刚踩过这个）。 */
@@ -2575,7 +2600,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：

@@ -88,18 +88,22 @@ const FORMAT = [
 ].join('\n');
 
 /**
- * 人物的格式**必须不一样**：`结论` 对人物来说就是"他这会儿会说出的那句台词"。
- * 沿用同一套标签（而不是另发明一套）是为了让解析器只有一份 ——
- * 模型换角色时格式不换，只有含义换，这是唯一能让 7B 稳定的做法。
+ * 人物的格式**必须比别的角色更简单**，而且第一行必须叫「台词」。
+ *
+ * 三条实测出来的理由（7B，2026-10-29）：
+ *   ① 它会把格式说明**当内容抄进正文** —— 提示词里写「声音：…（举例）+ 三个词」，
+ *      正文里就出现「（三个词：真他娘的）」。括号套括号，7B 分不清哪层是给它的说明书。
+ *   ② 它看到「结论：」会当成"我要输出的正文"，而人物要的是**台词** ——
+ *      一个字之差，出来的东西就从对话变成了解说。
+ *   ③ `声音` 这个字段在强模型上只会写成「短句、报数字」（两个人一模一样，等于没写），
+ *      在弱模型上直接变成噪声。所以删掉 —— 说话方式要靠**筹码和处境**带出来，
+ *      不是靠形容词。
  */
 const FORMAT_CHAR = [
-  '只输出下面四行（不要别的话，不要 markdown 标题，不要代码块）：',
-  '结论：他现在最想说的那一句台词（就这一句，别加引号）',
-  '理由：1) 他要什么；2) 他怕什么；3) 他拿什么当筹码（三条，每条一句）',
-  '反对：对方最可能戳中他的那个地方（他知道这一点，但他绝不会承认）',
-  /* 不要形容词。实测两张卡片都写成「短句、报数字」—— 两个人一模一样，等于没写。 */
-  /* 要具体到词和句子，才知道这人嘴边有什么、没有什么。 */
-  '声音：他绝不会说出口的一句（举个具体的例子），加他惯用的三个词',
+  '只输出下面三行，不要别的话，不要括号，不要解释：',
+  '台词：这个角色现在会说出口的那一句话',
+  '理由：1) 他要什么；2) 他怕什么；3) 他拿什么当筹码',
+  '反对：对方最可能戳中他的地方，他知道但绝不会承认',
 ].join('\n');
 
 export function roleBrief(role, { subject = '' } = {}) {
@@ -118,7 +122,9 @@ export function roleBrief(role, { subject = '' } = {}) {
 /* ───────────────────────── 解析 ───────────────────────── */
 
 const LABEL = {
-  conclusion: /^(结论|判断|我的结论)\s*[:：]\s*/,
+  /* 人物用「台词」当第一行（见 FORMAT_CHAR 的理由②）。旧标签仍然认，
+     否则已经存下来的会话、以及强模型习惯写的"结论"会解析成空。 */
+  conclusion: /^(结论|判断|我的结论|台词)\s*[:：]\s*/,
   reasons: /^(理由|原因|依据)\s*[:：]\s*/,
   counter: /^(反对|反驳|对方最强|最强反驳|对方最强的一点)\s*[:：]\s*/,
   /* 只对 `character` 出现：这个人怎么说话。写戏的人需要它，主 agent 拿不到就等于没分声。 */
@@ -185,6 +191,63 @@ export function looksLikeFence(text) {
   return FENCE.test(String(text || ''));
 }
 
+
+/* ───────────────────────── 对戏（多轮，服务端拼） ───────────────────────── */
+
+/**
+ * 角色卡：**只给服务端看**，不进主模型上下文。
+ *
+ * 这一条是踩出来的（7B，2026-10-29）：只要把卡片交给主模型，它就会把卡片上的字
+ * **念成台词** —— 先是「（三个词：真他娘的）」，换了个字段之后又变成
+ * 「对方最可能戳中他的地方，他知道但绝不会承认：…」。7B 分不清"给我看的信息"
+ * 和"要写出去的内容"，靠格式约束修不掉。
+ *
+ * 所以改成：卡片归服务端，主模型只拿到**最后拼好的台词**。没有元信息，就没有可念的东西。
+ */
+const CARD_FORMAT = [
+  '只输出三行，不要别的话，不要括号：',
+  '要什么：一句话',
+  '怕什么：一句话',
+  '筹码：他手上真正能压对方的东西，一句话',
+].join('\n');
+
+/** 说话：**只要一句台词**。多余的字都会变成噪声（弱模型会把它一起念出来）。 */
+const SPEAK_FORMAT = [
+  '只输出这个角色会说的那一句话。不要引号，不要名字，不要动作，不要旁白，不要解释。',
+].join('\n');
+
+
+/** 把「要什么/怕什么/筹码」三行拆开。缺哪行就给空串，不编。 */
+export function parseCard(text) {
+  const out = { wants: '', fears: '', leverage: '', ok: false };
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const t = raw.trim().replace(/^[-*·]\s*/, '');
+    const m = /^(要什么|想要|怕什么|怕|筹码|拿什么)\s*[:：]\s*(.+)$/.exec(t);
+    if (!m) continue;
+    const v = m[2].trim();
+    if (/^(要什么|想要)$/.test(m[1])) out.wants = v;
+    else if (/^(怕什么|怕)$/.test(m[1])) out.fears = v;
+    else out.leverage = v;
+  }
+  out.ok = !!(out.wants || out.fears || out.leverage);
+  return out;
+}
+
+/** 台词：去掉模型爱加的引号/名字前缀/旁白。**只留一句话**。 */
+export function cleanLine(text) {
+  let t = String(text || '').trim();
+  /* 去掉 markdown 与"台词："这类标签 */
+  t = t.replace(/^```[\s\S]*?```$/g, (m) => m.replace(/```/g, '')).trim();
+  t = t.replace(/^(台词|他说|她说|说)\s*[:：]\s*/, '');
+  /* 去名字前缀："老陈：……" */
+  t = t.replace(/^[^\s：:，。]{1,8}\s*[:：]\s*/, '');
+  /* 只取第一行非空（多行就是它开始解说了） */
+  t = (t.split(/\r?\n/).find((l) => l.trim()) || '').trim();
+  /* 去包裹的引号 */
+  t = t.replace(/^[「“"'']+/, '').replace(/[」”"'']+$/, '').trim();
+  return t;
+}
+
 /* ───────────────────────── 运行 ───────────────────────── */
 
 /**
@@ -249,5 +312,118 @@ export function createSub(o = {}) {
     }
   }
 
-  return { run, roles: () => Object.keys(ROLES), get calls() { return n; } };
+  /* ───────────────────── 对戏：两个人，各自上下文，服务端拼 ───────────────────── */
+
+  /**
+   * 一场两个人的戏。
+   *
+   * 为什么不复用 `run('character')`：那一次调用只能拿到"这个角色是谁"，
+   * 写戏的仍然是主模型 —— 而实测 7B 会把卡片的字段念成台词
+   * （「（三个词：真他娘的）」「对方最可能戳中他的地方…」）。
+   * 只要元信息流到主模型那边，就一定会漏。
+   *
+   * 所以这里**元信息一步都不出服务端**：
+   *   ① prepare：每人一次，产出"要什么/怕什么/筹码" —— 只存本地变量
+   *   ② speak：每人每轮一次，只看到"我是谁 + 我的卡 + 对方上一句"，输出一句台词
+   *   ③ 返回给调用方的只有 `lines`：纯台词，没有字段、没有标签、没有可念的说明
+   *
+   * 附带好处：**他们互相看不到对方的思考**，只看得到对方说出来的那句 ——
+   * 这本来就是戏里的真实处境。所以"体谅"没有发生的机会。
+   *
+   * @param {object} a
+   * @param {{name:string, who:string}[]} a.cast 正好两个人
+   * @param {string} a.scene 这一场是什么情况（两个人都知道的公共事实）
+   * @param {number} [a.turns] 每人说几句（默认 4，总台词 = turns × 2）
+   */
+  async function dialogue({ cast = [], scene = '', turns = 4 } = {}) {
+    if (!complete) return { ok: false, code: 'sub_unavailable', error: '子 agent 没有接模型' };
+    /* **不许悄悄取前两个。** 用户说"三个人"，只写两个而不解释，比报错更糟：
+       他会以为模型偷懒，其实是这里静默截断了。齐了就写，不齐就说清。 */
+    const all = (Array.isArray(cast) ? cast : []).filter((c) => c && c.name);
+    if (all.length > 2) {
+      return {
+        ok: false, code: 'sub_bad_cast',
+        error: `现在只能写两个人的对戏（收到 ${all.length} 个）。这一场最重要的是两个人互不相让，`
+          + '第三个人可以等他俩说完再单独开一场。',
+      };
+    }
+    const people = all;
+    if (people.length !== 2) {
+      return { ok: false, code: 'sub_bad_cast', error: '对戏要正好两个人（cast 里有 name 的条目）' };
+    }
+    const place = String(scene || '').trim();
+    if (!place) return { ok: false, code: 'sub_empty', error: '没说这一场是什么情况' };
+    const nTurn = Math.max(1, Math.min(10, Math.round(Number(turns) || 4)));
+
+    const ask = async (messages) => {
+      const out = await complete({ messages, tools: [], signal: AbortSignal.timeout(timeout) });
+      if (onUsage && out?.usage) onUsage(out.usage);
+      n += 1;
+      return String(out?.content || '');
+    };
+
+    /* ① 各自成卡。**两个人都不知道对方存在** —— 这是分开的前提。 */
+    const cards = [];
+    for (const p of people) {
+      const body = [
+        `你是 ${p.name}。${p.who || ''}`,
+        `现在的情况：${place}`,
+        '你要面对一个和你利益相反的人，你们谁也说服不了谁。',
+        CARD_FORMAT,
+      ].join('\n');
+      let card = { wants: '', fears: '', leverage: '', ok: false };
+      try {
+        card = parseCard(await ask([
+          { role: 'system', content: ROLES.character.brief },
+          { role: 'user', content: body },
+        ]));
+      } catch { /* 卡没成也继续：下面有兜底话术，总比整场不写强 */ }
+      cards.push(card);
+    }
+
+    /* ② 交替说话。每人只看到：我是谁、我的卡、对方刚说的那句。 */
+    const lines = [];
+    let prev = '';
+    for (let t = 0; t < nTurn; t++) {
+      for (let k = 0; k < 2; k++) {
+        const me = people[k];
+        const card = cards[k];
+        const body = [
+          `你是 ${me.name}。${me.who || ''}`,
+          `现在的情况：${place}`,
+          [
+            card.wants ? `你要的是：${card.wants}` : '',
+            card.fears ? `你怕的是：${card.fears}` : '',
+            card.leverage ? `你手上压他的东西：${card.leverage}` : '',
+          ].filter(Boolean).join('\n'),
+          prev ? `他刚刚说：「${prev}」` : '他站在你面前，还没开口。',
+          SPEAK_FORMAT,
+        ].join('\n');
+        let line = '';
+        try {
+          line = cleanLine(await ask([
+            { role: 'system', content: ROLES.character.brief },
+            { role: 'user', content: body },
+          ]));
+        } catch (e) {
+          return {
+            ok: false, code: 'sub_failed', lines,
+            error: `第 ${t + 1} 轮 ${me.name} 没能开口：${String(e?.message || e)}`,
+          };
+        }
+        /* 空台词不许静默跳过：那会让对手对着空气说话，读起来是两个独白。 */
+        if (!line) {
+          return {
+            ok: false, code: 'sub_silent', lines,
+            error: `第 ${t + 1} 轮 ${me.name} 没说话（空回复）`,
+          };
+        }
+        lines.push({ name: me.name, line });
+        prev = line;
+      }
+    }
+    return { ok: true, lines, cast: people.map((p) => p.name), turns: nTurn };
+  }
+
+  return { run, dialogue, roles: () => Object.keys(ROLES), get calls() { return n; } };
 }

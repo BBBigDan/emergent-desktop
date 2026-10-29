@@ -92,6 +92,8 @@ const T = {
   memory_forget: ['忘掉几条', (a) => cut(a?.q || a?.query, 16)],
   /* 子 agent 那一行要说清"谁在说"：用户需要一眼看出这不是它的结论，是另一个立场。
      `critic` = 挑毛病的人，`advocate` = 替这件事说话的人。 */
+  /* 对戏那一行要说清「两个人在说话」，不是「生成了一段文本」 */
+  dialogue: ['让两个人当面说', (a) => (Array.isArray(a?.cast) ? a.cast.map((c) => c?.name).filter(Boolean).join(' 对 ') : '')],
   sub_run: ['换个立场问', (a) => (a?.role === 'advocate' ? '替它说话的人'
     : a?.role === 'character' ? '扮一个人' : '挑毛病的人')],
   scene_show: ['铺一屏'],

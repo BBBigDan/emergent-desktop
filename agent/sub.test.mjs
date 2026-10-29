@@ -10,7 +10,7 @@
  *      以为方案过关了。
  */
 
-import { createSub, parseVerdict, roleBrief, looksLikeFence, ROLES } from './sub.mjs';
+import { createSub, parseVerdict, roleBrief, looksLikeFence, ROLES, cleanLine } from './sub.mjs';
 
 let failed = 0;
 const ok = (c, l, e = '') => { if (c) console.log('  ✓ ' + l); else { failed++; console.log('  ✗ ' + l + (e ? ` — ${e}` : '')); } };
@@ -79,7 +79,10 @@ console.log('\n扮一个人：声音要分开');
   ok(/不许承认他有道理/.test(c), '不许承认对方有道理');
   ok(/不会说/.test(c), '要求指出"有一类话这人不会说"（声音的边界比形容词有用）');
   ok(/你是：老陈/.test(c), `subject 当"你是"用，不是"审的对象"（${c.split('\n').find((l) => l.includes('老陈'))}）`);
-  ok(/声音：/.test(c), '格式里要它交代说话方式');
+  ok(!/声音：/.test(c), '**格式里没有「声音」**（强模型写成"短句、报数字"，弱模型抄进正文）');
+  ok(/台词：/.test(c), '第一行是「台词」不是「结论」');
+  const lineRow = (c.split('台词：')[1] || '').split('\n')[0] || '';
+  ok(!/[（(]/.test(lineRow), `台词那一行没有括号套括号（${lineRow}）`);
 
   const v = parseVerdict([
     '结论：我没拔。',
@@ -90,7 +93,11 @@ console.log('\n扮一个人：声音要分开');
   ok(/我没拔/.test(v.conclusion), `台词抓到了：${v.conclusion}`);
   ok(v.reasons.length === 3, `要什么/怕什么/筹码三条（${v.reasons.length}）`);
   ok(/只还了两千/.test(v.counter), '对手能戳中的地方也抓到了');
-  ok(/短句/.test(v.voice), `说话方式单独一个字段：${v.voice}`);
+  /* `台词：` 必须和 `结论：` 一样被认出来 —— 7B 看到"结论"会当成正文去解说 */
+  const v2 = parseVerdict(['台词：车你今天开不走', '理由：1) 要活 2) 怕没路 3) 拿车当筹码',
+    '反对：他知道我拖不起'].join('\n'));
+  ok(/开不走/.test(v2.conclusion), `「台词」也当结论解析：${v2.conclusion}`);
+  ok(v2.reasons.length === 3, `理由三条（${v2.reasons.length}）`);
 
   /* 老角色不受影响：critic 的格式里不该出现"声音"这一行 */
   ok(!/声音：/.test(roleBrief('critic')), 'critic 的格式没被改脏');
@@ -150,6 +157,93 @@ const stub = (content, extra = {}) => async (req) => {
   await sub.run({ role: 'critic', task: 'x' });
   ok(got && got.prompt === 100, `用量回传了（${JSON.stringify(got)}）`);
   ok(sub.calls === 1, '数了调用次数');
+}
+
+/* ─────────────────────── ④ 对戏：卡片不出服务端 ─────────────────────── */
+console.log('\n对戏（两个人各自上下文，服务端拼）');
+
+/** 假模型：按 prompt 里出现的东西决定回什么，顺便把每次调用的 prompt 记下来。 */
+function duelStub(lines = ['我没拔。', '那就拖。', '你拖一个坐着的人试试。', '我拖。']) {
+  const seen = [];
+  let i = 0;
+  const complete = async (req) => {
+    const body = req.messages[1].content;
+    seen.push(body);
+    if (/^要什么：一句话$/m.test(body)) {
+      /* 卡片：每人不同，靠 body 里出现的人名区分 */
+      const who = /你是 (\S+?)。/.exec(body)?.[1] || '';
+      return { content: `要什么：${who}要的东西\n怕什么：${who}怕的东西\n筹码：${who}的筹码` };
+    }
+    return { content: lines[i++ % lines.length] };
+  };
+  return { complete, seen };
+}
+
+{
+  const s = duelStub();
+  const sub = createSub({ complete: s.complete });
+  const r = await sub.dialogue({
+    cast: [{ name: '老陈', who: '货车司机' }, { name: '小段', who: '收车人' }],
+    scene: '车贷逾期三个月',
+    turns: 2,
+  });
+  ok(r.ok, `跑通了：${r.lines.length} 条台词`);
+  ok(r.lines.length === 4, `turns=2 → 每人两句（${r.lines.length}）`);
+  ok(r.lines.map((x) => x.name).join(',') === '老陈,小段,老陈,小段', '严格交替');
+  ok(!('wants' in (r.lines[0] || {})), '**台词里没有卡片字段**（只有 name/line）');
+  ok(!/要什么|筹码/.test(JSON.stringify(r)), '整个返回值里都没有卡片内容');
+  ok(s.seen.length === 6, `调用次数 = 2 张卡 + 4 句（${s.seen.length}）`);
+
+  /* 关键隔离：第二个人的第一句，只能看到第一个人的**台词**，看不到他的卡 */
+  const second = s.seen[3] || '';
+  ok(/他刚刚说：「我没拔。」/.test(second), `看得到对方说出口的那句：${second.slice(-60).replace(/\n/g, ' ')}`);
+  ok(!/老陈要的东西|老陈的筹码/.test(second), '**看不到对方的卡**（这就是"体谅"没有机会发生的原因）');
+  ok(/小段的筹码|小段要的东西/.test(second), '看得到自己的卡');
+}
+
+{
+  /* 卡片生成时，两个人互不知道对方存在 */
+  const s = duelStub();
+  const sub = createSub({ complete: s.complete });
+  await sub.dialogue({ cast: [{ name: '甲', who: 'A' }, { name: '乙', who: 'B' }], scene: 'x', turns: 1 });
+  const cardCalls = s.seen.slice(0, 2);
+  ok(!/乙/.test(cardCalls[0]), '做甲的卡时没提乙');
+  ok(!/甲/.test(cardCalls[1]), '做乙的卡时没提甲');
+}
+
+{
+  /* 参数与失败 */
+  const sub = createSub({ complete: duelStub().complete });
+  ok((await sub.dialogue({ cast: [{ name: '甲' }], scene: 'x' })).code === 'sub_bad_cast', '一个人不成戏');
+  ok((await sub.dialogue({ cast: [{ name: '甲' }, { name: '乙' }, { name: '丙' }], scene: 'x' })).code === 'sub_bad_cast', '三个人也不行（只做两个，多给就拒）');
+  ok((await sub.dialogue({ cast: [{ name: '甲' }, { name: '乙' }], scene: '' })).code === 'sub_empty', '没说情况就直说');
+
+  /* 空台词**不许静默跳过**：那会让对手对着空气说话，读起来是两个独白 */
+  const blank = createSub({
+    complete: async (req) => (/^要什么：一句话$/m.test(req.messages[1].content)
+      ? { content: '要什么：x\n怕什么：y\n筹码：z' } : { content: '   ' }),
+  });
+  const r = await blank.dialogue({ cast: [{ name: '甲' }, { name: '乙' }], scene: 'x', turns: 2 });
+  ok(r.ok === false && r.code === 'sub_silent', `空台词报错而不是跳过（${r.code}）`);
+  ok(Array.isArray(r.lines) && r.lines.length === 0, '把已经说出来的部分带回去，不吞掉');
+}
+
+{
+  /* 台词清洗：引号、名字前缀、markdown 都要剥掉 —— 弱模型爱加这些 */
+  const cases = [
+    ['「我没拔。」', '我没拔。'],
+    ['老陈：我没拔。', '我没拔。'],
+    ['台词：我没拔。', '我没拔。'],
+    ['我没拔。\n（他转过身）', '我没拔。'],
+    ['"我没拔。"', '我没拔。'],
+  ];
+  let allOk = true;
+  for (const [inp, want] of cases) {
+    const got = cleanLine(inp);
+    if (got !== want) { allOk = false; console.log(`    cleanLine(${JSON.stringify(inp)}) = ${JSON.stringify(got)}，应为 ${JSON.stringify(want)}`); }
+  }
+  ok(allOk, '台词清洗（引号 / 名字前缀 / 标签 / 旁白 / 英文引号）');
+  ok(cleanLine('') === '', '空的不抛');
 }
 
 console.log(failed ? `\n${failed} 项未通过` : '\n全部通过');

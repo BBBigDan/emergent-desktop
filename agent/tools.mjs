@@ -434,17 +434,93 @@ export function makeTools(o = {}) {
         /* 失败要能分辨：空回复 ≠ 没人反对。混起来主 agent 会以为方案过关了。 */
         return { error: r.error, code: r.code };
       }
+      /* 人物单独一个形状：**只有 `line` 是他的台词**，其余都是给我看的判断。
+         7B 实测会把卡片里的说明抄进正文（"（三个词：真他娘的）"就是这么来的），
+         所以这里用一次性的、各自只干一件事的字段，别让它有机会猜哪部分是内容。 */
+      if (role === 'character') {
+        return {
+          ok: true,
+          role: r.roleZh || r.role,
+          line: r.conclusion,
+          wants: r.reasons?.[0] || '',
+          fears: r.reasons?.[1] || '',
+          leverage: r.reasons?.[2] || '',
+          never_admit: r.counter || '',
+          hint: 'line 是他的台词（可以直接写进对话）；wants/fears/leverage/never_admit 是给你看的，不要抄进正文',
+          fence: r.fence || undefined,
+          ms: r.ms,
+        };
+      }
       return {
         ok: true,
         role: r.roleZh || r.role,
         conclusion: r.conclusion,
         reasons: r.reasons,
         counter: r.counter,
-        /* 人物独有：怎么说话。写戏的人拿不到这个，两个角色就会长成一张嘴。 */
-        voice: r.voice || undefined,
         /* 它自己都中和了的话，标出来 —— 这种结果按"没答"处理，不要拿它当依据 */
         fence: r.fence || undefined,
         ms: r.ms,
+      };
+    },
+  });
+
+  /* ── 两个人对一场戏（卡片不出服务端） ──
+   *
+   * 为什么不复用 sub_run(role=character)：那条路上"写"的还是主模型，而实测
+   * 7B 会把卡片上的字**念成台词**（「（三个词：真他娘的）」、
+   * 「对方最可能戳中他的地方，他知道但绝不会承认：…」）。换一个字段它就换个地方漏 ——
+   * 只要元信息进了主模型，就一定会漏。
+   *
+   * 所以卡片归服务端，回来的只有台词。描述里那句"不要改写"是必须的：
+   * 7B 会把拼好的台词再润色一遍，一润色就又变成同一个人在说话了。
+   */
+  add('dialogue', {
+    level: 'safe',
+    describe: '写一场**两个人当面交锋**的戏：主角和对手各在自己的上下文里说话，'
+      + '系统逐句拼接 —— 他们互相只看得到对方说出口的那句，看不到对方在想什么，'
+      + '所以不会互相体谅、也不会变成同一个人的两个名字。'
+      + '要用的时候：用户要写小说里的对手戏、谈判、对峙、审讯、摊牌。'
+      + '**不需要**你自己先给两个角色做人设（那正是它会糊掉的地方），只要说清'
+      + '「他是谁、这一场是什么情况」，卡片由系统各自去生成。'
+      + '回来的 `lines` 是**纯台词**：原样摆到屏幕上（surface_render 或 scene 的正文），'
+      + '**不要改写、不要润色、不要加旁白和解说** —— 你一改就又成了一个人的声音。',
+    schema: {
+      type: 'object',
+      properties: {
+        cast: {
+          type: 'array',
+          description: '正好两个人：[{"name":"老陈","who":"欠了三个月车贷的货车司机，车是他唯一的生计"},'
+            + '{"name":"小段","who":"公司派来收车的，收不回去他自己要赔"}]',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: '名字（出现在台词前）' },
+              who: { type: 'string', description: '他是谁、他要什么、他怕什么（一句话）' },
+            },
+            required: ['name', 'who'],
+          },
+        },
+        scene: { type: 'string', description: '这一场是什么情况（两个人都知道的公共事实），一句话' },
+        turns: { type: 'number', description: '每人说几句，1~10，默认 4' },
+      },
+      required: ['cast', 'scene'],
+      additionalProperties: false,
+    },
+    run: async ({ cast, scene, turns }) => {
+      if (!sub?.dialogue) return { error: '这个部署里没有对戏能力（agent/sub.mjs 没接上）' };
+      const r = await sub.dialogue({ cast, scene, turns });
+      if (!r.ok) return { error: r.error, code: r.code, lines: r.lines || [] };
+      /* **只给一段成品的正文，不给结构。**
+         7B 拿到 [{name, line}] 会把字段名一起打出来（屏幕上出现 name / 老陈 / 台词）。
+         这已经是同一个错的第三次变形了（卡片字段被念成台词 → 格式说明被抄进正文 →
+         数组结构被照抄上屏）：**它拆不了结构，就照抄结构**。
+         所以这里直接拼成一段话，它没有可拆的东西。 */
+      const script = r.lines.map((x) => x.name + '：' + x.line).join('\n');
+      return {
+        ok: true,
+        script,
+        note: 'script 就是成品。原样上屏，不要改写、不要润色、不要加旁白。',
+        turns: r.turns,
       };
     },
   });
