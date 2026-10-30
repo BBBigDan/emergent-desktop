@@ -235,8 +235,12 @@ console.log('\n⑤ 没为"查能力"多花一次请求');
   /* 一次成功发图**不写成"能看见"**：网关可能把图悄悄丢了而照样回 200，
      所以"能看"只能来自公开资料，不能来自"这次没报错"。 */
   ok(!pos.vis || Object.keys(pos.vis).length === 0, `台账里没多出记录（${JSON.stringify(pos.vis || {})}）`);
-  const reqs = (pos.seen || []).length;
-  ok(reqs === 2, `一轮只发了两次请求：工具调用 + 收口（实际 ${reqs}）`);
+  /* 断言的应该是**形状**，不是总条数：一轮里除了工具调用和收口，还可能有
+     记忆抽取、重试这些与环境有关的请求（CI 上就多过一次）。而"探测"有唯一的形状：
+     **只有一条 user 消息、里面是一张图** —— 正常对话不可能长这样。 */
+  const probeShaped = (pos.seen || []).filter((x) => x.n === 1 && x.images.length);
+  ok(probeShaped.length === 0, `没有任何"单条消息 + 一张图"的探测请求（${probeShaped.length}）`);
+  ok((pos.seen || []).filter((x) => x.images.length).length === 1, '带图的请求只有业务那一次');
 }
 
 /* ── 反面：接口说"不收图" ── */
