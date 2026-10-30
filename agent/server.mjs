@@ -31,7 +31,8 @@ import { createOpenAIModel } from './model.openai.mjs';
    只在 `models.mjs` 里写一次 —— 这里以前也抄了一份，换模型时漏改，
    日志打得像"改了没生效"。 */
 import {
-  DEFAULT_MODEL, catalog, findModel, routeOf, setCustomProviders, _resetCache as resetModelCache,
+  DEFAULT_MODEL, catalog, findModel, routeOf, setCustomProviders, setVisionLookup,
+  _resetCache as resetModelCache,
 } from './models.mjs';
 import { buildSystemPrompt, FORGE_GUIDE, systemPrompt } from './prompt.mjs';
 /* 设置（`settings.json`）：用户在界面上能改的那几件事 —— 额外的接口地址、
@@ -54,6 +55,11 @@ import { createSched, TICK_MS } from './sched.mjs';
 import { createMistakes, looksLikeCorrection } from './mistakes.mjs';
 /* 应用层（roadmap ③）。一个通用执行器 + 一份描述缓存，不按应用写适配器。 */
 import { createApps } from './apps.mjs';
+/* 看图这件事**属于模型**，不属于我们：所以只有"探/记"两件事，没有"支持哪些格式"。 */
+import { createVision, stripImages } from './vision.mjs';
+/* 只为了让 `/api/fs/img` 能把一张图吐给浏览器（图走不了 SSE，也进不了 JSON）。 */
+import { createFs } from './sources/fs.mjs';
+import { sniffImage } from './docs.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -286,6 +292,33 @@ const mistakes = createMistakes({ file: MISTAKES_FILE });
  * 地址的三级解析在 apps.mjs 里，第三级"集群里同名 Service"由这里的 `discover` 兜：
  * 只做一次 DNS 查询，**不做端口扫描** —— 应用装没装是平台知道的事（olares-cli 能查），
  * 端口是它自己 manifest 里写的。猜端口会变成对集群的随机扫描，那不是这个工具该干的事。 */
+/* 给 `/api/fs/img` 用的文件系统实例。它和工具层那两个是同一套代码、同一套
+   越界规则，只是**不需要会话**（浏览器取一张图不该先建对话）。
+   惰性建：FS_ROOT 没配时它就是个 null，路由会回 501，而不是让进程起不来。 */
+let filesHttp = null;
+function fsForHttp() {
+  if (filesHttp !== null) return filesHttp;
+  try {
+    filesHttp = process.env.FS_ROOT ? createFs({ root: process.env.FS_ROOT }) : false;
+  } catch (e) {
+    console.warn('[fs] HTTP 图片通道不可用：' + e.message);
+    filesHttp = false;
+  }
+  return filesHttp;
+}
+
+/* 视觉能力表：不是配置，是我们**观测到的事实**（谁看得见图、什么时候测的）。
+   所以它和 tasks/mistakes 放一起，7 天过期，可以随时重探。 */
+const VISION_FILE = path.resolve(process.env.VISION_FILE || path.join(HERE, 'config', 'vision.json'));
+const vision = createVision({ file: VISION_FILE, warn: (m) => console.warn(m) });
+/* 模型表上那个"看不看得见图"的格子：只认**观测过**的结论，没测过就是 `?`。
+   过期（7 天）就重新显示成 `?` —— 把它当成事实，比显示成未知更容易骗人。 */
+setVisionLookup((id) => {
+  const r = routeOf(id);
+  const k = vision.known(r.model, r.baseURL || '');
+  return k.fresh ? k.vision : null;
+});
+
 const APPS_DIR = path.resolve(process.env.APPS_DIR || path.join(HERE, 'config', 'apps'));
 const apps = createApps({
   dir: APPS_DIR,
@@ -529,6 +562,13 @@ async function getSession(sid) {
         mistakes,
         /* 应用层：通用执行器（app_api / app_act） */
         apps,
+        /* 看图：能力表 + "现在用的是哪个模型"。
+           给闭包而不是值，因为换了模型要重新问一遍 —— 上一张表说的是别的模型。 */
+        vision,
+        visionCtx: () => {
+          const r = routeOf(s.modelId || MODEL_ID);
+          return { model: r.model, baseURL: r.baseURL || '', apiKey: r.apiKey || '' };
+        },
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
         sub: {
@@ -1846,6 +1886,22 @@ async function runTurn(s, goal) {
       }
       recordUsage(s, out, reqMsgs, schemas);
 
+      /* 接口把图退回来了 —— 这是**最硬的证据**（比主动探测硬：真业务路径撞出来的）。
+         三件事：
+           ① 写进能力表，下一次 fs_view 就能在发请求之前说清楚；
+           ② 把历史里的图换成一句文字，否则下一步又发一遍，每一步多一次失败请求；
+           ③ 告诉用户"你看不见图"，别让它装作看过。 */
+      if (out.imageRejected) {
+        const route = routeOf(s.modelId || MODEL_ID);
+        vision.mark(route.model, route.baseURL || '', { vision: false, why: out.imageRejected });
+        const cut = stripImages(s.messages);
+        if (cut.count) s.messages = cut.messages;
+        emit(s, {
+          t: 'note',
+          message: `当前模型不收图片（${out.imageRejected}）—— 图已撤掉，后面只能靠文字`,
+        });
+      }
+
       /* ── 一轮之内的上下文闸 ──
        *
        * 步数不设限之后，吃满窗口的不再是"聊了很多轮"，而是**这一轮干了很多事**：
@@ -2316,6 +2372,13 @@ async function runTurn(s, goal) {
         /* 图只回一句"画好了，多大"：URL 是给前端用的，进上下文只会被模型
            原样念出来（屏幕上就是一串 /api/comfy/img?filename=…）。 */
         const forContext = result?.surface ? { ok: true, shown: 'surface' }
+          /* 看过图：回一句"看过了、多大"，**base64 一个字都不进上下文** ——
+             一张 1MB 的图是 130 万字符，够把任何窗口一次填满。 */
+          : result?.__img ? {
+            ok: true, looked: 'image',
+            width: result.width, height: result.height, mime: result.mime,
+            note: result.note,
+          }
           : result?.closeSurface ? { ok: true, closed: true }
             : result?.image ? { ok: true, drawn: 'image', width: result.image.width, height: result.image.height, seed: result.seed }
               : result?.draw ? { ok: true, drawn: result.draw.stop ? 0 : (result.draw.layers?.length || 0) }
@@ -2326,6 +2389,25 @@ async function runTurn(s, goal) {
           ? JSON.stringify({ ...ctxObj, hint: multi })
           : JSON.stringify(forContext);
         s.messages.push({ role: 'tool', name, tool_call_id: id, content: ctxContent });
+        /* 工具消息的 content 只能是字符串 —— 图塞不进去。
+           所以看图这条路的形状是：工具先回一句"我打开了"，紧接着补一条
+           **带图的 user 消息**。这是整条链路上唯一一处"结构上的谎"：
+           模型看到的是"用户发来一张图"，而其实是它自己刚打开的。
+           所以文字部分必须说明白，否则它会在回答里说"你发的这张图"。
+           另外**它必须是一条独立消息**：把图拼进工具结果里，OpenAI 形状里不存在。 */
+        if (result?.__img && !result.error) {
+          const d = result.__img;
+          s.messages.push({
+            role: 'user',
+            content: [
+              { type: 'text', text: d.question
+                ? `（这是你刚打开的那张图 ${result.path}。你想确认的是：${d.question}）`
+                : `（这是你刚打开的那张图 ${result.path}，看它）` },
+              { type: 'image_url', image_url: { url: d.dataUrl } },
+            ],
+          });
+          s.sawImg = (s.sawImg || 0) + 1;
+        }
         emit(s, { t: 'tool', id, name, state: result?.denied ? 'denied' : result?.error ? 'err' : 'ok', ms: Date.now() - t0, note: summarize(result) });
         /* 结局补到同一行上，而不是再开一行 —— 一行工具 = 一件事+它的下场。
            失败的那行 `note` 通常是"为什么失败"（模型没给参数、参数不是 JSON），
@@ -2751,7 +2833,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|schedule|app_api|app_act|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|fs_extract|fs_view|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|schedule|app_api|app_act|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：
@@ -3140,6 +3222,45 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  /* 用户空间里的一张图。和 `/api/comfy/img` 是同一个理由：**浏览器不直连文件系统**。
+   *
+   * 为什么需要它：`fs_view` 让模型看的那张图，用户也得看见 ——
+   * 否则它说"图里是只猫"，用户没有办法判断它看的是哪张图（更没法判断它在胡编）。
+   * 所以事件里带一个 URL，图由服务端取字节吐出去。
+   *
+   * 边界照旧：只认 `files.bytes`（它内部会做越界检查和 24MB 上限），
+   * 而且**只吐图片**：`sniffImage` 认不出的字节一律 415 ——
+   * 这个口子如果什么都能下，它就是一个"读用户空间任意文件"的下载器。 */
+  if (p === '/api/fs/img' && req.method === 'GET') {
+    const fsmod = fsForHttp();
+    if (!fsmod) {
+      res.writeHead(501, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '没挂用户目录，取不到图' }));
+      return;
+    }
+    const want = u.searchParams.get('path') || '';
+    const r = await fsmod.bytes(want, { maxBytes: 24 * 1024 * 1024 }).catch((e) => ({ error: String(e.message || e) }));
+    if (r.error) {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: r.error }));
+      return;
+    }
+    const info = sniffImage(r.buf);
+    if (!info) {
+      res.writeHead(415, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '不是图片' }));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': info.mime,
+      'Content-Length': r.buf.length,
+      /* private：这是用户的文件，别让任何中间层缓存它 */
+      'Cache-Control': 'private, max-age=60',
+    });
+    res.end(r.buf);
+    return;
+  }
+
   if (p === '/api/health' && req.method === 'GET') {
     const hasModel = MODEL_ID === 'mock' || !!process.env.MODEL_KEY;
     const body = {
@@ -3247,6 +3368,36 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ...c, current, busy }));
     } catch (e) {
       res.end(JSON.stringify({ error: String(e?.message || e) }));
+    }
+    return;
+  }
+
+  /* **探一次"这个模型看不看得见图"**。
+   *
+   * 为什么要一个单独的接口：能力是模型的属性，而用户换模型时最想知道的
+   * 就是"它能不能看图"。等它真去开一张图才知道，代价是一整轮对话。
+   * `force=1` 是无视缓存重探（刚充完值、刚换了网关时用）。
+   *
+   * 返回里 `vision` 三态：true / false / **null（不知道）**。
+   * null 是正常结果（比如接口 402、网断了），界面要照实说"没测出来"。 */
+  if (p === '/api/models/vision' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req) || '{}'); } catch { body = {}; }
+    const id = String(body.id || MODEL_ID);
+    const r = routeOf(id);
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    if (r.kind === 'mock') {
+      res.end(JSON.stringify({ id, vision: null, why: '离线桩不联网，测不了' }));
+      return;
+    }
+    try {
+      const out = await vision.check({
+        model: r.model, baseURL: r.baseURL || '', apiKey: r.apiKey || '',
+        force: !!body.force,
+      });
+      res.end(JSON.stringify({ id, model: r.model, ...out }));
+    } catch (e) {
+      res.end(JSON.stringify({ id, vision: null, why: String(e?.message || e) }));
     }
     return;
   }

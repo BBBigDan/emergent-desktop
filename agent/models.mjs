@@ -10,7 +10,11 @@
  *      所以这种模型在表里**可看不可选**；
  *   ③ 多少钱 —— 不知道就写 `null`，界面写"单价未配置"。**绝不填 0**：
  *      "¥0.0000" 和"免费"在屏幕上长得一样，含义完全不同（这条踩过）；
- *   ④ 走哪个接口 —— 本地那几行不过网络，平台那几行要 key。
+ *   ④ 走哪个接口 —— 本地那几行不过网络，平台那几行要 key；
+ *   ⑤ 看不看得见图 —— 这一条**不能按名字猜**（`-VL-` 在名字里也不保证接口收图），
+ *      只认两处观测：Ollama 自己报的 `capabilities`，或者我们真发过一张图
+ *      （探测或业务路径撞出来的，见 `vision.mjs`）。没观测过就是 `null`，
+ *      界面上写 `?` —— 写"能"而其实不能，比不写坏得多。
  *
  * 这些属性**都不靠名字猜**：
  *   · 平台那一列来自 README「换模型这件事」里的实测表（2026-10-23，
@@ -143,6 +147,10 @@ const PLATFORM = [
  * 这样 `models.mjs` 仍然是"纯粹算一张表"的模块，自测不用起服务、不用碰磁盘。
  */
 let CUSTOM = [];
+/* 运行时观测到的视觉能力（由 server 注入）。表本身不读文件 —— 这样
+   `models.mjs` 仍然只是"算一张表"，自测不用起服务、不用碰磁盘。 */
+let VISION_LOOKUP = null;
+export function setVisionLookup(fn) { VISION_LOOKUP = typeof fn === 'function' ? fn : null; }
 export function setCustomProviders(list) {
   CUSTOM = Array.isArray(list) ? list : [];
 }
@@ -231,6 +239,9 @@ async function ollamaCaps(root, model, ms) {
     return {
       think: j.capabilities.includes('thinking'),
       tools: j.capabilities.includes('tools'),
+      /* Ollama 0.6+ 会为多模态模型带上 'vision'。这是**模型自己声明的**，
+         不是我们按名字猜的 —— 所以可以直接用。 */
+      vision: j.capabilities.includes('vision'),
       ctx: Number(j?.model_info?.['*.context_length'] || j?.parameters?.num_ctx || 0) || null,
     };
   } catch { return null; }
@@ -259,6 +270,7 @@ async function probeLocal(ms = 900) {
       org: 'Ollama',
       think: caps ? caps.think : null,
       tools: caps ? caps.tools : null,
+      vision: caps ? caps.vision : null,
       cost: 'local',
       speed: null,
       ctx: caps?.ctx || null,
@@ -321,6 +333,9 @@ function decorate(m, ids, o = {}) {
     org: m.org || org,
     think: m.think ?? null,
     tools: m.tools ?? null,
+    /* `m.vision` 是表里写死的（本地模型来自 Ollama 的声明）；
+       没有就查一次**运行时观测到的**（真发过图才知道）。 */
+    vision: m.vision ?? (VISION_LOOKUP ? VISION_LOOKUP(m.id) : null),
     price: priceOf(m.id),
     cost: m.cost || (priceOf(m.id)?.free ? 'free' : 'unknown'),
     speed: m.speed || null,

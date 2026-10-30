@@ -20,6 +20,9 @@ import {
 } from './scene.schema.mjs';
 import { createK8s } from './sources/k8s.mjs';
 import { createFs } from './sources/fs.mjs';
+/* 文件头识别（PNG/JPEG 多大）。放 docs.mjs 里是因为"读文档"和"读图"
+   共用同一套字节入口，没必要为 30 行再开一个模块。 */
+import { sniffImage, createDocs } from './docs.mjs';
 import { OPS, OP_DOC, ACTS, ACT_DOC } from './olares.mjs';
 
 const GB = 1024 ** 3;
@@ -248,6 +251,10 @@ export function makeTools(o = {}) {
   const mistakes = o.mistakes || null;
   /* 应用层（见 agent/apps.mjs）：**一个通用执行器**，不是每个应用一份适配器。 */
   const apps = o.apps || null;
+  /* 视觉能力（见 agent/vision.mjs）。两个东西：能力表本身，和"当前模型是谁"
+     （换模型之后要重新问一遍，所以给的是闭包不是值）。 */
+  const vision = o.vision || null;
+  const visionCtx = o.visionCtx || null;
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
   const skills = o.skills || null;
@@ -292,6 +299,9 @@ export function makeTools(o = {}) {
   const noFs = () => ({
     error: '这台机器上还没挂用户目录，看不到文件。别猜文件名，直接告诉用户这一块还没接。',
   });
+  /* 文档抽取和文件工具**共用同一个 fs 实例**：不共用的话自己再 createFs 一次，
+     两道越界检查各算各的（而且 `home` 会各解析一次，出错时两边说的路径可能不一样）。 */
+  const docReader = o.docs || (files ? createDocs({ fs: files }) : null);
 
   /* ── Olares 系统层（官方 CLI） ──
    *
@@ -864,6 +874,121 @@ export function makeTools(o = {}) {
     run: async ({ path }) => {
       if (!files) return noFs();
       try { return await files.trash(path); } catch (e) { return { error: String(e.message || e) }; }
+    },
+  });
+
+  /* ── 文档：把字抽出来 ──
+   *
+   * 为什么不是"一律看图"：一份 20 页 PDF 是 20 张图、几万 token，而它要回答的
+   * "违约金多少"只需要其中的字。**能拿字的先拿字**，拿不到字（扫描件）才看图。
+   * 顺序反了的话，每份文档都要付一遍视觉的价钱，而且慢。
+   *
+   * 抽不到字时**不返回半篇乱码**：那比空更坏 —— 模型会把乱码当正文引用。 */
+  add('fs_extract', {
+    level: 'safe',
+    describe: '把文档里的文字读出来：pdf / docx / xlsx / pptx / 公文式 html / 纯文本。'
+      + '用户让你看一份文档（"这份合同违约金多少"、"这表里一共多少钱"）先用它。'
+      + '扫描件或纯图会如实说抽不到，那时才用 fs_view 看图。',
+    schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '文件路径，例如 ~/Documents/合同.pdf' },
+        limit: { type: 'integer', description: '最多回多少字，缺省 80000' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    run: async ({ path, limit }) => {
+      if (!docReader) return { error: '文档抽取没接（没有文件系统）' };
+      const r = await docReader.extract(path, { limit: Math.min(200_000, Number(limit) || 80_000) });
+      return r;
+    },
+  });
+
+  /* ── 图片：让模型自己看 ──
+   *
+   * 这是**能力问题，不是工具问题**：模型看不看得见由它自己决定，我们只能在
+   * 发之前问一次（`vision.check`，结果缓存 7 天），然后：
+   *   · 明确不能看 → 直接说清楚，别让它收到一张它"看不见"的图然后开始编；
+   *   · 明确能看 / 还没测过 → 照发。发出去撞回 400 也算证据，
+   *     服务端会把结论记下来（见 server 里那段 image 守卫）。
+   *
+   * 图同时会摆到屏幕上（`image` 事件）：用户要知道**它在看什么**。
+   * 不给看的话，它说"图里是只猫"，用户没法判断它在看哪张图。
+   */
+  add('fs_view', {
+    level: 'safe',
+    describe: '打开一张图，自己看（图片会同时摆到屏幕上让你知道它在看什么）。'
+      + '照片、截图、扫描件用这个；文档里有字先用 fs_extract，便宜得多。'
+      + '注意：看不看得见取决于当前模型有没有视觉能力，它不行会如实告诉你。',
+    schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '图片路径，例如 ~/Downloads/shot.png' },
+        question: { type: 'string', description: '你想从图里知道什么（可选，会一起问）' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    run: async ({ path, question }) => {
+      if (!files) return noFs();
+      let r;
+      try { r = await files.bytes(path, { maxBytes: 24 * 1024 * 1024 }); } catch (e) {
+        return { error: String(e.message || e) };
+      }
+      if (r.error) return r;
+      const info = sniffImage(r.buf);
+      if (!info) {
+        /* 不是图。这一步必须拦：把 20MB 的 zip 当 data URL 发出去，请求会自己爆掉，
+           而报错信息是"413 请求体过大"—— 看起来像我们的 bug，其实是格式不对。 */
+        return {
+          error: '这不是图片（认不出 PNG/JPEG/GIF/WEBP 文件头）',
+          hint: '文档用 fs_extract；不知道是什么就 fs_read 看前几个字节',
+        };
+      }
+      if (r.buf.length > 3 * 1024 * 1024) {
+        return {
+          error: `图有 ${r.sizeText}，太大了，模型接口一般收不下`,
+          hint: '让用户先缩一下（或截个图），现在这张不整份发',
+        };
+      }
+
+      /* 能力先问一次（`check` 会真的探一下，结果缓存 7 天）。
+         `null` = 不知道（比如接口 402、网断了）—— 不知道也发，但把话说明白，
+         免得它拿到一张"看不见的图"之后开始猜。 */
+      const cap = vision && visionCtx
+        ? await vision.check(visionCtx()).catch((e) => ({ vision: null, why: e.message }))
+        : { vision: null, why: '没接能力探测' };
+      if (cap.vision === false) {
+        return {
+          error: '当前模型看不了图',
+          why: cap.why || '',
+          hint: '要么换一个能看图的模型（模型表里会标），要么让我用 fs_extract 把字抽出来',
+        };
+      }
+
+      const b64 = r.buf.toString('base64');
+      return {
+        ok: true,
+        path: r.path,
+        sizeText: r.sizeText,
+        width: info.width,
+        height: info.height,
+        mime: info.mime,
+        /* 屏幕上要摆的那张（前端自己补 API 前缀） */
+        image: { url: `/api/fs/img?path=${encodeURIComponent(r.path)}`, width: info.width, height: info.height },
+        /* 真正进模型的那张。服务端见到这个字段会把它从上下文里切掉，
+           换成一条带图片的 user 消息 —— 工具结果里塞不进图。 */
+        __img: {
+          dataUrl: `data:${info.mime};base64,${b64}`,
+          mime: info.mime,
+          bytes: r.buf.length,
+          question: String(question || '').slice(0, 300),
+        },
+        note: cap.vision === true
+          ? '图已经交给你看了'
+          : `这个模型能不能看图还没测出来（${cap.why || '没探过'}），你如果看不到就说看不到，别猜`,
+      };
     },
   });
 

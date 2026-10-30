@@ -23,6 +23,9 @@ import { normUsage, estTokens } from './usage.mjs';
    而这个文件只管"怎么说一句话"。两处各写一份的下场踩过：换模型时改了一处、
    漏了这处，线上跑的还是旧的，日志里却打得像"改了没生效"。 */
 import { DEFAULT_MODEL } from './models.mjs';
+/* 「这个接口收不收图」是协议的事，所以撤图这一步放在适配器里：
+   上层拿到的是一个**正常回答**，外加一句 `imageRejected` 的实话。 */
+import { stripImages } from './vision.mjs';
 export { DEFAULT_MODEL };
 
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1';
@@ -119,6 +122,8 @@ export function createOpenAIModel(o = {}) {
        一共试 3 次（等 1s、3s、7s），仍不行就抛一个带 `limited` 的错误，
        让上层说一句人话（"被限流了"），而不是把 429 原文糊到用户脸上。 */
     let limited = 0;
+    /* 这个接口对图片的态度。只记一次 —— 第二次还发图就说明上层没听进去。 */
+    let imageRejected = '';
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const t0 = Date.now();
@@ -170,6 +175,22 @@ export function createOpenAIModel(o = {}) {
             attempt--;
             continue;
           }
+          /* **图被拒了。** 有的模型/网关不收 `image_url`，表现是一个 400，
+             报文里提到 image/vision/content-type。这不是"请求写错了"，
+             是"这个模型看不见" —— 撤掉图再问一次，别让一整轮对话因为一张图断掉。
+             但必须留痕（`imageRejected`）：上层要把它记进能力表，否则下一轮又发一遍，
+             每一步都多一次失败请求。 */
+          if (r.status >= 400 && r.status < 500 && r.status !== 429
+              && /image|vision|multimodal|content[\s_-]?type|不支持.{0,6}图/i.test(detail)) {
+            const cut = stripImages(body.messages);
+            if (cut.count && !imageRejected) {
+              imageRejected = detail.slice(0, 140) || `接口 ${r.status}`;
+              body.messages = cut.messages;
+              console.warn(`[model] 这个接口不收图片（${imageRejected}），撤掉 ${cut.count} 张再试`);
+              attempt--;
+              continue;
+            }
+          }
           /* 4xx（除 429）是请求本身的问题，重试只会重复同一个错误 */
           const retryable = r.status >= 500;
           /* 有一种 4xx 不是"请求写错了"，是**这个模型压根不支持工具**：
@@ -217,6 +238,9 @@ export function createOpenAIModel(o = {}) {
           truncated: j?.choices?.[0]?.finish_reason === 'length',
           usage,
           ms: Date.now() - t0,
+          /* 非空 = 这一轮**本来带了图，被接口拒了**，模型没看见。
+             上层要据此说一句实话，并把它记成"这个模型看不见"。 */
+          ...(imageRejected ? { imageRejected } : {}),
         };
       } catch (e) {
         /* 用户按了停：这不叫失败，别重试、别包装成"模型超时" */

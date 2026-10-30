@@ -254,10 +254,39 @@ export function createFs(o = {}) {
     return { deleted: pretty(f), movedTo: pretty(dest), bytes: st.size, sizeText: fmtSize(st.size), recoverable: true };
   }
 
+  /**
+   * 读原始字节（图片、PDF、docx 这些**不是文本**的东西）。
+   *
+   * 和 `read` 分开而不是加一个 `binary:true` 参数：这两个函数返回的东西
+   * 形状完全不同（一个是能直接进上下文的字符串，一个是必须再解释的字节），
+   * 合成一个的话，调用方总要记得"这次是不是文本"，忘一次就是把 20KB
+   * 乱码塞进模型窗口。
+   *
+   * 上限 24MB：iPhone 一张原图也就这个量级；再大就不该整份读，
+   * 而是应该先缩过（这里不做缩图，因为缩图要解码器，那是另一个依赖）。
+   */
+  async function bytes(p, { maxBytes = 24 * 1024 * 1024 } = {}) {
+    const f = await inner(p);
+    const st = await stat(f);
+    if (!st) return { error: `没有「${pretty(f)}」这个文件` };
+    if (st.isDirectory()) return { error: `「${pretty(f)}」是目录，用 fs_list` };
+    if (st.size > maxBytes) {
+      return { error: `文件 ${fmtSize(st.size)}，超过 ${fmtSize(maxBytes)}，不整份读`, size: st.size, path: pretty(f) };
+    }
+    return { abs: f, path: pretty(f), size: st.size, sizeText: fmtSize(st.size), buf: await fsp.readFile(f) };
+  }
+
+  /* `resolve` 只给需要自己 stat/open 的调用方用（比如文档抽取要按扩展名分派）。
+     它仍然过同一道越界检查 —— 导出 inner 会让这个边界形同虚设。 */
+  async function resolve(p) {
+    const f = await inner(p);
+    return { abs: f, path: pretty(f) };
+  }
+
   return {
     kind: 'fs',
     info: () => `${home}`,
     home: () => home,
-    list, read, search, du, write, move, trash, pretty,
+    list, read, search, du, write, move, trash, bytes, resolve, pretty,
   };
 }

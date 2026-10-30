@@ -39,6 +39,10 @@ function priceText(p) {
 
 const THINK = { true: { v: '1', t: '想', d: '会思考（有 reasoning_content）' }, false: { v: '0', t: '想', d: '不会思考：那栏里只剩动作' }, null: { v: '?', t: '?', d: '没测过' } };
 const TOOLS = { true: { v: '1', t: '工', d: '会调工具' }, false: { v: '0', t: '工', d: '不会调工具 —— agent 用不了它' }, null: { v: '?', t: '?', d: '没测过' } };
+/* 看不看得见图。这一格**必须能显示"?"**：能力是向模型问出来的，
+   没问过就不知道 —— 写成"不会"会让本来能用的模型被当成不能用，
+   写成"会"会让它对着一张看不见的图编故事。 */
+const VISION = { true: { v: '1', t: '图', d: '能看图（发过图，它认出来了）' }, false: { v: '0', t: '图', d: '看不了图：接口不收图片' }, null: { v: '?', t: '?', d: '还没测过（用一次 fs_view 就知道了）' } };
 
 /**
  * @param {{onPick?:(id:string)=>void, onClose?:()=>void}} [o]
@@ -81,7 +85,7 @@ export function createModelPicker(o = {}) {
       c: d.current, b: !!d.busy,
       g: (d.groups || []).map((g) => [g.key, g.label, g.note, g.empty,
         (g.models || []).map((m) => [m.id, m.name, m.org, m.usable, m.why, m.think, m.tools, m.cost,
-          m.price && [m.price.in, m.price.out, !!m.price.free], m.note, m.speed])]),
+          m.price && [m.price.in, m.price.out, !!m.price.free], m.note, m.speed, m.vision])]),
     });
   }
 
@@ -94,7 +98,9 @@ export function createModelPicker(o = {}) {
     if (data?.busy) { foot.textContent = '这一轮还在跑 —— 等它说完再换'; return; }
     const t = m || currentModel();
     if (!t) { foot.textContent = ''; return; }
-    const bits = [t.org, t.note, t.speed ? `实测 ${t.speed}` : '', t.why || ''].filter(Boolean);
+    const bits = [t.org, t.note, t.speed ? `实测 ${t.speed}` : '',
+      t.vision === false ? '看不了图' : t.vision === true ? '能看图' : '',
+      t.why || ''].filter(Boolean);
     foot.textContent = bits.join(' · ');
   }
 
@@ -124,7 +130,7 @@ export function createModelPicker(o = {}) {
         const nm = el('span', 'mn', m.name);
         const org = el('span', 'mo', m.org || '');
         const tags = el('span', 'mtags');
-        for (const [tbl, val] of [[THINK, m.think], [TOOLS, m.tools]]) {
+        for (const [tbl, val] of [[THINK, m.think], [TOOLS, m.tools], [VISION, m.vision]]) {
           const d = tbl[val] || tbl.null;
           const tag = el('span', 'mt', d.t);
           tag.dataset.v = d.v;

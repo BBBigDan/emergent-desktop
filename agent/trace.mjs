@@ -79,6 +79,10 @@ const T = {
   fs_scan: ['扫磁盘', (a) => (a?.path ? tail(a.path) : '整台机器')],
   fs_list: ['看目录', (a) => tail(a?.path || '~')],
   fs_read: ['读文件', (a) => tail(a?.path)],
+  /* 这两句要**分开**：用户得知道它是"读了字"还是"看了图"。
+     "抽不到字所以要去看图"这件事，只有在动词分开时才看得出来。 */
+  fs_extract: ['读文档', (a) => tail(a?.path)],
+  fs_view: ['看了张图', (a) => tail(a?.path)],
   fs_search: ['搜文件', (a) => cut(a?.q || a?.query || a?.pattern, 16)],
   fs_write: ['写文件', (a) => tail(a?.path)],
   fs_move: ['挪文件', (a) => tail(a?.from || a?.src)],
