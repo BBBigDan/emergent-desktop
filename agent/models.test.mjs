@@ -19,6 +19,7 @@ delete process.env.MODEL_CTX;
 process.env.MODEL_LOCAL_BASE = 'http://127.0.0.1:9/v1';
 delete process.env.MODEL_KEY;
 
+import { declaredVision } from './models.mjs';
 import { catalog, findModel, routeOf, priceOf, localBase, DEFAULT_MODEL } from './models.mjs';
 
 let failed = 0;
@@ -119,6 +120,11 @@ console.log('看不看得见图：公开信息，写在表里');
   ok(byId['Qwen/Qwen3-8B']?.vision === false, '纯文本模型标 false，不是 null（查得到的就别写不知道）');
   ok(byId['Qwen/Qwen3.5-9B']?.vision === null, '查不到公开说明的写 null（不许猜）');
   ok(rows.every((m) => m.vision === true || m.vision === false || m.vision === null), '只有三态，没有 undefined');
+  /* 同步查"公开规格"：`fs_view` 发请求之前要用它，而且它**必须压过台账** ——
+     否则一条"某次探出 402"的旧记录会把一个能看图的模型锁掉。 */
+  ok(declaredVision(DEFAULT_MODEL) === true, 'declaredVision(默认) = true');
+  ok(declaredVision('Qwen/Qwen3-8B') === false, 'declaredVision(纯文本) = false');
+  ok(declaredVision('local/qwen3:8b') === null, '本地模型查不到公开规格 → null（交给台账 O(llama) 或直接照发）');
 }
 
 console.log(failed ? `\n${failed} 项没过` : '\n全部通过');

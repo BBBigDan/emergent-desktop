@@ -31,7 +31,7 @@ import { createOpenAIModel } from './model.openai.mjs';
    只在 `models.mjs` 里写一次 —— 这里以前也抄了一份，换模型时漏改，
    日志打得像"改了没生效"。 */
 import {
-  DEFAULT_MODEL, catalog, findModel, routeOf, setCustomProviders, setVisionLookup,
+  DEFAULT_MODEL, catalog, findModel, routeOf, declaredVision, setCustomProviders, setVisionLookup,
   _resetCache as resetModelCache,
 } from './models.mjs';
 import { buildSystemPrompt, FORGE_GUIDE, systemPrompt } from './prompt.mjs';
@@ -567,7 +567,11 @@ async function getSession(sid) {
         vision,
         visionCtx: () => {
           const r = routeOf(s.modelId || MODEL_ID);
-          return { model: r.model, baseURL: r.baseURL || '', apiKey: r.apiKey || '' };
+          return {
+            model: r.model, baseURL: r.baseURL || '', apiKey: r.apiKey || '',
+            /* 公开规格（模型卡）优先；查不到才轮到观测台账。 */
+            declared: declaredVision(s.modelId || MODEL_ID),
+          };
         },
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */

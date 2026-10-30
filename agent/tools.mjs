@@ -960,9 +960,14 @@ export function makeTools(o = {}) {
        * 你自己配的中转站）才是 `null` —— 那种情况**照发**，因为真发一次本来就
        * 是这一轮要做的事，"接口不收图"会作为副作用撞出来（见 server 那段 image 守卫）。
        */
-      const cap = vision && visionCtx
-        ? vision.known(visionCtx().model, visionCtx().baseURL)
-        : { vision: null, why: '没接能力表' };
+      const ctx = visionCtx ? visionCtx() : null;
+      /* 优先级：**公开规格 > 观测台账**。模型卡说能看，就不该被一条
+         "某次探出 402"的旧记录挡住 —— 那会把能用的模型锁掉。
+         两者都没有（本地模型 / 自建网关）才是 null，此时照发。 */
+      const cap = !ctx ? { vision: null, why: '没接能力表' }
+        : ctx.declared !== null && ctx.declared !== undefined
+          ? { vision: ctx.declared, why: '公开资料' }
+          : (vision ? vision.known(ctx.model, ctx.baseURL) : { vision: null, why: '没接能力表' });
       if (cap.vision === false) {
         return {
           error: '当前模型看不了图',

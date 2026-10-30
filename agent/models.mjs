@@ -426,6 +426,19 @@ export async function catalog(o = {}) {
   };
 }
 
+/**
+ * 某个 id 的**公开规格**里"看不看得见图"。同步、不联网、不碰磁盘。
+ *
+ * 为什么单独给一个函数：`fs_view` 要在发请求之前判断一次，而它拿到的只有 id。
+ * 判断的**优先级是公开资料 > 观测台账** —— 模型卡说能看，就不该被一条
+ * "某次探出 402"的旧记录挡住（那会把能用的模型锁掉）。
+ * 本地模型和自定义网关查不到，返回 null（由调用方去看台账 / 直接照发）。
+ */
+export function declaredVision(id) {
+  const e = PLATFORM.find((m) => m.id === String(id || ''));
+  return e && e.vision !== undefined ? e.vision : null;
+}
+
 /** 找到一条（含运行时发现的本地模型）。找不到就是 null —— 调用方必须拒绝切换。 */
 export async function findModel(id) {
   const s = String(id || '');
