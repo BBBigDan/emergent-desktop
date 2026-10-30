@@ -50,6 +50,8 @@ import { createComfy } from './comfy.mjs';
 import { createSub } from './sub.mjs';
 /* 定时任务（roadmap ①）。只管"什么时候该开一轮"，开轮的事在下面 runTurn。 */
 import { createSched, TICK_MS } from './sched.mjs';
+/* 错题本（roadmap ④）。判据是"用户紧接着否定上一句"，不靠模型自省。 */
+import { createMistakes, looksLikeCorrection } from './mistakes.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -271,6 +273,11 @@ const TASKS_FILE = path.resolve(process.env.TASKS_FILE || path.join(HERE, 'confi
    `onFire` 在 `runTurn` 定义之后才接上（见下面的 startSched），
    这里先建出来是因为 `makeTools` 要拿它做工具。 */
 const sched = createSched({ file: TASKS_FILE });
+
+/* 错题本。和任务表同一个目录（`agent/config`）：都是"这台机器的记事"，
+   不属于某段对话。`file` 用环境变量覆盖是为了自测能开在临时目录。 */
+const MISTAKES_FILE = path.resolve(process.env.MISTAKES_FILE || path.join(HERE, 'config', 'mistakes.json'));
+const mistakes = createMistakes({ file: MISTAKES_FILE });
 
 /* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
    反代重启一次，用户看到的就是一片空粒子，刚才那屏和那行结论全没了。
@@ -498,6 +505,8 @@ async function getSession(sid) {
       tools: makeTools({ source: SYS, memory, forge, olares, skills, comfy,
         /* 定时任务：同一个实例给所有会话；`sid` 让工具知道任务记在谁头上。 */
         sched, sid,
+        /* 错题本：`memory_recall` 命中场景时把它排在最前面 */
+        mistakes,
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
         sub: {
@@ -1563,6 +1572,9 @@ async function runTurn(s, goal) {
   s.reasonN = 0;            // 这一轮已经上屏了几条"想"（整轮封顶 8 条，见下面）
   s.reasonSeen = new Set(); // 已经上过屏的那几句（跨步去重）
   s.traced = null;          // 这一轮它有没有把注入的旧事说出来（说了就记下编号）
+  /* 记下上一轮它说的最后一句 —— 下一行就要把 `lastSpoken` 清掉了，
+     而"用户在纠正什么"需要的正是那句话（roadmap ④ 的 wrong 字段）。 */
+  const prevSpoken = s.lastSpoken || '';
   s.lastSpoken = '';
   s.pendingNext = '';     // 上一件工具留下的"下一步"（只用来推模型一把）
   s.forgeStep = false;    // 这一轮有没有动造工具的那几个（决定步数上限，见 MAX_STEPS）
@@ -1580,6 +1592,18 @@ async function runTurn(s, goal) {
     console.warn('[memory] 取上下文失败：' + e.message);
   }
   if (memHits.length) console.log(`[memory] 注入 ${memNote.length} 字，命中 ${memHits.length} 条`);
+
+  /* 错题：同一件事上，用户当场纠正过什么。
+   *
+   * 它排在记忆**前面**（见下面的 ctxNote）：事实说"这台机器装了什么"，
+   * 错题说"你上次在这件事上判断错了"。后者更要紧 —— 记不住事实顶多是重新查一次，
+   * 记不住错误就是当着用户的面再错一次。
+   *
+   * 判据在 mistakes.mjs 里（按具体名字命中，不按语气相似度），这里只管取。 */
+  let misNote = '';
+  if (goal.kind === 'ask') {
+    try { misNote = await mistakes.promptText(goal.text); } catch (e) { console.warn('[mistakes] ' + e.message); }
+  }
 
   /* 事实种子的原料：**最近发生的事**，不是这一问的命中。
      这一步也是漂移唯一可能失败的地方 —— 记忆库空的时候它没什么可说的，
@@ -1625,7 +1649,7 @@ async function runTurn(s, goal) {
   /* 身份段在**每次请求**里都出现（它是"你是谁"，不是"这轮用得上什么"）；
      漂移段只在真的抽到东西时才出现。两段都走 ctxNote，不写进历史 ——
      写进历史的话，同一句话会在每一轮的上下文里留一份副本。 */
-  const ctxNote = [persona.promptText(), memNote, driftNote.text, skillNote, guideNote]
+  const ctxNote = [misNote, persona.promptText(), memNote, driftNote.text, skillNote, guideNote]
     .filter(Boolean).join('\n\n');
 
 
@@ -1657,6 +1681,28 @@ async function runTurn(s, goal) {
     /* 手势也进记录，但它不是"一句话" —— 前端按另一种笔调排（更暗、前缀是括号） */
     hear(s, line, 'i');
     emit(s, { t: 'turn', round: s.turn, kind: 'intent', intent: it });
+  }
+
+  /* 错题的注入也要说出来。不说的话，用户看不到"它记得我纠正过"，
+     下一次它不再犯错时，用户只会觉得"这次运气好"。 */
+  if (misNote) trace(s, 'note', { text: '想起上次的纠正', detail: cut(goal.text, 16), tone: 'mem' });
+
+  /* 用户在纠正上一句吗 —— 记一条错题。
+   *
+   * 判据是**句式**（"不对/我说的是/你弄错了"打头），不是模型自省：
+   * 让模型自己判断"我刚说错了吗"，它要么说没错，要么把没说的也认了。
+   *
+   * 只在"上一轮真的说过话"时记（prevSpoken 非空）：
+   * 没有上一句时，"不对"可能是在否定别的东西，记下来就是一条假错题 ——
+   * 而假错题每轮都会跳出来道歉，比不记更糟。 */
+  if (goal.kind === 'ask' && prevSpoken && looksLikeCorrection(goal.text)) {
+    mistakes.add({ wrong: prevSpoken, right: goal.text })
+      .then((e) => {
+        if (!e) return;
+        const twice = e.repeat > 0 ? `（这个坑第 ${e.repeat + 1} 次了）` : '';
+        trace(s, 'note', { text: '记下了这条纠正' + twice, detail: cut(goal.text, 16), tone: 'mem' });
+      })
+      .catch(() => {});
   }
 
   /* 记忆命中要说出来。不说的后果是：模型忽然提起三周前的事，
@@ -3299,6 +3345,16 @@ try {
   console.warn('[sched] 任务表读不出来：' + e.message);
 }
 startSched();
+
+/* 错题本。读不出来不致命（按空表处理，留一条 warn）——
+   一个坏文件不该让 agent 起不来，但"没有错题"这件事不能悄悄变成"没有检查"。 */
+try {
+  const n = await mistakes.init();
+  const st = await mistakes.stats();
+  if (n) console.log(`[mistakes] ${n} 条错题（有效 ${st.fresh}，重复踩过 ${st.repeated}）`);
+} catch (e) {
+  console.warn('[mistakes] 读不出来：' + e.message);
+}
 
 /* 绑哪个地址。默认是 Node 的老行为（不带 host = `::`/0.0.0.0 双栈），
    pod 里要的就是这个 —— 只绑 127.0.0.1 的话 k8s 的探针和 Service 都进不来。

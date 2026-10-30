@@ -244,6 +244,8 @@ export function makeTools(o = {}) {
      `sid` 用来把任务记在"谁挂的"上面：到点自动开的是**这个会话**的一轮。 */
   const sched = o.sched || null;
   const sid = o.sid || '';
+  /* 错题本（见 agent/mistakes.mjs）：用户当场纠正过的判断。 */
+  const mistakes = o.mistakes || null;
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
   const skills = o.skills || null;
@@ -959,11 +961,16 @@ export function makeTools(o = {}) {
     run: async ({ query, k } = {}) => {
       if (!memory) return noMem();
       const n = Math.min(8, Math.max(1, Number(k) || 5));
+      /* 错题先出去：同一件事上"用户纠正过我什么"比"我记得什么"更要紧 ——
+         事实记错了顶多再查一次，判断错过的会当着用户的面再错一次。
+         这条不依赖记忆侧车（它有自己的文件），所以记忆关着时它也还能用。 */
+      const bad = mistakes ? await mistakes.recall(String(query || '')).catch(() => []) : [];
       const r = await memory.recall(String(query || ''), n);
-      if (!r.facts.length) return { ok: true, found: 0, note: '记忆里没有相关的东西。不要编。' };
+      if (!r.facts.length && !bad.length) return { ok: true, found: 0, note: '记忆里没有相关的东西。不要编。' };
       return {
         ok: true,
         found: r.facts.length,
+        ...(bad.length ? { mistakes: bad } : {}),
         facts: r.facts.map((f) => ({ text: f.text, when: f.when, about: f.about })),
       };
     },
