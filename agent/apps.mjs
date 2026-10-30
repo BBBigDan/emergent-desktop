@@ -170,13 +170,13 @@ export function createApps({ dir, env = process.env, fetchImpl = fetch, discover
   }
 
   /** 换票：结果按 app 缓存，过期时间取响应里的 max-age，拿不到就给 30 分钟 */
-  async function ticket(app, d) {
+  async function ticket(app, d, baseGiven = '') {
     const auth = d.auth || {};
     const key = `${app}:${auth.scheme}`;
     const hit = tickets.get(key);
     if (hit && hit.until > Date.now()) return hit;
 
-    const base = await baseOf(app);
+    const base = baseGiven || await baseOf(app);
     if (!base) throw new Error(`不知道 ${app} 在哪：配 APP_${envName(app)}_URL，或先 probe 一次`);
     const { tok, user, pass } = credOf(app, d);
 
@@ -239,10 +239,11 @@ export function createApps({ dir, env = process.env, fetchImpl = fetch, discover
     return null;
   }
 
-  /** 发一次请求。`write` 只影响调用方（工具层）的审批，这里不区分。 */
-  async function call(app, { method = 'GET', path: p = '/', query = null, body = null, headers = null } = {}) {
+  /** 发一次请求。`write` 只影响调用方（工具层）的审批，这里不区分。
+   *  `base` 是给 probe 验描述用的覆盖值 —— 那时描述还没落盘，解析不到地址。 */
+  async function call(app, { method = 'GET', path: p = '/', query = null, body = null, headers = null, base: baseOverride = '' } = {}) {
     const d = await descOf(app);
-    const base = await baseOf(app);
+    const base = baseOverride || await baseOf(app);
     if (!base) {
       return {
         ok: false, code: 'no_base',
@@ -256,7 +257,7 @@ export function createApps({ dir, env = process.env, fetchImpl = fetch, discover
 
     const h = { 'user-agent': 'emergent-agent/1.0 (+olares)', accept: 'application/json, text/plain;q=0.8' };
     let t = null;
-    try { t = await ticket(app, d); } catch (e) { return { ok: false, code: 'auth_setup', error: e.message }; }
+    try { t = await ticket(app, d, base); } catch (e) { return { ok: false, code: 'auth_setup', error: e.message }; }
     /* 凭据由服务端注入。`header` 方案里 value 就是整个头的值
        （X-Api-Key 是裸 token，Basic 是 "Basic base64(...)"）—— 不在调用方拼。 */
     if (t?.header) h[t.header] = t.value;
@@ -404,18 +405,24 @@ export function createApps({ dir, env = process.env, fetchImpl = fetch, discover
     if (report.doc) report.suggestions.push({ kind: 'doc', path: report.doc.path, note: '把 doc.path 写进描述，模型就能直接选 op' });
     if (report.needsAuth) report.suggestions.push({ kind: 'auth', note: '根路径要认证：先确认是 header token、Basic，还是表单登录换 cookie' });
 
-    /* ④ 落盘之前验一次：能不能真的用这份描述调到东西 */
-    if (report.doc) {
-      const d = { base, auth: { scheme: report.needsAuth ? 'header' : 'none' }, doc: { path: report.doc.path, note: report.doc.title } };
-      const test = await call(app, { method: 'GET', path: '/' });
-      if (test.ok) {
-        await writeDesc(app, d);
-        report.saved = true;
-      } else {
-        /* 验不过就只给建议、不落盘：错的描述比没有描述更坏 */
-        report.saved = false;
-        report.why = `描述没落盘：拿它试了一次 ${test.status || ''} ${test.error || ''}`.trim();
-      }
+    /* ④ 落盘之前验一次：能不能真的用这份描述调到东西。
+     *    有文档时打文档路径；没文档的打根路径 —— 200/3xx 说明"地址对、能说话"，
+     *    401/403 也算对（地址是对的，只是要认证）。**验不过就不落盘**：
+     *    一份错的描述比没有描述更坏，它会让下一次调用莫名其妙地 404。 */
+    const d = {
+      base,
+      auth: { scheme: report.needsAuth ? 'header' : 'none' },
+      ...(report.doc ? { doc: { path: report.doc.path, note: report.doc.title } } : {}),
+    };
+    const test = await call(app, { method: 'GET', path: '/', base });
+    const good = (test.ok || [401, 403].includes(test.status));
+    if (good) {
+      await writeDesc(app, d);
+      report.saved = true;
+      if (!report.doc) report.note = '没有 OpenAPI：描述只记了地址（和"需要认证"这件事），接口得自己试';
+    } else {
+      report.saved = false;
+      report.why = `描述没落盘：拿它试了一次 ${test.status || ''} ${test.error || ''}`.trim();
     }
     return report;
   }

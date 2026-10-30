@@ -238,8 +238,30 @@ console.log('\n⑨ probe：发现文档 + 登录端点，能验证才落盘');
   ok(file.base === BASE && file.doc?.path === '/openapi.json', '落盘的内容是地址 + 文档位置');
 }
 
-console.log('\n⑩ list：知道"接了哪些应用"');
+console.log('\n⑨b 没有 OpenAPI 的应用也要能接（只记地址 + 需不需要认证）');
 {
+  /* 真实世界里大多数自建应用**没有** OpenAPI（ComfyUI 就是一个）。
+     这时候 probe 不能空手而归 —— 它至少要能把地址记下来，并说清"没有文档"。 */
+  const bare = http.createServer((req, res) => {
+    res.writeHead(req.url === '/' ? 200 : 404, { 'content-type': 'text/html' });
+    res.end(req.url === '/' ? '<title>Bare</title><body>ok</body>' : 'no');
+  });
+  const bp = port + 1;
+  await new Promise((r) => bare.listen(bp, '127.0.0.1', r));
+  const { a, dir } = await mk();
+  const rep = await a.probe('bare', { base: `http://127.0.0.1:${bp}` });
+  ok(rep.ok && rep.reachable, '连得上');
+  ok(rep.doc === null, '确实没有文档');
+  ok(rep.saved === true, '仍然落盘（地址本身就是有用的信息）');
+  ok(/没有 OpenAPI/.test(rep.note || ''), `说清了没有文档（${(rep.note || '').slice(0, 20)}…）`);
+  const f = JSON.parse(await fs.readFile(path.join(dir, 'bare.json'), 'utf8'));
+  ok(f.base.includes(String(bp)) && !f.doc, '描述里只有地址，没有编出来的文档位置');
+  const got = await a.call('bare', { path: '/' });
+  ok(got.ok, '之后能用这份描述直接调');
+  bare.close();
+}
+
+console.log('\n⑩ list：知道"接了哪些应用"');{
   const { a } = await mk({}, { demo: { base: BASE, auth: { scheme: 'none' } } });
   const list = await a.list();
   ok(list.some((x) => x.app === 'demo' && x.auth === 'none'), '描述里的应用在列表里');
