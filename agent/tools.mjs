@@ -246,6 +246,8 @@ export function makeTools(o = {}) {
   const sid = o.sid || '';
   /* 错题本（见 agent/mistakes.mjs）：用户当场纠正过的判断。 */
   const mistakes = o.mistakes || null;
+  /* 应用层（见 agent/apps.mjs）：**一个通用执行器**，不是每个应用一份适配器。 */
+  const apps = o.apps || null;
   /* 官方技能包（见 agent/skills.mjs）。名字表是异步索引，启动时由 server 预热；
      没预热到时 schema 里退化成只有一个名字 —— 模型不会因此调到空东西。 */
   const skills = o.skills || null;
@@ -1638,6 +1640,79 @@ export function makeTools(o = {}) {
       if (o === 'pause') return sched.pause(id, true);
       if (o === 'resume') return sched.pause(id, false);
       return { ok: false, error: `不认识的 op：${op}。用 add / list / cancel / pause / resume。` };
+    },
+  });
+
+  /* ── 应用层：一个通用执行器 ──
+   *
+   * **不按应用写适配器**（用户 2026-10-30：「给每个应用都单独写的话这个需求就爆炸了」）。
+   * 通用的部分是地址、认证、发请求这三件事；应用之间的差别压缩成**一行描述**
+   * （`apps/<name>.json`），由 `probe` 现探或用户手写。
+   *
+   * 读写分成两个工具，因为审批门按**工具名**判 level：
+   * `app_api` 只 GET（safe，随时能用）；`app_act` 会改世界（danger，必须点同意）。
+   */
+  add('app_api', {
+    level: 'safe',
+    describe: '查这台机器上某个应用的 API（只读）。三种用法：'
+      + 'op=list 看现在知道哪些应用；op=probe 探一个应用（给它一个内网地址，'
+      + '会自动找 OpenAPI 文档和登录端点，能验通就把描述存下来）；'
+      + 'op=get 调一次 GET（要 app 和 path）。'
+      + '**不要按应用背路径**：先 probe，或者 op=get 打它的文档路径把接口读回来。'
+      + '认证由服务端从 Secret 里取，你不用管也拿不到。',
+    schema: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', enum: ['list', 'probe', 'get'] },
+        app: { type: 'string', description: '应用名（小写，例如 qbittorrent / jellyfin）' },
+        base: { type: 'string', description: 'probe 时的地址，例如 http://qbittorrent:8080' },
+        path: { type: 'string', description: '相对路径，例如 /api/v2/app/version' },
+        query: { type: 'object', description: '查询参数（可选）' },
+      },
+      required: ['op'],
+      additionalProperties: false,
+    },
+    run: async ({ op, app, base, path: p, query } = {}) => {
+      if (!apps) return { error: '应用层没挂上（服务端没注入 apps）' };
+      const o = String(op || '').toLowerCase();
+      if (o === 'list') {
+        const list = await apps.list();
+        return { ok: true, apps: list, note: list.length ? '' : '还没有接任何应用。先 probe 一个。' };
+      }
+      if (o === 'probe') {
+        if (!app) return { error: 'probe 要给应用名' };
+        return apps.probe(String(app).toLowerCase(), base ? { base: String(base) } : {});
+      }
+      if (o === 'get') {
+        if (!app || !p) return { error: 'get 要给 app 和 path' };
+        return apps.call(String(app).toLowerCase(), { method: 'GET', path: String(p), query: query || null });
+      }
+      return { error: `不认识的 op：${op}。用 list / probe / get。` };
+    },
+  });
+
+  add('app_act', {
+    level: 'danger',
+    describe: '**改**某个应用里的东西（POST/PUT/PATCH/DELETE）。会弹审批，用户同意才执行。'
+      + 'path 必须是相对路径，body 直接给对象。'
+      + '先用 app_api 的 probe / get 把接口和参数搞清楚再动 —— 改错了要人去收拾。',
+    schema: {
+      type: 'object',
+      properties: {
+        app: { type: 'string', description: '应用名（小写）' },
+        method: { type: 'string', enum: ['POST', 'PUT', 'PATCH', 'DELETE'] },
+        path: { type: 'string', description: '相对路径，例如 /api/v2/torrents/stop' },
+        query: { type: 'object' },
+        body: { type: 'object', description: '请求体（对象；表单接口自己拼字符串）' },
+      },
+      required: ['app', 'method', 'path'],
+      additionalProperties: false,
+    },
+    run: async ({ app, method, path: p, query, body } = {}) => {
+      if (!apps) return { error: '应用层没挂上（服务端没注入 apps）' };
+      const m = String(method || '').toUpperCase();
+      if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(m)) return { error: `app_act 只做写操作，${method} 用 app_api` };
+      return apps.call(String(app).toLowerCase(), { method: m, path: String(p), query: query || null, body: body ?? null });
     },
   });
 

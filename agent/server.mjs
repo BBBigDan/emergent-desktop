@@ -52,6 +52,8 @@ import { createSub } from './sub.mjs';
 import { createSched, TICK_MS } from './sched.mjs';
 /* 错题本（roadmap ④）。判据是"用户紧接着否定上一句"，不靠模型自省。 */
 import { createMistakes, looksLikeCorrection } from './mistakes.mjs';
+/* 应用层（roadmap ③）。一个通用执行器 + 一份描述缓存，不按应用写适配器。 */
+import { createApps } from './apps.mjs';
 import { createSkills } from './skills.mjs';
 import { cleanSpeech } from './speech.mjs';
 import { toolLine, cut, reasonLines, alike } from './trace.mjs';
@@ -278,6 +280,24 @@ const sched = createSched({ file: TASKS_FILE });
    不属于某段对话。`file` 用环境变量覆盖是为了自测能开在临时目录。 */
 const MISTAKES_FILE = path.resolve(process.env.MISTAKES_FILE || path.join(HERE, 'config', 'mistakes.json'));
 const mistakes = createMistakes({ file: MISTAKES_FILE });
+
+/* 应用层。描述存 `agent/config/apps/<name>.json`（和 settings/tasks/mistakes 一起挂着）。
+ *
+ * 地址的三级解析在 apps.mjs 里，第三级"集群里同名 Service"由这里的 `discover` 兜：
+ * 只做一次 DNS 查询，**不做端口扫描** —— 应用装没装是平台知道的事（olares-cli 能查），
+ * 端口是它自己 manifest 里写的。猜端口会变成对集群的随机扫描，那不是这个工具该干的事。 */
+const APPS_DIR = path.resolve(process.env.APPS_DIR || path.join(HERE, 'config', 'apps'));
+const apps = createApps({
+  dir: APPS_DIR,
+  discover: async (name) => {
+    if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(name)) return '';
+    try {
+      const { lookup } = await import('node:dns/promises');
+      const r = await lookup(name, { all: false });
+      return r?.address ? `http://${name}` : '';
+    } catch { return ''; }
+  },
+});
 
 /* 会话落盘。为什么需要：这套界面的状态几乎全在"场"里 —— 刷新一下、
    反代重启一次，用户看到的就是一片空粒子，刚才那屏和那行结论全没了。
@@ -507,6 +527,8 @@ async function getSession(sid) {
         sched, sid,
         /* 错题本：`memory_recall` 命中场景时把它排在最前面 */
         mistakes,
+        /* 应用层：通用执行器（app_api / app_act） */
+        apps,
         /* 子 agent 的出口：闭包引用 `s`，所以拿的是**这个会话当前**的模型
            （换模型之后子 agent 也跟着换，见 runSubFor 的注释）。 */
         sub: {
@@ -2729,7 +2751,7 @@ const safeJSON = (v) => {
    只认行首、且括注 ≤8 字，正常的括号说明（"（这台机器上）"）不会中枪。 */
 const HEAD_TAG = /^[[{【〔（(]\s*[^\]}】〕）)]{1,8}\s*[\]}】〕）)]/;
 
-const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|schedule|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
+const TOOL_WORDS = /(sys_status|app_list|olares_act|olares|skill_use|tool_write|tool_code|tool_try|tool_keep|tool_list|skill_save|memory_recall|memory_stats|memory_forget|fs_scan|logs_tail|mem_trim|fs_move|comfy|sub_run|dialogue|schedule|app_api|app_act|scene_show|scene_ask|scene_set|scene_patch|scene_pulse|scene_transition)/;
 /* 复述输入、复述用户意图、复述自己的计划 —— 都是旁白。
    实测原话："[手势] 把「内存」从 65% 拖到 34% 表示用户想把内存占用压低。我们先确……" */
 /* 这几类话都不是"给用户看的一行"，是模型在自言自语：
