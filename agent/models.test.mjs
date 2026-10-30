@@ -108,5 +108,18 @@ console.log('本地那一组：探测不到也要能看');
   ok(g.models.length === 1 && g.models[0].id === 'mock', '只剩 mock');
 }
 
+console.log('看不看得见图：公开信息，写在表里');
+{
+  const rows = cat.groups.flatMap((g) => g.models).filter((m) => m.id !== 'mock');
+  const byId = Object.fromEntries(rows.map((m) => [m.id, m]));
+  /* 默认那个是原生的多模态（模型卡写明带 DeepSeek-ViT）—— 所以**它自己就能看图**，
+     不需要为这件事再配一个视觉模型，也不需要发请求去试。 */
+  ok(byId[DEFAULT_MODEL]?.vision === true, `${DEFAULT_MODEL} 标着能看图`);
+  ok(/模型卡/.test(byId[DEFAULT_MODEL]?.visionWhy || ''), `带出处（${byId[DEFAULT_MODEL]?.visionWhy}）`);
+  ok(byId['Qwen/Qwen3-8B']?.vision === false, '纯文本模型标 false，不是 null（查得到的就别写不知道）');
+  ok(byId['Qwen/Qwen3.5-9B']?.vision === null, '查不到公开说明的写 null（不许猜）');
+  ok(rows.every((m) => m.vision === true || m.vision === false || m.vision === null), '只有三态，没有 undefined');
+}
+
 console.log(failed ? `\n${failed} 项没过` : '\n全部通过');
 process.exit(failed ? 1 : 0);

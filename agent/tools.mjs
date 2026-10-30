@@ -953,12 +953,16 @@ export function makeTools(o = {}) {
         };
       }
 
-      /* 能力先问一次（`check` 会真的探一下，结果缓存 7 天）。
-         `null` = 不知道（比如接口 402、网断了）—— 不知道也发，但把话说明白，
-         免得它拿到一张"看不见的图"之后开始猜。 */
+      /* 能力**查表**，不试探。
+       *
+       * 为什么：能不能看图是模型的公开规格（模型卡上写着原生多模态就是能看），
+       * 花一次请求去确认一件查得到的事，是白花钱也白等。表里没有的（本地模型、
+       * 你自己配的中转站）才是 `null` —— 那种情况**照发**，因为真发一次本来就
+       * 是这一轮要做的事，"接口不收图"会作为副作用撞出来（见 server 那段 image 守卫）。
+       */
       const cap = vision && visionCtx
-        ? await vision.check(visionCtx()).catch((e) => ({ vision: null, why: e.message }))
-        : { vision: null, why: '没接能力探测' };
+        ? vision.known(visionCtx().model, visionCtx().baseURL)
+        : { vision: null, why: '没接能力表' };
       if (cap.vision === false) {
         return {
           error: '当前模型看不了图',
@@ -987,7 +991,7 @@ export function makeTools(o = {}) {
         },
         note: cap.vision === true
           ? '图已经交给你看了'
-          : `这个模型能不能看图还没测出来（${cap.why || '没探过'}），你如果看不到就说看不到，别猜`,
+          : `这个模型的看图能力表里没有（${cap.why || '查不到'}），你如果看不到就说看不到，别猜`,
       };
     },
   });

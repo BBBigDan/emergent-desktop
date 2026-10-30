@@ -134,7 +134,9 @@ export function createModelPicker(o = {}) {
           const d = tbl[val] || tbl.null;
           const tag = el('span', 'mt', d.t);
           tag.dataset.v = d.v;
-          tag.title = d.d;
+          /* "图"这一格要说出来处：模型卡写的、Ollama 自报的、还是真发图撞出来的。
+             "为什么说它能看图"必须能回答 —— 否则这个标签就是在替用户下结论。 */
+          tag.title = tbl === VISION && m.visionWhy ? `${d.d}（${m.visionWhy}）` : d.d;
           tags.appendChild(tag);
         }
         const pr = el('span', 'mpr', priceText(m.price));

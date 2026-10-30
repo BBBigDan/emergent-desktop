@@ -11,10 +11,12 @@
  *   ③ 多少钱 —— 不知道就写 `null`，界面写"单价未配置"。**绝不填 0**：
  *      "¥0.0000" 和"免费"在屏幕上长得一样，含义完全不同（这条踩过）；
  *   ④ 走哪个接口 —— 本地那几行不过网络，平台那几行要 key；
- *   ⑤ 看不看得见图 —— 这一条**不能按名字猜**（`-VL-` 在名字里也不保证接口收图），
- *      只认两处观测：Ollama 自己报的 `capabilities`，或者我们真发过一张图
- *      （探测或业务路径撞出来的，见 `vision.mjs`）。没观测过就是 `null`，
- *      界面上写 `?` —— 写"能"而其实不能，比不写坏得多。
+ *   ⑤ 看不看得见图 —— **这是公开信息**：模型卡上写着原生多模态就是能看，
+ *      文本模型就是不能看。所以这一列像 `think`/`tools` 一样是**手写的**，
+ *      `visionSrc` 记着出处（哪天模型换了代，要能回头核对）。
+ *      只有两种情况下它会变成"运行时观测"：本地模型（Ollama 自报 capabilities）
+ *      和自定义网关（公开资料管不到别人家的中转站）。**不为这件事发试探请求** ——
+ *      能查到的东西不值得花钱问。
  *
  * 这些属性**都不靠名字猜**：
  *   · 平台那一列来自 README「换模型这件事」里的实测表（2026-10-23，
@@ -58,13 +60,19 @@ const PLATFORM = [
     id: DEFAULT_MODEL,
     think: true,
     tools: true,
+    /* 原生多模态：模型卡写明是 multimodal MoE，带 DeepSeek-ViT 视觉编码器，
+       图像与文本一起进、文本出。所以**默认模型就能看图**，不用另配视觉模型。 */
+    vision: true,
+    visionSrc: '模型卡：原生多模态（DeepSeek-ViT）',
     cost: 'paid',
     speed: '3~6s/步',
     tag: '默认',
-    note: '会想、工具稳；按量计费，本机没配单价',
+    note: '会想、工具稳、能看图；按量计费，本机没配单价',
   },
   {
     id: 'Qwen/Qwen3-8B',
+    vision: false,
+    visionSrc: '文本模型，没有视觉编码器',
     think: true,
     tools: true,
     cost: 'free',
@@ -73,6 +81,8 @@ const PLATFORM = [
   },
   {
     id: 'Qwen/Qwen2.5-7B-Instruct',
+    vision: false,
+    visionSrc: '文本模型，没有视觉编码器',
     think: false,
     tools: true,
     cost: 'free',
@@ -81,6 +91,8 @@ const PLATFORM = [
   },
   {
     id: 'THUDM/GLM-Z1-9B-0414',
+    vision: false,
+    visionSrc: '文本模型，没有视觉编码器',
     think: true,
     tools: true,
     cost: 'free',
@@ -89,6 +101,8 @@ const PLATFORM = [
   },
   {
     id: 'THUDM/GLM-4-9B-0414',
+    vision: false,
+    visionSrc: '文本模型，没有视觉编码器',
     think: false,
     tools: true,
     cost: 'free',
@@ -97,6 +111,9 @@ const PLATFORM = [
   },
   {
     id: 'Qwen/Qwen3.5-9B',
+    /* 没查到公开的模态说明。**不知道就写不知道** —— 写"能看"会让它对着一张
+       看不见的图编故事；写"不能看"会把一个可能能用的模型挡在门外。 */
+    vision: null,
     think: true,
     tools: true,
     cost: 'free',
@@ -105,6 +122,7 @@ const PLATFORM = [
   },
   {
     id: 'XingChenAGI/Xing4.0-29B',
+    vision: null,
     think: true,
     tools: true,
     cost: 'free',
@@ -116,6 +134,8 @@ const PLATFORM = [
        删掉的话，用户在别处听说 R1 免费又能想，只会觉得这张表漏了东西；
        留在表里并且写明原因，才是回答了那个问题。 */
     id: 'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
+    vision: false,
+    visionSrc: 'R1 系列是纯文本推理模型',
     think: true,
     tools: false,
     cost: 'free',
@@ -125,6 +145,7 @@ const PLATFORM = [
   },
   {
     id: 'Qwen/Qwen3.5-4B',
+    vision: null,
     think: true,
     tools: false,
     cost: 'free',
@@ -336,6 +357,11 @@ function decorate(m, ids, o = {}) {
     /* `m.vision` 是表里写死的（本地模型来自 Ollama 的声明）；
        没有就查一次**运行时观测到的**（真发过图才知道）。 */
     vision: m.vision ?? (VISION_LOOKUP ? VISION_LOOKUP(m.id) : null),
+    /* 这个判断是从哪来的（模型卡 / Ollama 自报 / 真发图撞出来的）。
+       界面上悬停能看到 —— "为什么说它能看图"必须能回答。 */
+    visionWhy: m.visionSrc || (VISION_LOOKUP && VISION_LOOKUP(m.id) !== null
+      ? '实测：发过图，接口接了'
+      : null),
     price: priceOf(m.id),
     cost: m.cost || (priceOf(m.id)?.free ? 'free' : 'unknown'),
     speed: m.speed || null,

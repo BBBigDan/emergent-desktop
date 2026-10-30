@@ -11,7 +11,10 @@
  *   ② 工具消息里**没有** base64（图不能从工具结果里漏进上下文 —— 那是几十万字符）。
  *
  * 还测了反面：桩明确说"不收图片"（400）时，这一轮**不能死**，
- * 而且要把结论写进能力表（下次不用再撞一次）。
+ * 而且要把结论写进台账（下次不用再撞一次）。
+ *
+ * 以及一条被用户纠正过的纪律：**不许为了查能力偷偷发试探请求**。
+ * 能力来自公开资料（`models.mjs` 的 `vision` 列），这里断言"一轮里没有多余请求"。
  */
 import { spawn } from 'node:child_process';
 import http from 'node:http';
@@ -191,15 +194,15 @@ const pos = await run({ port: { model: base, app: base + 1 } });
 console.log('① 图真的进了模型上下文');
 {
   ok(pos.up, '服务起来了');
-  /* 带图请求会有两次：一次是**能力探测**（8×8 的小红图），一次是业务请求。
-     分开数 —— 混在一起数会得出"发了两次图"这种假结论。 */
+  /* **不许有探测请求。** 能不能看图是公开信息，查表就够了；
+     发一次 8×8 小红图去问一遍，是拿真钱问一个查得到的问题（用户当场纠正过）。 */
   const probes = (pos.seen || []).filter((s) => s.probe);
-  const withImg = (pos.seen || []).filter((s) => s.images.length && !s.probe);
-  ok(probes.length === 1, `探测发生了一次（${probes.length}）`);
+  const withImg = (pos.seen || []).filter((s) => s.images.length);
+  ok(probes.length === 0, `没有偷偷探测（探测请求 ${probes.length} 次）`);
   ok(withImg.length === 1, `业务请求恰好一次带图（${withImg.length}）`);
   const u = withImg[0]?.images?.[0]?.url || '';
   ok(/^data:image\/png;base64,/.test(u), `是 data URL（${u.slice(0, 32)}…）`);
-  ok(u.length > 120 && u !== (probes[0]?.images?.[0]?.url || ''), `是 32×32 那张原图，不是探测的小图（${u.length} 字符）`);
+  ok(u.length > 120, `是 32×32 那张原图（${u.length} 字符）`);
   ok(withImg[0]?.images?.[0]?.role === 'user', '图挂在 user 消息上（工具消息塞不进图）');
 }
 
@@ -227,11 +230,13 @@ console.log('\n④ 屏幕能拿到那张图（用户要知道它在看什么）'
   ok(pos.escape.status === 400, `越界 400（${pos.escape.status}）`);
 }
 
-console.log('\n⑤ 能力表记下了"能看"');
+console.log('\n⑤ 没为"查能力"多花一次请求');
 {
-  const k = Object.values(pos.vis || {})[0] || {};
-  ok(k.vision === true, `vision=true（${k.why}）`);
-  ok(typeof k.at === 'number', '带时间（7 天后自动过期）');
+  /* 一次成功发图**不写成"能看见"**：网关可能把图悄悄丢了而照样回 200，
+     所以"能看"只能来自公开资料，不能来自"这次没报错"。 */
+  ok(!pos.vis || Object.keys(pos.vis).length === 0, `台账里没多出记录（${JSON.stringify(pos.vis || {})}）`);
+  const reqs = (pos.seen || []).length;
+  ok(reqs === 2, `一轮只发了两次请求：工具调用 + 收口（实际 ${reqs}）`);
 }
 
 /* ── 反面：接口说"不收图" ── */
